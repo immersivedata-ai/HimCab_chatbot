@@ -15,39 +15,39 @@ Enterprise-grade AI travel concierge backend powering the Him Cab rider app.
 ```
 travel_assistant/
 ├── app/
-│   ├── agent/              # LangGraph agent (nodes, graph, state)
-│   │   ├── nodes/          # Individual graph nodes
-│   │   ├── tools/          # Gemini function-calling tools
-│   │   ├── graph.py        # Graph assembly & compilation
-│   │   └── state.py        # AgentState schema
+│   ├── agent/                  # LangGraph agent (nodes, graph, state)
+│   │   ├── nodes/              # Individual graph nodes (planner, router, writer, ...)
+│   │   ├── graph.py            # Graph assembly & compilation
+│   │   └── state.py            # AgentState schema
 │   ├── api/
 │   │   ├── v1/
-│   │   │   ├── routes/     # FastAPI route handlers
+│   │   │   ├── routes/         # FastAPI route handlers
 │   │   │   └── router.py
-│   │   └── middleware/     # Auth, rate-limit, logging middleware
+│   │   └── middleware/         # Auth, rate-limit, logging middleware
 │   ├── core/
-│   │   ├── config.py       # Settings (pydantic-settings)
-│   │   ├── logging.py      # Structured logging
-│   │   └── exceptions.py   # Custom exception classes
+│   │   ├── config.py           # Settings (pydantic-settings)
+│   │   ├── logging.py          # Structured logging
+│   │   └── exceptions.py       # Custom exception classes
 │   ├── services/
-│   │   ├── firestore.py    # Firestore session & profile service
-│   │   ├── redis_cache.py  # Redis cache service
-│   │   ├── vertex_ai.py    # Vertex AI / Gemini client
-│   │   └── external/       # 3rd party API wrappers
-│   ├── models/
-│   │   ├── session.py      # Session / conversation models
-│   │   ├── itinerary.py    # Itinerary structured output models
-│   │   ├── user.py         # User profile models
-│   │   └── alerts.py       # Weather / snowfall alert models
-│   └── main.py             # FastAPI app entrypoint
+│   │   ├── firestore.py        # Firestore session & profile service
+│   │   ├── redis_cache.py      # Redis cache service
+│   │   ├── vertex_ai.py        # Vertex AI / Gemini client
+│   │   ├── offers.py           # Offers/promo service
+│   │   ├── trip_booking.py     # Trip booking service
+│   │   └── external/           # 3rd party API wrappers (places, weather)
+│   ├── models/                 # Pydantic models (session, itinerary, user, alerts, booking, offers)
+│   ├── prompts/                # Prompt templates & builder
+│   └── main.py                 # FastAPI app entrypoint
 ├── workers/
-│   └── alert_refresher.py  # Cloud Run Job: snowfall/weather cache warmer
+│   └── alert_refresher.py      # Cloud Run Job: snowfall/weather cache warmer
 ├── tests/
-│   ├── unit/
-│   └── integration/
+│   └── unit/
+├── secrets/                     # GCP/Firebase credential JSONs (gitignored, not committed)
 ├── deploy/
-│   ├── cloudrun.yaml
-│   └── pubsub_config.yaml
+│   └── cloudrun.yaml
+├── docs/                       # Architecture docs & reference material
+├── scripts/                    # Dev setup & data seeding scripts
+├── frontend/                   # Static demo/test HTML clients
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -65,7 +65,8 @@ python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\acti
 pip install -r requirements.txt
 
 # 3. Configure environment
-cp .env.example .env  # Fill in your GCP credentials & API keys
+cp .env.example .env  # Fill in your API keys
+mkdir -p secrets       # Place your GCP service-account & Firebase admin SDK JSON keys here
 
 # 4. Run locally
 uvicorn app.main:app --reload --port 8000

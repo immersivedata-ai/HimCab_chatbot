@@ -28,9 +28,6 @@ test: ## Run all tests
 test-unit: ## Run unit tests only
 	python -m pytest tests/unit/ -v --tb=short
 
-test-integration: ## Run integration tests only
-	python -m pytest tests/integration/ -v --tb=short
-
 test-cov: ## Run tests with coverage report
 	python -m pytest tests/ -v --tb=short --cov=app --cov-report=term-missing
 
