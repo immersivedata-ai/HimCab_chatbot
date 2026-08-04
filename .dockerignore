@@ -1,0 +1,36 @@
+# ── Exclude from Docker build context ─────────────────────────────────────────
+.git
+.gitignore
+.env
+.env.example
+.venv
+venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+
+# ── Documentation & tooling (not needed in container) ─────────────────────────
+docs/
+scripts/
+tests/
+graphify-out/
+.benchmarks/
+.agents/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Config files not needed in container ──────────────────────────────────────
+Makefile
+*.md
+!README.md
+pyproject.toml
+ruff.toml
+.pre-commit-config.yaml
+deploy.ps1
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+test_results.txt

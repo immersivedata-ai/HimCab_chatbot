@@ -1,0 +1,53 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environment ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Testing & Quality ────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+test_results.txt
+
+# ── Environment & Secrets ────────────────────────────────────────────────────
+.env
+*.pem
+*.json
+!pyproject.toml
+!package.json
+!package-lock.json
+secrets/
+
+# ── Firebase / GCP Credentials ───────────────────────────────────────────────
+firebase-service-account.json
+service-account.json
+*-firebase-adminsdk-*.json
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Auto-generated ───────────────────────────────────────────────────────────
+graphify-out/
+
+# ── OS Files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

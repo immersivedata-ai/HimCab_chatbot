@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Language Instructions
+# ─────────────────────────────────────────────────────────────────────────────
+# Used by: app/prompts/builder.py (injected into writer system prompt)
+# Purpose: Control response language based on visitor type and user preference
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "1.0"
+
+# Instruction when the user explicitly requested English
+english_explicit: |
+  The user has requested English. Respond in clear, friendly English.
+  Do NOT use any emojis in your response.
+
+# Instruction for LOCAL visitors (HP residents) — always Hindi
+hindi_local: |
+  सख्त निर्देश: यह यूज़र हिमाचल प्रदेश का स्थानीय निवासी है।
+  हमेशा शुद्ध हिंदी में जवाब दें, देवनागरी लिपि में।
+  चाहे यूज़र अंग्रेज़ी में लिखे, हिंगलिश में लिखे, या हिंदी में —
+  आपका जवाब हमेशा देवनागरी हिंदी में होना चाहिए।
+  English या Hinglish (Roman script में Hindi) बिल्कुल मत लिखें।
+  केवल तभी अंग्रेज़ी में जवाब दें जब यूज़र ने स्पष्ट रूप से कहा हो:
+  'speak in English', 'English mein bolo', या इसी तरह कुछ।
+  किसी भी emoji का उपयोग न करें।
+
+# Instruction for non-local users typing in English
+english_detected: |
+  The user is typing in English. Respond in clear, friendly English.
+  Do NOT use any emojis in your response.
+
+# Instruction for non-local users typing in Hindi/Hinglish
+hindi_default: |
+  सख्त निर्देश: हमेशा शुद्ध हिंदी में जवाब दें, देवनागरी लिपि में।
+  चाहे यूज़र हिंगलिश में लिखे, रोमन लिपि में लिखे, या हिंदी में —
+  आपका जवाब हमेशा देवनागरी हिंदी में होना चाहिए।
+  Hinglish (Roman script में Hindi) बिल्कुल मत लिखें।
+  केवल तभी अंग्रेज़ी में जवाब दें जब यूज़र ने स्पष्ट रूप से कहा हो:
+  'speak in English', 'English mein bolo', या इसी तरह कुछ।
+  किसी भी emoji का उपयोग न करें।
+
+# Phrases that trigger English mode (checked against user messages)
+english_trigger_phrases:
+  - "speak in english"
+  - "english mein bolo"
+  - "in english please"
+  - "reply in english"
+  - "english me bolo"
+  - "english me jawab do"
+  - "answer in english"
+  - "respond in english"
+  - "talk in english"
+  - "english mein bat karo"
+  - "english me bat karo"
+  - "english mein baat karo"
+  - "english me baat karo"

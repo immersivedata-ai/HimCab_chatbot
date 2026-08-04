@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "himcab-ai-assistant"
+version = "1.0.0"
+description = "Him Cab AI Tourist Travel Assistant — Enterprise LangGraph-powered travel concierge for Himachal Pradesh"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [
+    {name = "ImmersiveData", email = "dev@immersivedata.in"},
+]
+readme = "README.md"
+
+[project.urls]
+Documentation = "docs/"
+Repository = "https://github.com/immersivedata/himcab-ai-assistant"
+
+# ── Pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+log_cli = true
+log_level = "INFO"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks integration tests",
+]
+
+# ── Ruff (Linter + Formatter) ────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "A",    # flake8-builtins
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults (FastAPI Depends)
+    "A003",   # class attribute shadowing builtin (Pydantic models use 'type', 'id')
+    "N805",   # first argument of a method should be named 'self' (Pydantic validators)
+    "UP007",  # use X | Y for union types (keep Optional for readability)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+force-single-line = false
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+# ── Mypy (Type Checking) ─────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+exclude = [
+    "tests/",
+    "scripts/",
+    "workers/",
+    "graphify-out/",
+    "docs/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "firebase_admin.*",
+    "vertexai.*",
+    "langchain.*",
+    "langchain_core.*",
+    "langchain_google_vertexai.*",
+    "langgraph.*",
+    "redis.*",
+    "structlog.*",
+    "sse_starlette.*",
+    "tenacity.*",
+    "google.cloud.*",
+]
+ignore_missing_imports = true

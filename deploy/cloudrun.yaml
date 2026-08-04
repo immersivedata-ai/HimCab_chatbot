@@ -1,0 +1,76 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: himcab-ai-assistant
+  labels:
+    service: himcab-ai-assistant
+    environment: production
+spec:
+  template:
+    metadata:
+      annotations:
+        # Auto-scaling: 2–100 instances
+        autoscaling.knative.dev/minScale: "2"
+        autoscaling.knative.dev/maxScale: "100"
+        # Concurrency per instance
+        autoscaling.knative.dev/target: "80"
+        # VPC connector
+        run.googleapis.com/vpc-access-connector: "projects/PROJECT_ID/locations/asia-south1/connectors/himcab-vpc"
+    spec:
+      containerConcurrency: 100
+      timeoutSeconds: 300   # 5 min timeout for SSE streams
+      serviceAccountName: himcab-ai-sa@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+        - image: asia-south1-docker.pkg.dev/PROJECT_ID/himcab/ai-assistant:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+          env:
+            - name: GCP_PROJECT_ID
+              value: PROJECT_ID
+            - name: APP_ENV
+              value: production
+            - name: APP_DEBUG
+              value: "false"
+            - name: REDIS_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: redis-host
+                  key: latest
+            - name: OPENWEATHER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openweather-api-key
+                  key: latest
+            - name: GOOGLE_PLACES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: google-places-api-key
+                  key: latest
+            - name: GOOGLE_MAPS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: google-maps-api-key
+                  key: latest
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 10
+  traffic:
+    - percent: 100
+      latestRevision: true

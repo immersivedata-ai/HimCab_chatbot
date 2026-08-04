@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  # ── Main API Service ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "8000:8080"
+    env_file:
+      - .env
+    environment:
+      APP_ENV: development
+      APP_DEBUG: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app        # Hot reload in dev
+      - ./workers:/app/workers
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Redis (Local Memorystore replacement) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # ── Alert Refresher Worker (manual trigger in dev) ──────────────────────────
+  alert_worker:
+    build:
+      context: .
+      target: runtime
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+    command: python workers/alert_refresher.py
+    profiles:
+      - worker   # Only starts with: docker-compose --profile worker up
+
+volumes:
+  redis_data:
