@@ -127,7 +127,6 @@ class AgentHarness:
             or ExtractedEntities(
                 visitor_type=persona,
                 last_asked_field="destination",
-                last_asked_fields=["destination"],
             ),
             visitor_type=persona,
             rider_jwt=rider_jwt,
@@ -216,7 +215,7 @@ class TestWholeTurns:
             extraction=dict(destination="Manali", user_wants_to_proceed_now=True),
             entities=ExtractedEntities(
                 destination="Manali", visitor_type="outstation",
-                last_asked_field="origin", last_asked_fields=["origin", "duration_days"],
+                last_asked_field="origin",
                 asked_counts={"origin": 2, "duration_days": 2, "group_size": 2,
                               "travel_dates": 2},
                 no_progress_turns=1,
@@ -380,7 +379,7 @@ class TestWholeTurns:
             extraction=dict(destination="Manali", origin="Delhi", origin_in_himachal=False),
             entities=ExtractedEntities(
                 destination="Manali", visitor_type="outstation",
-                last_asked_field="origin", last_asked_fields=["origin", "duration_days"],
+                last_asked_field="origin",
                 asked_counts={"origin": 1, "duration_days": 1},
             ),
             history=[
@@ -390,3 +389,164 @@ class TestWholeTurns:
 
         assert final["intent"] == "clarification"
         assert final["entities"].origin == "Delhi"
+
+
+# ── The local rider flow ──────────────────────────────────────────────────────
+
+LOCAL_FARE_RESPONSE = {"data": [
+    {"categoryId": 1, "name": "Economy", "totalFare": 3200, "seatCapacity": None},
+    {"categoryId": 2, "name": "Sedan", "totalFare": 3900, "seatCapacity": None},
+    {"categoryId": 3, "name": "SUV", "totalFare": 5400, "seatCapacity": None},
+    {"categoryId": 4, "name": "Innova Crysta", "totalFare": 6800, "seatCapacity": None},
+    {"categoryId": 5, "name": "Tempo Traveller", "totalFare": 11000, "seatCapacity": None},
+    {"categoryId": 6, "name": "Mini Bus", "totalFare": 17500, "seatCapacity": None},
+]}
+
+
+def _local_weather():
+    report = MagicMock()
+    report.model_dump.return_value = {
+        "destination": "manali", "current_temp_c": 9.4, "condition": "light snow",
+        "forecast_7day": [{"min_c": -1.0, "max_c": 10.0}, {"min_c": 0.0, "max_c": 11.0}],
+        "alerts": [],
+    }
+    return report
+
+
+class TestLocalRiderGetsACabNotAnItinerary:
+    """A Himachal resident asking to go to Manali is booking a ride, not planning a
+    holiday in a place they already know. The reply is the cab, the fare, the drive
+    time and the weather — then a handoff to the app's booking screen."""
+
+    async def _local_turn(self, agent, **overrides):
+        kwargs = dict(
+            message="Shimla se Manali, 4 log, kal",
+            intent="plan_trip",
+            persona="local",
+            rider_jwt="rider-token",
+            fare_response=LOCAL_FARE_RESPONSE,
+            weather=_local_weather(),
+            reply="<ride reply>",
+            extraction=dict(
+                destination="Manali", origin="Shimla", home_city="Shimla",
+                group_size=4, travel_dates="kal", duration_days=2, origin_in_himachal=True,
+            ),
+        )
+        kwargs.update(overrides)
+        return await agent.turn(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_no_itinerary_is_produced_for_a_local(self, agent):
+        final = await self._local_turn(agent)
+
+        assert final.get("structured_itinerary") is None
+        assert "itinerary" not in _event_types(final)
+        assert "Do NOT write a day-by-day itinerary" in agent.writer_prompt
+        assert "ITINERARY JSON" not in agent.writer_prompt
+        # The sightseeing brief that used to be added for locals is gone.
+        assert "LOCAL VISITOR INSTRUCTIONS" not in agent.writer_prompt
+
+    @pytest.mark.asyncio
+    async def test_only_cabs_that_seat_the_group_reach_the_rider(self, agent):
+        """The reported symptom: a Mini Bus recommended to four travellers."""
+        final = await self._local_turn(agent)
+
+        fare = next(e for e in final["structured_events"] if e["type"] == "cab_fare")
+        offered = [o["category_name"] for o in fare["payload"]["options"]]
+
+        assert offered == ["Economy", "Sedan", "SUV"]
+        assert "Mini Bus" not in agent.writer_prompt
+        assert "Tempo Traveller" not in agent.writer_prompt
+
+    @pytest.mark.asyncio
+    async def test_the_reply_carries_the_drive_time_and_temperature(self, agent):
+        final = await self._local_turn(agent)
+
+        assert "THIS JOURNEY" in agent.writer_prompt
+        assert "4h 30m" in agent.writer_prompt          # surveyed Shimla → Manali
+        assert "270 km" in agent.writer_prompt
+        assert "9.4" in agent.writer_prompt             # current temperature
+        assert final["route_estimate"]["duration_text"] == "4h 30m"
+
+    @pytest.mark.asyncio
+    async def test_the_rider_is_handed_to_the_booking_screen_with_map_pins(self, agent):
+        """The app needs coordinates, not names — re-geocoding "Kasol" could land
+        somewhere other than the point this fare was priced on."""
+        final = await self._local_turn(agent)
+
+        handoff = next(e for e in final["structured_events"] if e["type"] == "booking_handoff")
+        payload = handoff["payload"]
+
+        assert payload["origin"]["name"] == "Shimla"
+        assert payload["destination"]["name"] == "Manali"
+        for end in ("origin", "destination"):
+            assert payload[end]["lat"] and payload[end]["lon"], f"{end} has no map pin"
+        assert payload["passengers"] == 4
+        assert payload["recommended_category_id"] is not None
+        assert payload["duration_text"] == "4h 30m"
+
+    @pytest.mark.asyncio
+    async def test_the_reply_never_asks_the_rider_to_confirm_a_booking(self, agent):
+        """The app owns the booking flow — the assistant only opens the door to it."""
+        final = await self._local_turn(agent)
+
+        assert "Do NOT ask whether they want to book" in agent.writer_prompt
+        assert "shall I book" not in agent.writer_prompt.lower()
+        assert final["structured_events"]
+
+    @pytest.mark.asyncio
+    async def test_a_local_is_still_asked_for_the_missing_details(self, agent):
+        """"take all the questions as you were taking" — the ride mode changes the
+        answer, not the interview."""
+        final = await agent.turn(
+            "Manali",
+            intent="plan_trip",
+            persona="local",
+            rider_jwt="rider-token",
+            extraction=dict(destination="Manali", origin_in_himachal=None),
+        )
+
+        assert final["node_trace"] == ["router", "context", "planner", "clarify", "persist"]
+        assert final["final_response_text"].endswith("?")
+
+
+class TestOutstationIsUnaffected:
+    """The ride mode is scoped to residents; a visitor's itinerary must be untouched."""
+
+    @pytest.mark.asyncio
+    async def test_an_outstation_visitor_still_gets_a_full_itinerary(self, agent):
+        final = await agent.turn(
+            "Delhi to Manali, 4 of us, 3 days, next week",
+            intent="plan_trip",
+            persona="outstation",
+            rider_jwt="rider-token",
+            fare_response=LOCAL_FARE_RESPONSE,
+            extraction=dict(
+                destination="Manali", origin="Delhi", group_size=4, duration_days=3,
+                travel_dates="next week", origin_in_himachal=False,
+            ),
+        )
+
+        assert final.get("structured_itinerary") is not None
+        assert "Give a day-by-day itinerary" in agent.writer_prompt
+        assert "ITINERARY JSON" in agent.writer_prompt
+        # No handoff: the visitor is choosing a holiday, not hailing a cab.
+        assert "booking_handoff" not in _event_types(final)
+
+    @pytest.mark.asyncio
+    async def test_a_visitor_is_also_spared_the_oversized_cab(self, agent):
+        """Seat filtering is a plain bug fix, so it applies to both personas."""
+        final = await agent.turn(
+            "Delhi to Manali, 4 of us, 3 days, next week",
+            intent="plan_trip",
+            persona="outstation",
+            rider_jwt="rider-token",
+            fare_response=LOCAL_FARE_RESPONSE,
+            extraction=dict(
+                destination="Manali", origin="Delhi", group_size=4, duration_days=3,
+                travel_dates="next week", origin_in_himachal=False,
+            ),
+        )
+
+        fare = next(e for e in final["structured_events"] if e["type"] == "cab_fare")
+        assert not any("Bus" in o["category_name"] for o in fare["payload"]["options"])

@@ -47,7 +47,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from app.models.session import ExtractedEntities
 
@@ -112,9 +112,9 @@ def _is_non_answer(text: str) -> bool:
 def parse_place(text: str) -> Optional[str]:
     """A place name, or None. Accepts 1-3 alphabetic words that name something.
 
-    A city is asked for before a date, so this parser is tried first against a reply
-    to a combined question — which means it also has to recognise when a reply is a
-    DATE and decline it, or "next friday" becomes the starting city.
+    Rejects date words too. A reply does not always answer the question that was
+    asked — someone asked for their city may volunteer "next friday" — and filing
+    that as the starting city is worse than not parsing it at all.
     """
     text = text.strip().strip(".,!")
     if not text or _looks_like_a_question(text) or any(c.isdigit() for c in text):
@@ -159,9 +159,9 @@ def parse_group_size(text: str) -> Optional[int]:
     return _in_range(int(m.group(1)), 1, 60) if m else None
 
 
-# Words that mark a reply as being about WHEN. Required, because travel_dates is the
-# last field a combined question covers: without this check a reply that answered one
-# of the other fields ("shimla") fell through and was filed as the travel date.
+# Words that mark a reply as being about WHEN. Used both to accept a date and, in
+# `parse_place`, to reject one — the parsers police each other's boundaries so a
+# reply can never be filed against a field it doesn't answer.
 _TIME_WORDS = {
     "today", "tomorrow", "tonight", "weekend", "week", "weeks", "month", "months",
     "next", "this", "coming", "after", "soon", "later", "end", "start", "mid",
@@ -248,8 +248,6 @@ class Slot:
     name: str
     #: (lang_key, visitor_type, attempt) -> the question to put to the user
     ask: Callable[[str, Optional[str], int], str]
-    #: (lang_key, visitor_type) -> a clause, so several slots fit in one question
-    clause: Callable[[str, Optional[str]], str]
     #: read the current value out of the entity bag (None when unknown)
     read: Callable[[ExtractedEntities], Any]
     #: strict parser for a direct reply; None when the reply doesn't fit
@@ -308,28 +306,6 @@ _LABELS = {
     "return_journey_preference": {"hi": "वापसी की व्यवस्था", "en": "return journey"},
 }
 
-# Clauses, so two open details cost ONE turn instead of two. Asking for a city and a
-# trip length separately is how a short conversation turned into an interrogation.
-_CLAUSES = {
-    "destination": {"hi": "आप कहाँ जाना चाहते हैं", "en": "where you'd like to go"},
-    "origin": {"hi": "आप किस शहर से चल रहे हैं", "en": "which city you're starting from"},
-    "origin_local": {"hi": "आप हिमाचल में कहाँ रहते हैं", "en": "which Himachal city you're based in"},
-    "duration_days": {"hi": "यात्रा कितने दिन की है", "en": "how many days you're planning"},
-    "group_size": {"hi": "कितने लोग जा रहे हैं", "en": "how many people are travelling"},
-    "travel_dates": {"hi": "आप कब जाना चाहते हैं", "en": "when you'd like to travel"},
-    "return_journey_preference": {
-        "hi": "वापसी की क्या व्यवस्था है", "en": "how you're getting back"
-    },
-}
-
-#: Template per language for a question covering several clauses, plus the two
-#: joiners used to build the list ("a, b and c").
-_COMBINED_Q = {
-    "hi": ("बस कुछ जानकारी चाहिए — {clauses}?", ", ", " और "),
-    "en": ("Just a few quick details so I can plan it properly — {clauses}?", ", ", " and "),
-}
-
-
 def _write_origin(merged: dict, value: Any, visitor_type: Optional[str]) -> None:
     """The pickup city. For a Himachal resident it doubles as their home city, which
     is why there is one slot here and not two that can disagree."""
@@ -348,17 +324,12 @@ def _label(field: str) -> Callable[[str], str]:
     return lambda lang_key: _q(_LABELS[field], lang_key)
 
 
-def _clause(field: str) -> Callable[[str, Optional[str]], str]:
-    return lambda lang_key, _vt: _q(_CLAUSES[field], lang_key)
-
-
 SLOTS: dict[str, Slot] = {
     "destination": Slot(
         name="destination",
         ask=lambda lang, _vt, attempt: _q(
             _DESTINATION_Q_RETRY if attempt else _DESTINATION_Q, lang
         ),
-        clause=_clause("destination"),
         read=lambda e: e.destination,
         parse=parse_place,
         write=_simple_write("destination"),
@@ -367,7 +338,6 @@ SLOTS: dict[str, Slot] = {
     "origin": Slot(
         name="origin",
         ask=lambda lang, vt, _a: _q(_ORIGIN_Q_LOCAL if vt == LOCAL else _ORIGIN_Q, lang),
-        clause=lambda lang, vt: _q(_CLAUSES["origin_local" if vt == LOCAL else "origin"], lang),
         read=lambda e: e.origin or e.home_city,
         parse=parse_place,
         write=_write_origin,
@@ -376,7 +346,6 @@ SLOTS: dict[str, Slot] = {
     "duration_days": Slot(
         name="duration_days",
         ask=lambda lang, _vt, _a: _q(_DURATION_Q, lang),
-        clause=_clause("duration_days"),
         read=lambda e: e.duration_days,
         parse=parse_duration_days,
         write=_simple_write("duration_days"),
@@ -385,7 +354,6 @@ SLOTS: dict[str, Slot] = {
     "group_size": Slot(
         name="group_size",
         ask=lambda lang, _vt, _a: _q(_GROUP_SIZE_Q, lang),
-        clause=_clause("group_size"),
         read=lambda e: e.group_size,
         parse=parse_group_size,
         write=_simple_write("group_size"),
@@ -394,7 +362,6 @@ SLOTS: dict[str, Slot] = {
     "travel_dates": Slot(
         name="travel_dates",
         ask=lambda lang, _vt, _a: _q(_WHEN_Q, lang),
-        clause=_clause("travel_dates"),
         read=lambda e: e.travel_dates,
         parse=parse_when,
         write=_simple_write("travel_dates"),
@@ -403,7 +370,6 @@ SLOTS: dict[str, Slot] = {
     "return_journey_preference": Slot(
         name="return_journey_preference",
         ask=lambda lang, _vt, _a: _q(_RETURN_Q, lang),
-        clause=_clause("return_journey_preference"),
         read=lambda e: e.return_journey_preference,
         parse=parse_return_preference,
         write=_simple_write("return_journey_preference"),
@@ -461,11 +427,18 @@ _NEEDS: dict[str, dict[str, Need]] = {
     "general_query": {},
 }
 
-#: Intents whose reply is a full day-by-day plan. Everything else gets a direct
-#: answer — no itinerary, no JSON block, no "which cab category?" close.
-_ITINERARY_INTENTS = frozenset({"plan_trip", "clarification", "show_itinerary", "cost_query"})
+#: Intents that are about GOING somewhere rather than asking about it. What the
+#: reply looks like then depends on who is travelling — see `response_mode`.
+_TRAVEL_INTENTS = frozenset({"plan_trip", "clarification", "show_itinerary", "cost_query"})
 
+#: A full day-by-day plan plus the structured itinerary JSON. Outstation visitors:
+#: they are choosing what to do with several days in an unfamiliar state.
 ITINERARY_MODE = "itinerary"
+#: A cab recommendation — vehicle, fare, drive time, weather — and nothing else.
+#: Himachal residents already know the place; what they want is the ride, so an
+#: itinerary telling them about Mall Road is noise around the useful part.
+RIDE_MODE = "ride"
+#: A short direct answer to a question about a place. No trip, no cab.
 ANSWER_MODE = "answer"
 
 
@@ -474,9 +447,16 @@ def needs_for(intent: Optional[str]) -> dict[str, Need]:
     return _NEEDS.get(intent or "", _PLAN_TRIP_NEEDS)
 
 
-def response_mode(intent: Optional[str]) -> str:
-    """`ITINERARY_MODE` for planning requests, `ANSWER_MODE` for questions."""
-    return ITINERARY_MODE if (intent or "plan_trip") in _ITINERARY_INTENTS else ANSWER_MODE
+def response_mode(intent: Optional[str], visitor_type: Optional[str] = None) -> str:
+    """What shape the reply takes, from the intent and who is asking.
+
+    The same "plan my trip" means different things to the two personas: a visitor
+    wants an itinerary, a resident wants a cab. Questions about a place get a direct
+    answer either way.
+    """
+    if (intent or "plan_trip") not in _TRAVEL_INTENTS:
+        return ANSWER_MODE
+    return RIDE_MODE if visitor_type == LOCAL else ITINERARY_MODE
 
 
 # ── The decision ──────────────────────────────────────────────────────────────
@@ -485,10 +465,8 @@ def response_mode(intent: Optional[str]) -> str:
 class Decision:
     """What the planner should do this turn."""
 
-    #: field the reply will be read as an answer to, or None to go ahead and answer
+    #: the one field being asked about, or None to go ahead and answer
     ask_field: Optional[str] = None
-    #: every field this question covers — one question covers all of them at once
-    ask_fields: tuple[str, ...] = ()
     #: the question to put to the user (set iff ask_field is set)
     question: Optional[str] = None
     #: slots we wanted but gave up on — the writer MUST say what it assumed
@@ -507,26 +485,30 @@ def decide(
     *,
     max_attempts: int,
 ) -> Decision:
-    """Choose between asking for what's missing and producing the answer.
+    """Choose between asking for ONE missing detail and producing the answer.
+
+    Exactly one question per turn, in the order of the policy table, so each gets a
+    focused reply. Bundling several into one message reads as a form to fill in and
+    invites a partial answer that then has to be chased anyway.
 
     A slot is asked only when it is unknown, relevant to `intent`, and has been put
-    to the user fewer than `max_attempts` times. Two independent limits keep the
-    conversation finite, because either one alone still allowed a long march of
-    questions:
+    to the user fewer than `max_attempts` times. Because the questions are now serial,
+    the limits below are what keep the conversation finite rather than merely tidy:
 
       • per field  — `entities.asked_counts`, so one detail is never chased forever
       • per person — `entities.no_progress_turns`, so a user who keeps replying
         without answering gets their plan instead of another question
+      • on request — `entities.proceed_requested`, set the moment they tell us to
+        get on with it, which drops every remaining question at once
 
-    `entities.proceed_requested` (the user asked us to get on with it) short-circuits
-    both. None of the three can skip a REQUIRED slot: with no destination there is
-    nothing to produce, and inventing one is the failure this whole module prevents.
+    None of the three can skip a REQUIRED slot: with no destination there is nothing
+    to produce, and inventing one is the failure this whole module prevents.
     """
     needs = needs_for(intent)
     give_up = bool(entities.proceed_requested) or entities.no_progress_turns >= max_attempts
 
-    required: list[str] = []
-    askable: list[str] = []
+    required: Optional[str] = None
+    important: Optional[str] = None
     assumed: list[str] = []
 
     for name, need in needs.items():
@@ -536,54 +518,27 @@ def decide(
             continue
 
         if need is Need.REQUIRED:
-            required.append(name)
+            # Never escapable — not by the attempt cap, not by "just make it".
+            required = required or name
         elif give_up or entities.asked_counts.get(name, 0) >= max_attempts:
             # IMPORTANT: worth a question, never worth a loop.
             assumed.append(name)
         else:
-            askable.append(name)
+            important = important or name
 
-    # A missing REQUIRED slot is the only thing worth a question on its own — it is
-    # the anchor everything else hangs off, so it is asked alone and never bundled.
-    if required:
-        anchor = required[0]
-        attempt = entities.asked_counts.get(anchor, 0)
-        return Decision(
-            ask_field=anchor,
-            ask_fields=(anchor,),
-            question=SLOTS[anchor].ask(lang_key, visitor_type, attempt),
-            assumed=tuple(assumed),
-        )
-
-    if not askable:
+    # A missing REQUIRED slot always jumps the queue — it is the anchor the rest of
+    # the questions only make sense against.
+    pending = required or important
+    if pending is None:
         return Decision(assumed=tuple(assumed))
 
-    # Everything still open goes into ONE question. Asking them one per turn is what
-    # turned a two-message exchange into an interrogation; asking them after the
-    # itinerary is what produced a plan that ignored the answers.
     return Decision(
-        ask_field=askable[0],
-        ask_fields=tuple(askable),
-        question=_compose_question(askable, lang_key, visitor_type, entities),
+        ask_field=pending,
+        question=SLOTS[pending].ask(
+            lang_key, visitor_type, entities.asked_counts.get(pending, 0)
+        ),
         assumed=tuple(assumed),
     )
-
-
-def _compose_question(
-    fields: list[str],
-    lang_key: str,
-    visitor_type: Optional[str],
-    entities: ExtractedEntities,
-) -> str:
-    """One question covering `fields` — a single slot asks its own question."""
-    if len(fields) == 1:
-        slot = SLOTS[fields[0]]
-        return slot.ask(lang_key, visitor_type, entities.asked_counts.get(fields[0], 0))
-
-    template, comma, final = _COMBINED_Q.get(lang_key, _COMBINED_Q["en"])
-    clauses = [SLOTS[f].clause(lang_key, visitor_type) for f in fields]
-    joined = final.join([comma.join(clauses[:-1]), clauses[-1]])
-    return template.format(clauses=joined)
 
 
 def _has_value(value: Any) -> bool:
@@ -591,36 +546,31 @@ def _has_value(value: Any) -> bool:
 
 
 def read_answer(
-    fields: Sequence[Optional[str]],
+    field: Optional[str],
     text: str,
     merged: dict,
     visitor_type: Optional[str],
 ) -> Optional[str]:
-    """Read `text` as the answer to the question we just asked.
-
-    `fields` is what that question covered — usually one slot, two when the question
-    was combined. Each is tried in turn and the first whose parser accepts the reply
-    wins; the parsers do not overlap in shape (a place has no digits, a duration
-    needs them), so the order only decides ties that cannot occur.
+    """Read `text` as the answer to the question we just asked about `field`.
 
     Returns the field that was filled, or None. Nothing happens unless we actually
-    asked about the field and it is still unknown — the agent never reinterprets a
-    message as an answer to a question it did not ask, which is what let "plan a
-    trip" become a destination.
+    asked about it and it is still unknown — the agent never reinterprets a message
+    as an answer to a question it did not ask, which is what let "plan a trip" become
+    a destination. The per-slot parser then has to accept the shape of the reply, so
+    an off-topic answer fills nothing rather than something wrong.
     """
-    for field in fields:
-        if not field or field not in SLOTS:
-            continue
-        if _has_value(merged.get(field)):
-            continue
-        if field == "origin" and _has_value(merged.get("home_city")):
-            continue
+    if not field or field not in SLOTS:
+        return None
+    if _has_value(merged.get(field)):
+        return None
+    if field == "origin" and _has_value(merged.get("home_city")):
+        return None
 
-        value = SLOTS[field].parse(text)
-        if value is not None:
-            SLOTS[field].write(merged, value, visitor_type)
-            return field
-    return None
+    value = SLOTS[field].parse(text)
+    if value is None:
+        return None
+    SLOTS[field].write(merged, value, visitor_type)
+    return field
 
 
 def label_for(field: str, lang_key: str) -> str:

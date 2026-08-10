@@ -285,3 +285,28 @@ def estimate_road_distance_km(origin: str, destination: str) -> Optional[float]:
         bands = _FACTORS_PLAINS
 
     return round(straight_line * _winding_factor(bands, straight_line), 1)
+
+
+# ── Drive times ───────────────────────────────────────────────────────────────
+# Average speeds in km/h, also calibrated from the surveyed routes (distance divided
+# by measured drive time). Speed rises with trip length because a long run is mostly
+# highway while a short one is all hill road: the surveyed median is 35 km/h under
+# 120 km and 58 km/h over 400 km. A single average would badly under-state a short
+# hop, which is exactly the trip a Himachal local is asking about.
+#
+# Each entry is (distance below which this applies, average km/h).
+_AVERAGE_SPEEDS_KMH = ((120, 35.0), (400, 50.0), (float("inf"), 58.0))
+
+
+def estimate_drive_time_minutes(distance_km: float) -> int:
+    """Typical drive time for a road distance, in minutes.
+
+    An estimate in ordinary conditions — nothing here sees traffic, roadworks or
+    snow, so callers must present it as approximate. Rounded to 5 minutes, because
+    a figure like "4h 07m" implies a precision this does not have.
+    """
+    for limit, speed in _AVERAGE_SPEEDS_KMH:
+        if distance_km < limit:
+            break
+    minutes = (distance_km / speed) * 60
+    return max(5, int(round(minutes / 5) * 5))

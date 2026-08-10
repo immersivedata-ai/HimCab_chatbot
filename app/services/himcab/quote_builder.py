@@ -5,24 +5,21 @@ Assembles a `FareQuoteInput` for POST /api/rider/fare/estimate and selects a dis
 headline from the per-category estimate response.
 
 The estimate endpoint is DISTANCE-DRIVEN (needs distanceInMeters) and returns a fare for
-every category in one call. So there is no categoryId to send; we only choose which
-category to feature as the headline, using group size + budget (the endpoint gives no
-seat capacity, so selection is by category name/price, not seats).
+every category in one call. So there is no categoryId to send; the response is narrowed
+to what seats the group (`vehicles.select_cabs_for_group`) and this module only picks
+which of those to feature as the headline, by budget.
 """
-
-from typing import Optional
 
 from typing import Optional
 
 from app.core.logging import get_logger
 from app.models.session import ExtractedEntities
-from app.services.himcab.distances import resolve_distance
+from app.services.himcab.distances import resolve_route
 from app.services.himcab.models import FareCategoryFare, FareQuoteInput
 
 log = get_logger(__name__)
 
 # Category-name preferences for the headline pick (real names from /fare/get-all).
-_MINIBUS_HINT = "bus"
 _PREF_BY_BUDGET = {
     "luxury": ["premium", "luxury"],
     "moderate": ["standard", "economy"],
@@ -56,7 +53,7 @@ def build_fare_quote_input(
     """Build the estimate input for the main origin→destination journey.
 
     Distance is surveyed where known and computed from coordinates otherwise (see
-    `distances.resolve_distance`); it is None only when a place is unrecognised, in
+    `distances.resolve_route`); it is None only when a place is unrecognised, in
     which case the caller must skip the quote — the endpoint requires distanceInMeters.
 
     `trip_type` defaults to whatever the distance implies; pass it explicitly to override.
@@ -65,7 +62,7 @@ def build_fare_quote_input(
     # lookup and the request body still get a usable origin city.
     origin = entities.origin or entities.home_city or ""
     destination = entities.destination or ""
-    resolved = resolve_distance(origin, destination)
+    resolved = resolve_route(origin, destination)
 
     return FareQuoteInput(
         origin=origin,
@@ -85,16 +82,16 @@ def select_headline_category(
     group_size: Optional[int],
     budget_range: Optional[str],
 ) -> Optional[FareCategoryFare]:
-    """Pick which category to feature. Large groups → Mini Bus; otherwise by budget
-    preference; falling back to the cheapest option."""
+    """Pick which of the SUITABLE cabs to feature, by budget.
+
+    Callers pass a list already narrowed to what seats the group
+    (`vehicles.select_cabs_for_group`), so this only chooses between vehicles the
+    rider could actually take. It used to special-case large groups onto a minibus
+    itself, which is now handled properly upstream by seat capacity — and which,
+    applied to the unnarrowed list, is what put a 20-seater in front of a family.
+    """
     if not options:
         return None
-
-    # Large group → prefer a mini-bus-type category if present.
-    if group_size and group_size >= 7:
-        for o in options:
-            if _MINIBUS_HINT in (o.category_name or "").lower():
-                return o
 
     # Budget travellers → the genuinely cheapest option, regardless of tier name.
     if (budget_range or "").lower() == "budget":

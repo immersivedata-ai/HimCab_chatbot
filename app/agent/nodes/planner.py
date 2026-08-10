@@ -195,9 +195,9 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
 def _build_entities(merged: dict) -> ExtractedEntities:
     """Rebuild the entity bag from the merged dict, preserving conversation control.
 
-    `last_asked_field`/`last_asked_fields` are deliberately NOT carried over — they
-    are set by `_resolve` from this turn's decision, so a stale question can never be
-    used to reinterpret a later message.
+    `last_asked_field` is deliberately NOT carried over — it is set by `_resolve`
+    from this turn's decision, so a stale question can never be used to reinterpret a
+    later message.
     """
     return ExtractedEntities(
         destination=merged.get("destination"),
@@ -242,11 +242,12 @@ def _resolve(
         max_attempts=settings.max_clarification_attempts,
     )
 
-    # Count the asks now, so both caps hold even when the user ignores the question.
-    for field in decision.ask_fields:
-        entities.asked_counts[field] = entities.asked_counts.get(field, 0) + 1
+    # Count the ask now, so both caps hold even when the user ignores the question.
+    if decision.ask_field:
+        entities.asked_counts[decision.ask_field] = (
+            entities.asked_counts.get(decision.ask_field, 0) + 1
+        )
     entities.last_asked_field = decision.ask_field
-    entities.last_asked_fields = list(decision.ask_fields)
 
     return {
         "entities": entities,
@@ -265,11 +266,9 @@ async def planner_node(state: AgentState) -> dict:
 
     lang_key, reply_language = detect_reply_language(state)
     latest_text = _latest_user_text(state)
-    # Everything our last question covered — one question may have asked for two
-    # details, and the reply is a valid answer to either.
-    previously_asked = state.entities.last_asked_fields or (
-        [state.entities.last_asked_field] if state.entities.last_asked_field else []
-    )
+    # The single detail our last question asked about. The reply is only ever read
+    # as an answer to THIS field.
+    previously_asked = state.entities.last_asked_field
     known_before = _known_slots(state.entities)
     existing_entities = state.entities.model_dump(exclude_none=True)
 
@@ -381,13 +380,18 @@ Report what the user has stated. Use null for anything they have not."""
     entities = _build_entities(merged)
 
     # ── Progress tracking ─────────────────────────────────────────────────────
-    # "They replied but told us nothing new." Counting these — and only these — is
-    # what lets the agent notice it is getting nowhere and deliver instead of asking
-    # again. Any new detail clears the streak, so an engaged user is never cut off.
-    if previously_asked and not (_known_slots(entities) - known_before):
-        entities.no_progress_turns = state.entities.no_progress_turns + 1
-    else:
+    # "They replied but told us nothing new." Counting these is what lets the agent
+    # notice it is getting nowhere and deliver instead of asking again.
+    #
+    # The condition is deliberately NOT "…and we asked a question last turn". It was,
+    # and that made giving up last exactly one turn: the agent stopped asking, which
+    # cleared `last_asked_field`, which reset the streak, which let it start asking
+    # again on the very next message. The user got interrogated, then a plan, then
+    # interrogated again. Only real progress — a slot that gained a value — resets it.
+    if _known_slots(entities) - known_before:
         entities.no_progress_turns = 0
+    else:
+        entities.no_progress_turns = state.entities.no_progress_turns + 1
 
     result = _resolve(state, entities, visitor_type, lang_key)
 

@@ -76,6 +76,10 @@ class AgentState(BaseModel):
     weather_data: Optional[dict] = None
     snowfall_data: Optional[dict] = None
     cab_fare: Optional[dict] = None          # Real fare quote (base + cab details) or None
+    # The journey itself: both endpoints with coordinates, road distance and drive
+    # time. Feeds the drive time quoted to a local rider AND the booking handoff the
+    # app uses to drop pins on its map, so both come from one resolution of the route.
+    route_estimate: Optional[dict] = None
 
     # ── Generated output (from Writer node) ───────────────────────────────────
     final_response_text: str = ""

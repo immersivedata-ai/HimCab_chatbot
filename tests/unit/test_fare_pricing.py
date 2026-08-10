@@ -23,7 +23,7 @@ import pytest
 from app.agent.state import AgentState
 from app.models.session import ExtractedEntities
 from app.services import geo
-from app.services.himcab.distances import ROAD_DISTANCES_KM, resolve_distance
+from app.services.himcab.distances import ROAD_ROUTES, resolve_route
 from app.services.himcab.quote_builder import build_fare_quote_input, classify_trip_type
 
 
@@ -46,7 +46,7 @@ class TestEveryRecognisedRouteCanBePriced:
         ],
     )
     def test_a_route_outside_the_surveyed_table_still_gets_a_distance(self, origin, destination):
-        resolved = resolve_distance(origin, destination)
+        resolved = resolve_route(origin, destination)
 
         assert resolved is not None, f"{origin}->{destination} would ship with no fare"
         assert resolved.km > 0
@@ -54,18 +54,18 @@ class TestEveryRecognisedRouteCanBePriced:
 
     def test_a_surveyed_route_uses_the_measured_distance(self):
         """Estimates fill gaps; they never override a real survey."""
-        resolved = resolve_distance("Delhi", "Manali")
+        resolved = resolve_route("Delhi", "Manali")
 
-        assert resolved.km == ROAD_DISTANCES_KM[("delhi", "manali")]
+        assert resolved.km == ROAD_ROUTES[("delhi", "manali")][0]
         assert resolved.is_approximate is False
 
     def test_the_surveyed_table_is_bidirectional(self):
-        assert resolve_distance("Manali", "Delhi").km == resolve_distance("Delhi", "Manali").km
+        assert resolve_route("Manali", "Delhi").km == resolve_route("Delhi", "Manali").km
 
     def test_an_unrecognised_place_is_still_refused(self):
         """Better no price than a price for the wrong route."""
-        assert resolve_distance("Atlantis", "Manali") is None
-        assert resolve_distance("Manali", "") is None
+        assert resolve_route("Atlantis", "Manali") is None
+        assert resolve_route("Manali", "") is None
 
     def test_an_estimate_is_never_shorter_than_the_straight_line(self):
         """A road cannot be shorter than the crow's flight — a factor below 1 would
@@ -74,7 +74,7 @@ class TestEveryRecognisedRouteCanBePriced:
                                     ("Mumbai", "Shimla"), ("Solan", "Kufri")]:
             a, b = geo.find_city(origin), geo.find_city(destination)
             straight_line = geo.haversine_km(a[1], b[1])
-            assert resolve_distance(origin, destination).km >= straight_line
+            assert resolve_route(origin, destination).km >= straight_line
 
     def test_the_estimator_tracks_the_surveyed_distances(self):
         """Sanity bound on the calibration: half the surveyed routes within 20%.
@@ -83,10 +83,10 @@ class TestEveryRecognisedRouteCanBePriced:
         exists so a bad edit to the winding factors fails here rather than in a quote.
         """
         errors = []
-        for (origin, destination), surveyed in ROAD_DISTANCES_KM.items():
+        for (origin, destination), (surveyed_km, _minutes) in ROAD_ROUTES.items():
             estimated = geo.estimate_road_distance_km(origin, destination)
             if estimated:
-                errors.append(abs(estimated - surveyed) / surveyed)
+                errors.append(abs(estimated - surveyed_km) / surveyed_km)
         within_20pct = sum(1 for e in errors if e <= 0.20)
 
         assert len(errors) > 50, "coordinates missing for surveyed routes"
@@ -196,7 +196,135 @@ class TestApproximateFaresAreLabelled:
             assert "This section is REQUIRED" in self._prompt(cab_fare)
 
 
-# ── 4. Geography is single-sourced ────────────────────────────────────────────
+# ── 4. Only cabs that fit the group are offered ───────────────────────────────
+
+class TestCabsAreNarrowedToTheGroup:
+    """The reported bug: a party of four was recommended a Mini Bus.
+
+    `/fare/estimate` prices EVERY category in one call, and the reply repeated the
+    list verbatim — which is not the same as recommending something.
+    """
+
+    CATEGORIES = [
+        ("Economy", 1800), ("Sedan", 2200), ("SUV", 3100),
+        ("Innova Crysta", 3900), ("Tempo Traveller", 6500), ("Mini Bus", 9800),
+    ]
+
+    def _options(self):
+        from app.services.himcab.models import FareCategoryFare
+
+        return [
+            FareCategoryFare(category_id=i, category_name=name, total_fare_inr=fare)
+            for i, (name, fare) in enumerate(self.CATEGORIES, 1)
+        ]
+
+    @pytest.mark.parametrize(
+        "group_size,expected",
+        [
+            (1, ["Economy", "Sedan", "SUV"]),
+            (4, ["Economy", "Sedan", "SUV"]),
+            (6, ["SUV", "Innova Crysta", "Tempo Traveller"]),
+            (7, ["Innova Crysta", "Tempo Traveller", "Mini Bus"]),
+            (12, ["Tempo Traveller", "Mini Bus"]),
+        ],
+    )
+    def test_only_cabs_that_seat_the_group_are_offered(self, group_size, expected):
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        chosen = [c.category_name for c in select_cabs_for_group(self._options(), group_size)]
+        assert chosen == expected
+
+    def test_a_family_of_four_is_never_shown_a_minibus(self):
+        """The literal reported symptom."""
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        chosen = [c.category_name for c in select_cabs_for_group(self._options(), 4)]
+        assert not any("Bus" in name for name in chosen)
+
+    def test_the_smallest_suitable_cab_leads(self):
+        """A family of four wants a sedan, not an empty minibus at three times the price."""
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        assert select_cabs_for_group(self._options(), 5)[0].category_name == "SUV"
+
+    def test_a_group_too_big_for_any_cab_still_sees_the_largest(self):
+        """They need to know two vehicles are required, not that Him Cab has nothing."""
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        chosen = select_cabs_for_group(self._options(), 30)
+        assert chosen and chosen[0].category_name == "Mini Bus"
+
+    def test_with_no_group_size_nothing_is_ruled_out(self):
+        """Narrowing on a guess would hide a cab the rider wanted."""
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        assert len(select_cabs_for_group(self._options(), None)) == 3
+
+    def test_the_backends_own_seat_count_wins_over_the_name(self):
+        from app.services.himcab.models import FareCategoryFare
+        from app.services.himcab.vehicles import effective_seats
+
+        # Named like a 4-seater, but the backend says otherwise.
+        option = FareCategoryFare(category_name="Sedan", total_fare_inr=100, seat_capacity=6)
+        assert effective_seats(option) == 6
+
+    @pytest.mark.parametrize(
+        "name,seats",
+        [("Mini Bus", 20), ("Mini", 4), ("mini bus", 20), ("Tempo Traveller", 12),
+         ("Innova Crysta", 7), ("Hatchback", 4), ("Something Odd", None)],
+    )
+    def test_seat_inference_from_the_category_name(self, name, seats):
+        """"Mini Bus" contains "mini" — longest match must win or a 20-seater reads
+        as a hatchback and gets offered to a group of twelve."""
+        from app.services.himcab.vehicles import seat_capacity_for
+
+        assert seat_capacity_for(name) == seats
+
+    def test_an_unrecognised_category_is_kept_rather_than_filtered_out(self):
+        """Hiding a cab the rider could have taken is worse than showing one extra."""
+        from app.services.himcab.models import FareCategoryFare
+        from app.services.himcab.vehicles import select_cabs_for_group
+
+        options = [FareCategoryFare(category_name="Mystery Wagon", total_fare_inr=2000)]
+        assert select_cabs_for_group(options, 6)
+
+
+# ── 5. Journey distance and drive time ────────────────────────────────────────
+
+class TestJourneyDuration:
+
+    def test_a_surveyed_route_uses_its_measured_drive_time(self):
+        route = resolve_route("Shimla", "Manali")
+        assert route.duration_minutes == ROAD_ROUTES[("shimla", "manali")][1]
+        assert route.duration_text == "4h 30m"
+
+    def test_an_unsurveyed_route_gets_an_estimated_drive_time(self):
+        route = resolve_route("Solan", "Kufri")
+        assert route.is_approximate
+        assert route.duration_minutes > 0
+
+    @pytest.mark.parametrize(
+        "minutes,text", [(30, "30m"), (60, "1h"), (270, "4h 30m"), (90, "1h 30m")]
+    )
+    def test_drive_time_reads_the_way_a_rider_would_say_it(self, minutes, text):
+        from app.services.himcab.distances import RouteEstimate
+
+        assert RouteEstimate(km=1, duration_minutes=minutes, is_approximate=False).duration_text == text
+
+    def test_estimated_drive_times_track_the_surveyed_ones(self):
+        """Hill roads are slow; a single average speed would badly under-state a short
+        hop, which is exactly the trip a Himachal local asks about."""
+        import statistics
+
+        errors = []
+        for (origin, destination), (km, surveyed_minutes) in ROAD_ROUTES.items():
+            estimated = geo.estimate_drive_time_minutes(km)
+            errors.append(abs(estimated - surveyed_minutes) / surveyed_minutes)
+
+        assert statistics.median(errors) <= 0.30
+
+
+# ── 6. Geography is single-sourced ────────────────────────────────────────────
 
 class TestGeography:
 
@@ -237,7 +365,7 @@ class TestGeography:
         """Otherwise that route silently loses its estimate fallback."""
         missing = {
             place
-            for pair in ROAD_DISTANCES_KM
+            for pair in ROAD_ROUTES
             for place in pair
             if geo.find_city(place) is None
         }

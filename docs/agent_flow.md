@@ -41,8 +41,14 @@ Policy by intent:
 | `general_query` | — | — | — |
 
 Everything that SHAPES the plan is `IMPORTANT`, so it is collected **before** the plan
-is written — and all of it in ONE question, not one per turn. Asking "how many days?"
-after handing over an itinerary means the itinerary was written without the answer.
+is written. Asking "how many days?" after handing over an itinerary means the itinerary
+was written without the answer.
+
+Questions are asked **one per turn**, in the order of the table above, so each gets a
+focused reply. Bundling them into a single message reads as a form to fill in and
+invites a partial answer that has to be chased anyway. A user who volunteers several
+details at once still skips those questions — the policy asks for what is *missing*,
+it does not run a fixed script.
 
 The return cab is `OPTIONAL` because it is a booking detail, not an itinerary input:
 it rides along with the closing "shall I book your Him Cab?" instead of gating the plan.
@@ -52,7 +58,10 @@ Three independent limits guarantee the conversation terminates:
 1. **Per field** — `entities.asked_counts`; one detail is never chased more than
    `settings.max_clarification_attempts` times.
 2. **Per person** — `entities.no_progress_turns`; a user who keeps replying without
-   answering gets their plan instead of another question. Resets when they engage.
+   answering gets their plan instead of another question. It counts every turn that
+   yields no new detail — deliberately NOT just the turns where a question was asked,
+   or giving up would last exactly one turn and the interrogation would restart on
+   the next message. Only real progress resets it.
 3. **On request** — `entities.proceed_requested`, set when the user says to get on
    with it, in any language (the extraction model detects it).
 
@@ -64,10 +73,23 @@ the user as an assumption, at the TOP of the reply where a correction still help
 **Nothing is ever silently invented.** The reply's closing question is always about
 booking, never about a trip detail — see `_build_followup_instruction` in the writer.
 
-Two response shapes, chosen by `slots.response_mode(intent)`:
+Three response shapes, chosen by `slots.response_mode(intent, visitor_type)` — the
+same request means different things to the two personas:
 
-- `itinerary` — a full day-by-day plan plus the structured JSON (planning intents)
-- `answer` — a short direct answer, no itinerary, no JSON (questions about a place)
+| Mode | Who | Reply |
+|---|---|---|
+| `itinerary` | OUTSTATION visitor, travel intent | Day-by-day plan + structured itinerary JSON |
+| `ride` | LOCAL resident, travel intent | Cab recommendation, fare, drive time, weather, then a `booking_handoff` — no itinerary at all |
+| `answer` | either, question about a place | Short direct answer. No trip, no cab, no JSON |
+
+`ride` exists because a Kullu resident asking to go to Manali is booking a ride, not
+planning a holiday somewhere unfamiliar. Telling them what to see on Mall Road is the
+same mistake as answering a weather question with a four-day plan. They are still
+asked the same questions — the mode changes the answer, not the interview.
+
+The reply ends by announcing the booking screen rather than asking whether to book:
+the app owns that flow, and `booking_handoff` carries both endpoints **with
+coordinates** so its map can drop pins without geocoding the names again.
 
 ## Node Descriptions
 
@@ -113,6 +135,11 @@ Two response shapes, chosen by `slots.response_mode(intent)`:
   else is computed from city coordinates (`services/geo.py`) and the fare is labelled
   approximate all the way to the reply. Requiring a surveyed pair is what made most
   itineraries arrive with no price at all.
+- **Which cabs are offered**: the endpoint prices EVERY category, so the raw list always
+  includes vehicles the group cannot sensibly book. `himcab/vehicles.py` narrows it to
+  what seats them, smallest suitable first — repeating the backend's list verbatim is
+  how a party of four was recommended a Mini Bus. Seat counts come from the response
+  when present and from the category name otherwise.
 - **Trip type** is decided by the journey's length, not the rider's persona: a Himachal
   resident driving 270 km is an intercity transfer, not a local run.
 - **Timeout**: 20s per tool, graceful degradation on failure — a missing tool result

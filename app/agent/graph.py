@@ -108,14 +108,16 @@ def route_after_planner(state: AgentState) -> str:
     The destination guard is a backstop, not policy — the slot policy already makes
     `destination` mandatory wherever it matters. It is here because an itinerary
     without a destination is a fabricated itinerary, which is worth catching as a
-    question. It deliberately does NOT apply to a general question ("when's the best
-    time to visit Himachal?"), which can be answered without one.
+    question — as is a cab quote with nowhere to drive to. It deliberately does NOT
+    apply to a general question ("when's the best time to visit Himachal?"), which can
+    be answered without one.
     """
     from app.agent import slots
 
     if state.needs_clarification:
         return "clarify"
-    if slots.response_mode(state.intent) == slots.ITINERARY_MODE and not state.entities.destination:
+    mode = slots.response_mode(state.intent, state.visitor_type)
+    if mode in (slots.ITINERARY_MODE, slots.RIDE_MODE) and not state.entities.destination:
         log.warning(
             "planner_cleared_without_destination",
             session_id=state.session_id,

@@ -254,6 +254,7 @@ without breaking older app builds.
 | `weather_alert` | One alert — `event`, `severity`, `description` | Destination has an active weather alert |
 | `snowfall_alert` | `risk` (`high`\|`critical`), `message` | Snowfall risk at the destination |
 | `cab_fare` | `{options[], category_name, fare_inr, vehicle_label, seat_capacity, trip_type, distance_km, is_approximate, source}`. When `is_approximate` is true the route distance was computed rather than surveyed — render the price as "approx". | A fare was quoted for the route |
+| `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, options[]}`. Open the booking screen with both pins already dropped on the map and the recommended cab preselected. Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A LOCAL rider's route was resolved |
 
 Enum vocabularies inside an `itinerary` payload:
 

@@ -8,21 +8,27 @@ Two tools run today:
      from that same report rather than fetched again)
   2. A real Him Cab fare quote, when the flag is on and a rider JWT was forwarded
 
+It also resolves the journey itself (`_build_route_estimate`) from local tables — no
+network call — because the distance, the drive time and the map coordinates all have
+to agree with the fare that was quoted on them.
+
 Both are called concurrently, so total latency is the slower of the two rather than
 their sum. Each is wrapped in a timeout and degrades to None instead of raising —
 a missing tool result costs detail in the reply, never the reply itself.
 """
 
 import asyncio
-from typing import Any
+from typing import Any, Optional
 
 from app.agent import slots
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.session import ExtractedEntities
+from app.services import geo
 from app.services.external.weather import get_weather_service
 from app.services.himcab import build_fare_quote_input, get_fare_service
+from app.services.himcab.distances import resolve_route
 from app.services.himcab.models import FareQuote
 
 log = get_logger(__name__)
@@ -65,6 +71,44 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
         return None
 
 
+def _build_route_estimate(entities: ExtractedEntities) -> Optional[dict]:
+    """Resolve the journey once: both endpoints, their coordinates, distance and time.
+
+    Coordinates are included because the app's booking screen needs to drop pins for
+    the pickup and the drop — handing it two place NAMES would make it geocode them
+    again and possibly land somewhere else than we priced.
+    """
+    origin = entities.origin or entities.home_city
+    destination = entities.destination
+    if not origin or not destination:
+        return None
+
+    route = resolve_route(origin, destination)
+    if route is None:
+        return None
+
+    origin_place = geo.find_city(origin)
+    destination_place = geo.find_city(destination)
+    return {
+        "origin": {
+            "name": origin.title(),
+            "lat": origin_place[1][0] if origin_place else None,
+            "lon": origin_place[1][1] if origin_place else None,
+        },
+        "destination": {
+            "name": destination.title(),
+            "lat": destination_place[1][0] if destination_place else None,
+            "lon": destination_place[1][1] if destination_place else None,
+        },
+        "distance_km": route.km,
+        "duration_minutes": route.duration_minutes,
+        "duration_text": route.duration_text,
+        # Surveyed routes carry measured figures; the rest are derived, and the reply
+        # has to say so rather than quoting them as fact.
+        "is_approximate": route.is_approximate,
+    }
+
+
 async def tool_executor_node(state: AgentState) -> dict:
     """
     LangGraph Tool Executor Node.
@@ -88,6 +132,12 @@ async def tool_executor_node(state: AgentState) -> dict:
         "weather": _safe_call(weather_svc.get_weather(destination), "weather"),
     }
 
+    # ── The journey ───────────────────────────────────────────────────────────
+    # Resolved once, from local tables, and reused three ways: it prices the fare,
+    # it is the drive time quoted to a local rider, and its coordinates are what the
+    # app drops on its map at the booking handoff.
+    route_estimate = _build_route_estimate(entities)
+
     # ── Real cab fare (Him Cab backend) ───────────────────────────────────────
     # Gated: flag on, origin known, pricing-relevant intent, and a forwarded rider JWT.
     # Any failure degrades gracefully to None via _safe_call → no price is quoted.
@@ -95,9 +145,12 @@ async def tool_executor_node(state: AgentState) -> dict:
         "enable_real_fares": settings.enable_real_fares,
         # Locals often only give home_city (not origin) — either satisfies the gate.
         "has_origin": bool(entities.origin or entities.home_city),
-        # Exactly the intents that produce an itinerary — the same predicate the writer
-        # uses, so a new planning intent can never be added and silently lose its fare.
-        "pricing_intent": slots.response_mode(intent) == slots.ITINERARY_MODE,
+        # Exactly the intents that produce a trip — the same predicate the writer uses,
+        # so a new travel intent can never be added and silently lose its fare. A local
+        # rider's whole reply IS the fare, so this must cover RIDE_MODE too.
+        "pricing_intent": slots.response_mode(intent, state.visitor_type) in (
+            slots.ITINERARY_MODE, slots.RIDE_MODE
+        ),
         "has_rider_jwt": bool(state.rider_jwt),
     }
     should_quote = all(fare_gate.values())
@@ -183,6 +236,7 @@ async def tool_executor_node(state: AgentState) -> dict:
         weather_ok=weather_obj is not None,
         has_cab_fare=cab_fare is not None,
         fare_approximate=bool(cab_fare and cab_fare["is_approximate"]),
+        route_km=(route_estimate or {}).get("distance_km"),
         visitor_type=state.visitor_type,
         session_id=state.session_id,
     )
@@ -191,5 +245,6 @@ async def tool_executor_node(state: AgentState) -> dict:
         "weather_data": weather_obj.model_dump(mode="json") if weather_obj else None,
         "snowfall_data": snowfall_data,
         "cab_fare": cab_fare,
+        "route_estimate": route_estimate,
         "node_trace": ["tool_executor"],
     }

@@ -289,26 +289,45 @@ class TestUserProfileEnhancements:
 # ── Writer Context Tests ──────────────────────────────────────────────────────
 
 class TestWriterLocalContext:
-    def test_build_system_prompt_has_local_instructions(self):
-        """System prompt for local visitor should contain local-specific instructions."""
+    def test_a_local_gets_a_cab_recommendation_not_an_itinerary(self):
+        """Residents know the place. What they are choosing is the ride, so the prompt
+        must ask for a cab, a fare and a drive time — and explicitly not a day plan."""
         from app.agent.nodes.writer import _build_system_prompt
 
         state = AgentState(
             session_id="test-writer-3",
             user_id="user-1",
+            intent="plan_trip",
             visitor_type="local",
             entities=ExtractedEntities(
                 destination="Manali",
                 origin="Shimla",
-                duration_days=2,
+                group_size=4,
                 visitor_type="local",
                 home_city="Shimla",
             ),
+            route_estimate={
+                "origin": {"name": "Shimla", "lat": 31.1, "lon": 77.17},
+                "destination": {"name": "Manali", "lat": 32.24, "lon": 77.19},
+                "distance_km": 270, "duration_minutes": 270,
+                "duration_text": "4h 30m", "is_approximate": False,
+            },
         )
         prompt = _build_system_prompt(state)
-        assert "LOCAL VISITOR" in prompt
-        assert "hidden gems" in prompt.lower()
-        assert "Shimla" in prompt
+
+        assert "Do NOT write a day-by-day itinerary" in prompt
+        assert "ITINERARY JSON" not in prompt
+        # The sightseeing brief is gone — matched on the instruction that sells it,
+        # not on the words "hidden gems", which the ride prompt uses to FORBID it.
+        assert "LOCAL VISITOR INSTRUCTIONS" not in prompt
+        assert "prioritise hidden gems" not in prompt
+        # …and it must carry the ride facts instead.
+        assert "THIS JOURNEY" in prompt
+        assert "4h 30m" in prompt
+        assert "270 km" in prompt
+        assert "Shimla" in prompt and "Manali" in prompt
+        # The app owns booking; the reply must not ask for it.
+        assert "Do NOT ask whether they want to book" in prompt
 
     def test_build_system_prompt_no_local_for_outstation(self):
         """System prompt for outstation visitor should NOT contain local instructions."""

@@ -466,7 +466,7 @@ class TestResponsePayload:
         from app.models.session import StructuredEventType
 
         assert {t.value for t in StructuredEventType} == {
-            "itinerary", "weather_alert", "snowfall_alert", "cab_fare",
+            "itinerary", "weather_alert", "snowfall_alert", "cab_fare", "booking_handoff",
         }
 
     def test_rate_limit_returns_429_with_retry_after(self, api):

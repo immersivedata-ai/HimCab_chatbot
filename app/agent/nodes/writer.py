@@ -9,8 +9,13 @@ Responsibilities:
   4. Emit structured SSE events for the mobile app (itinerary, alerts, cab fare)
   5. Stream tokens back to the SSE handler
 
-Two response shapes, chosen by `slots.response_mode(state.intent)`: a day-by-day plan
-for a planning request, and a short direct answer for a question about a place.
+Three response shapes, chosen by `slots.response_mode(intent, visitor_type)`:
+
+  • ITINERARY — a day-by-day plan for a visitor with days to fill
+  • RIDE      — a cab recommendation for a Himachal resident: vehicle, fare, drive
+                time, weather, then a handoff to the app's booking screen. They know
+                the place; what they are choosing is the ride.
+  • ANSWER    — a short direct answer to a question about somewhere
 
 Live data always beats generated data. Whatever the model writes, the real cab fare
 and the real weather report are stamped onto the validated itinerary afterwards
@@ -22,6 +27,7 @@ This is the most visible node — its output IS the user experience.
 
 import asyncio
 import json
+from typing import Optional
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
@@ -246,6 +252,62 @@ def _apply_weather(itinerary: Itinerary, state: AgentState) -> None:
     )
 
 
+def _build_journey_section(state: AgentState) -> str:
+    """Distance and drive time for the route, or nothing when it isn't known.
+
+    Surveyed routes carry measured figures; the rest are derived from coordinates and
+    are labelled, because a drive time quoted to the minute implies knowledge of the
+    road that this app does not have.
+    """
+    route = state.route_estimate
+    if not route:
+        return ""
+
+    qualifier = " (approximate)" if route.get("is_approximate") else ""
+    return (
+        f"\n### THIS JOURNEY\n"
+        f"- {route['origin']['name']} to {route['destination']['name']}\n"
+        f"- Drive time: about {route['duration_text']}{qualifier}\n"
+        f"- Distance: about {round(route['distance_km'])} km\n"
+        f"Use these exact figures. Do NOT add traffic, road or weather-delay claims — "
+        f"nothing here observes them.\n"
+    )
+
+
+def _build_booking_handoff(state: AgentState) -> Optional[dict]:
+    """The payload the app needs to open its booking screen on this journey.
+
+    Both endpoints carry coordinates so the map can drop pins without geocoding the
+    names again — re-resolving "Kasol" in the app could easily land somewhere other
+    than the point this fare was priced on.
+
+    This is a handoff, not a booking: nothing here reserves a cab or takes payment.
+    The app owns that flow, which is why the reply is told to announce the screen
+    rather than ask the rider to confirm anything.
+    """
+    route = state.route_estimate
+    if not route:
+        return None
+
+    fare = state.cab_fare or {}
+    return {
+        "origin": route["origin"],
+        "destination": route["destination"],
+        "distance_km": route["distance_km"],
+        "duration_minutes": route["duration_minutes"],
+        "duration_text": route["duration_text"],
+        "is_approximate": route["is_approximate"],
+        "trip_type": fare.get("trip_type"),
+        "passengers": state.entities.group_size,
+        "travel_dates": state.entities.travel_dates,
+        # The cab we put in front of them, so the booking screen opens on the same one.
+        "recommended_category_id": fare.get("category_id"),
+        "recommended_category_name": fare.get("category_name"),
+        "fare_inr": fare.get("fare_inr"),
+        "options": fare.get("options", []),
+    }
+
+
 def _build_assumptions_section(state: AgentState) -> str:
     """Tell the model exactly what the user never said, and what to do about it.
 
@@ -330,13 +392,15 @@ def _build_system_prompt(state: AgentState) -> str:
     Build the full system prompt for the Writer node,
     injecting all tool results as structured context.
 
-    Two shapes, chosen by `slots.response_mode(state.intent)`: a full day-by-day plan
-    for a planning request, and a short direct answer for a question about a place.
-    Answering "what's the weather in Manali?" with a four-day itinerary is what made
-    the agent feel like it never listened.
+    Three shapes, chosen by `slots.response_mode(intent, visitor_type)`: a day-by-day
+    plan for a visitor, a cab recommendation for a Himachal resident, and a short
+    direct answer for a question about a place. Answering "what's the weather in
+    Manali?" with a four-day itinerary is what made the agent feel like it never
+    listened; telling a Kullu resident what to see in Manali is the same mistake in a
+    different costume.
     """
     entities = state.entities
-    mode = slots.response_mode(state.intent)
+    mode = slots.response_mode(state.intent, state.visitor_type)
     is_local = state.visitor_type == "local"
     is_outstation = state.visitor_type == "outstation"
 
@@ -412,8 +476,10 @@ def _build_system_prompt(state: AgentState) -> str:
 """
 
     # ── Local visitor-specific instructions ────────────────────────────────────
+    # Itinerary mode only. A local in RIDE_MODE is booking a cab, not being sold
+    # hidden gems in a valley they live next to.
     local_instructions = ""
-    if is_local:
+    if is_local and mode == slots.ITINERARY_MODE:
         home_city = entities.home_city or entities.origin or "their HP home city"
         local_instructions = f"""
 **LOCAL VISITOR INSTRUCTIONS (IMPORTANT):**
@@ -518,6 +584,39 @@ def _build_system_prompt(state: AgentState) -> str:
             "End with ONE short line offering to plan the full trip if they'd like.",
         ]
         json_block = ""
+
+    elif mode == slots.RIDE_MODE:
+        # A Himachal resident booking a cab. They know the destination — what they are
+        # deciding is which vehicle, what it costs, how long the drive is and what the
+        # weather is doing. An itinerary here is noise wrapped around the useful part.
+        steps = [
+            language_step,
+            honesty_step,
+            f"Open with ONE line confirming the journey: {origin_display} to "
+            f"{destination_display}.",
+            "Then a JOURNEY line with the drive time and distance from THIS JOURNEY below, "
+            "exactly as given. Say nothing about traffic or road conditions — nothing here "
+            "measures them.",
+            weather_step,
+            (
+                "Recommend the cabs from HIM CAB FARES as short bullets — vehicle, seats and "
+                "price. They are ALREADY narrowed to what seats this group, so recommend every "
+                "one of them and never mention a larger vehicle."
+                if has_fares
+                else "No fare is available for this route, so do NOT state or estimate any "
+                     "price. Say the fare is confirmed when they book."
+            ),
+            "Do NOT write a day-by-day itinerary, sightseeing plan, hidden gems or any JSON — "
+            "they live here and are booking a ride, not planning a holiday.",
+            no_coupons_step,
+            "Close with ONE short line telling them the booking screen is ready with their "
+            "pickup and drop already filled in. Do NOT ask whether they want to book, do not "
+            "ask them to confirm, and do not ask for any more details — the app takes over "
+            "from here.",
+            "Keep the whole reply under about 12 short lines.",
+        ]
+        json_block = ""
+
     else:
         steps = [
             language_step,
@@ -581,16 +680,27 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
     trip_facts = [
         f"- Destination: {destination_display}",
         f"- Origin: {origin_display}",
-        f"- Duration: {duration_days} days"
-        + ("" if entities.duration_days else " (ASSUMED — the user never said)"),
         f"- Group: {resolved_group_type}"
         + (f" ({entities.group_size} people)" if entities.group_size else " (size not stated)"),
-        f"- Budget: {resolved_budget_range}"
-        + ("" if entities.budget_range else " (not stated — keep costs mid-range)"),
         f"- Travel dates: {entities.travel_dates or 'not stated — do not name specific dates'}",
-        f"- Interests: {', '.join(entities.interests) if entities.interests else 'general sightseeing'}",
         f"- Visitor type: {state.visitor_type or 'unknown'}",
     ]
+    if mode != slots.RIDE_MODE:
+        # A resident booking a cab is not choosing a holiday length or a budget tier.
+        trip_facts.insert(2, (
+            f"- Duration: {duration_days} days"
+            + ("" if entities.duration_days else " (ASSUMED — the user never said)")
+        ))
+        trip_facts.insert(4, (
+            f"- Budget: {resolved_budget_range}"
+            + ("" if entities.budget_range else " (not stated — keep costs mid-range)")
+        ))
+        trip_facts.append(
+            f"- Interests: "
+            f"{', '.join(entities.interests) if entities.interests else 'general sightseeing'}"
+        )
+
+    journey_section = _build_journey_section(state)
 
     return f"""You are the AI travel concierge for **Him Cab** — Himachal Pradesh's most trusted local cab service. Help the user genuinely, and guide them toward booking their travel with Him Cab.
 
@@ -600,7 +710,7 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
 ## TRIP
 {chr(10).join(trip_facts)}
 {user_context}
-{assumptions_section}{travel_section}{outstation_instructions}{local_instructions}
+{assumptions_section}{journey_section}{travel_section}{outstation_instructions}{local_instructions}
 {fare_block}
 ## REAL-TIME DATA
 {weather_section}{snowfall_section}
@@ -711,7 +821,7 @@ async def writer_node(state: AgentState) -> dict:
     """
     log.info("writer_node_entered", session_id=state.session_id, intent=state.intent)
 
-    mode = slots.response_mode(state.intent)
+    mode = slots.response_mode(state.intent, state.visitor_type)
     wants_itinerary = mode == slots.ITINERARY_MODE
     system_prompt = _build_system_prompt(state)
 
@@ -836,14 +946,25 @@ async def writer_node(state: AgentState) -> dict:
                 "payload": state.cab_fare,
             })
 
+        # Hand a local rider straight to the booking screen, with both endpoints and
+        # their coordinates so the map opens on the journey we just priced. This is a
+        # handoff, not a booking — nothing is reserved here, which is why the reply
+        # announces the screen rather than asking them to confirm.
+        if mode == slots.RIDE_MODE:
+            handoff = _build_booking_handoff(state)
+            if handoff:
+                structured_events.append({
+                    "type": "booking_handoff",
+                    "payload": handoff,
+                })
+
         log.info(
             "writer_completed",
             mode=mode,
+            visitor_type=state.visitor_type,
             response_length=len(full_response),
             has_itinerary=validated_itinerary is not None,
             assumed_fields=state.assumed_fields,
-            visitor_type=state.visitor_type,
-            is_local=state.visitor_type == "local",
             structured_events=len(structured_events),
             session_id=state.session_id,
         )

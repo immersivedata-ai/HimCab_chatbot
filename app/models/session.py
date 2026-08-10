@@ -63,9 +63,6 @@ class ExtractedEntities(BaseModel):
     #: The field our last question was about. A reply is only ever read as an
     #: answer to THIS field — the agent never reinterprets an unrelated message.
     last_asked_field: Optional[str] = None
-    #: Everything that question covered — one question may ask for two details at
-    #: once, and the reply can answer either of them.
-    last_asked_fields: list[str] = Field(default_factory=list)
     #: field name → how many times we have asked for it. Bounds the conversation:
     #: past `max_clarification_attempts` the agent proceeds instead of re-asking.
     asked_counts: dict[str, int] = Field(default_factory=dict)
@@ -162,6 +159,7 @@ class StructuredEventType(str, Enum):
     WEATHER_ALERT = "weather_alert"
     SNOWFALL_ALERT = "snowfall_alert"
     CAB_FARE = "cab_fare"
+    BOOKING_HANDOFF = "booking_handoff"
 
 
 class StructuredEvent(BaseModel):
@@ -175,9 +173,17 @@ class StructuredEvent(BaseModel):
       - `snowfall_alert` → {risk: "high"|"critical", message, ...}
       - `cab_fare`       → Him Cab quote: {options[], category_name, fare_inr,
                            vehicle_label, seat_capacity, trip_type, distance_km,
-                           is_approximate, source}. `is_approximate` is true when the
+                           is_approximate, source}. `options` is already narrowed to
+                           cabs that seat the party. `is_approximate` is true when the
                            route distance was computed from coordinates rather than
                            surveyed — render the price as "approx" in that case.
+      - `booking_handoff`→ open the booking screen on this journey. `origin` and
+                           `destination` each carry {name, lat, lon} so the map can
+                           drop both pins without geocoding again; plus distance_km,
+                           duration_text, passengers, travel_dates and the
+                           recommended_category_id to preselect. Sent to LOCAL riders
+                           once a route is known. Nothing is reserved — the app owns
+                           the booking, and the reply never asks the rider to confirm.
 
     Zero or more events accompany any reply; clarification turns carry none.
     """

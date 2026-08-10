@@ -19,6 +19,8 @@ turns through the planner with a stubbed extraction model and asserts on what th
 user would experience — how many questions, and whether an answer ever arrives.
 """
 
+from collections import Counter
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,7 +77,6 @@ class Conversation:
         self.entities = ExtractedEntities(
             visitor_type=persona,
             last_asked_field="destination",
-            last_asked_fields=["destination"],
         )
         self.messages = [AIMessage(content="Where would you like to go?")]
         self.turns: list[Turn] = []
@@ -215,11 +216,7 @@ class TestTheAgentAlwaysGetsToAnAnswer:
         )
 
         assert turn.asked, "produced an itinerary before knowing how long or for whom"
-        assert set(turn.result["entities"].last_asked_fields) == {
-            "duration_days", "group_size", "travel_dates"
-        }
-        # …and it costs ONE turn, not three.
-        assert turn.question.count("?") == 1
+        assert turn.result["last_asked_field"] == "duration_days"
 
     @pytest.mark.asyncio
     async def test_the_return_cab_never_blocks_the_plan(self):
@@ -236,7 +233,9 @@ class TestTheAgentAlwaysGetsToAnAnswer:
         assert turn.result["assumed_fields"] == []
 
     @pytest.mark.asyncio
-    async def test_one_detail_at_a_time_still_reaches_a_plan(self):
+    async def test_answering_several_details_at_once_skips_their_questions(self):
+        """Serial questions are the fallback, not a script: anything already answered
+        is never asked, however it arrived."""
         chat = Conversation(persona="local")
         await chat.say("namaste", NOTHING)
         await chat.say("kasol", extraction(destination="Kasol"))
@@ -251,26 +250,61 @@ class TestTheAgentAlwaysGetsToAnAnswer:
         assert chat.entities.home_city == "Shimla"
 
     @pytest.mark.asyncio
-    async def test_every_open_detail_is_asked_in_one_question(self):
-        """Asking for each detail on its own turn is what made this an interrogation."""
+    async def test_details_are_asked_one_at_a_time_in_policy_order(self):
+        """One question per turn, so each gets a focused reply. The order is the slot
+        policy's, and the questions are never bundled into a single message."""
         chat = Conversation()
-        turn = await chat.say("Manali", extraction(destination="Manali"))
+        asked = []
 
-        assert turn.asked
-        assert set(turn.result["entities"].last_asked_fields) == {
-            "origin", "duration_days", "group_size", "travel_dates"
-        }
-        assert turn.question.count("?") == 1
+        await chat.say("Manali", extraction(destination="Manali"))
+        asked.append(chat.turns[-1].result["last_asked_field"])
+        await chat.say("Delhi", extraction(destination="Manali", origin="Delhi",
+                                           origin_in_himachal=False))
+        asked.append(chat.turns[-1].result["last_asked_field"])
+        await chat.say("4 days", extraction(destination="Manali", origin="Delhi",
+                                            duration_days=4, origin_in_himachal=False))
+        asked.append(chat.turns[-1].result["last_asked_field"])
+        await chat.say("3 people", extraction(destination="Manali", origin="Delhi",
+                                              duration_days=4, group_size=3,
+                                              origin_in_himachal=False))
+        asked.append(chat.turns[-1].result["last_asked_field"])
+
+        assert asked == ["origin", "duration_days", "group_size", "travel_dates"]
+        # Each question is exactly one question — never a bundled list.
+        for turn in chat.turns:
+            if turn.asked:
+                assert turn.question.count("?") == 1, turn.question
 
     @pytest.mark.asyncio
-    async def test_either_half_of_a_combined_question_can_be_answered(self):
-        """A bare "3 days" answers the length half; the city half stays open."""
+    async def test_serial_questions_still_reach_an_itinerary(self):
+        """The whole point of asking separately is that the answers land — the run must
+        still terminate in a plan, not another question."""
         chat = Conversation()
         await chat.say("Manali", extraction(destination="Manali"))
-        turn = await chat.say("3 days", None)  # extractor down: code must read it
+        await chat.say("Delhi", extraction(destination="Manali", origin="Delhi",
+                                           origin_in_himachal=False))
+        await chat.say("4 days", extraction(destination="Manali", origin="Delhi",
+                                            duration_days=4, origin_in_himachal=False))
+        await chat.say("3 people", extraction(destination="Manali", origin="Delhi",
+                                              duration_days=4, group_size=3,
+                                              origin_in_himachal=False))
+        turn = await chat.say("next weekend", extraction(
+            destination="Manali", origin="Delhi", duration_days=4, group_size=3,
+            travel_dates="next weekend", origin_in_himachal=False))
 
-        assert turn.result["entities"].duration_days == 3
+        assert turn.produced
+        assert turn.result["assumed_fields"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_reply_answers_only_the_question_that_was_asked(self):
+        """We asked for the starting city, so "3 days" fills nothing — the date parser
+        never gets a look at a reply aimed at a different field."""
+        chat = Conversation()
+        await chat.say("Manali", extraction(destination="Manali"))
+        turn = await chat.say("3 days", None)  # extractor down: code-only path
+
         assert turn.result["entities"].origin is None
+        assert turn.result["entities"].duration_days is None
 
     @pytest.mark.asyncio
     async def test_the_user_can_tell_the_agent_to_just_get_on_with_it(self):
@@ -305,7 +339,24 @@ class TestTheAgentAlwaysGetsToAnAnswer:
             await chat.say("dunno", extraction(destination="Manali"))
 
         asks = [t.question for t in chat.turns if t.asked]
-        assert len(asks) <= settings.max_clarification_attempts
+        repeats = Counter(asks)
+        assert all(n <= settings.max_clarification_attempts for n in repeats.values()), repeats
+
+    @pytest.mark.asyncio
+    async def test_giving_up_stays_given_up(self):
+        """Serial questions made this reachable: the agent stopped asking, which
+        cleared `last_asked_field`, which reset the patience counter, which let it
+        start asking again on the very next message. Ask, ask, plan, ask, ask, plan."""
+        chat = Conversation()
+        for _ in range(6):
+            await chat.say("dunno", extraction(destination="Manali"))
+
+        # It gives up once and stays given up — no question after the first plan.
+        first_plan = next(i for i, t in enumerate(chat.turns) if t.produced)
+        assert not any(t.asked for t in chat.turns[first_plan:]), (
+            "the interrogation restarted after the agent had already given up"
+        )
+        assert chat.questions_asked <= settings.max_clarification_attempts
 
     @pytest.mark.asyncio
     async def test_engaging_again_resets_the_patience_counter(self):
@@ -335,15 +386,22 @@ class TestTheAgentAlwaysGetsToAnAnswer:
 
     @pytest.mark.asyncio
     async def test_the_agent_still_works_when_vertex_ai_is_down(self):
-        """Extraction failing degrades what the agent knows, never how it behaves."""
+        """Extraction failing degrades what the agent knows, never how it behaves.
+
+        Every reply here is read by the code-level parsers alone — one question at a
+        time is exactly the shape they handle best, since each reply has only one
+        field it could be answering.
+        """
         chat = Conversation()
-        await chat.say("shimla", None)
-        await chat.say("delhi", None)
-        turn = await chat.say("3 days", None)
+        for reply in ("shimla", "delhi", "3 days", "4 people"):
+            await chat.say(reply, None)
+        turn = await chat.say("next week", None)
 
         assert turn.produced
-        assert (chat.entities.destination, chat.entities.origin, chat.entities.duration_days) == (
-            "Shimla", "Delhi", 3
+        entities = chat.entities
+        assert (entities.destination, entities.origin, entities.duration_days,
+                entities.group_size, entities.travel_dates) == (
+            "Shimla", "Delhi", 3, 4, "next week"
         )
 
 
@@ -384,7 +442,7 @@ class TestNothingIsEverInvented:
         """With no question in flight, a stray message changes nothing."""
         entities = ExtractedEntities(visitor_type="outstation")  # nothing asked
         merged = entities.model_dump()
-        filled = slots.read_answer([], "manali", merged, "outstation")
+        filled = slots.read_answer(None, "manali", merged, "outstation")
 
         assert filled is None
         assert merged["destination"] is None
@@ -394,7 +452,7 @@ class TestNothingIsEverInvented:
         """It used to default to "own arrangement", silently rewriting the last day."""
         merged = {"return_journey_preference": None}
         assert slots.read_answer(
-            ["return_journey_preference"], "we'll see how it goes", merged, "outstation"
+            "return_journey_preference", "we'll see how it goes", merged, "outstation"
         ) is None
         assert merged["return_journey_preference"] is None
 
@@ -462,16 +520,22 @@ class TestAnswerParsers:
     def test_when(self, text, expected):
         assert slots.parse_when(text) == expected
 
-    def test_a_reply_is_never_filed_against_the_wrong_field(self):
-        """One question can cover four fields; each parser must claim only its own."""
-        merged = {"origin": None, "duration_days": None, "group_size": None,
-                  "travel_dates": None}
-        asked = ["origin", "duration_days", "group_size", "travel_dates"]
+    def test_each_field_only_accepts_a_reply_of_its_own_shape(self):
+        """The parsers police each other's boundaries, so a reply aimed at one field
+        is never filed against another."""
+        blank = {"origin": None, "duration_days": None, "group_size": None,
+                 "travel_dates": None}
 
-        assert slots.read_answer(asked, "shimla", dict(merged), "local") == "origin"
-        assert slots.read_answer(asked, "3 days", dict(merged), "local") == "duration_days"
-        assert slots.read_answer(asked, "6 people", dict(merged), "local") == "group_size"
-        assert slots.read_answer(asked, "next friday", dict(merged), "local") == "travel_dates"
+        assert slots.read_answer("origin", "shimla", dict(blank), "local") == "origin"
+        assert slots.read_answer("duration_days", "3 days", dict(blank), "local") == "duration_days"
+        assert slots.read_answer("group_size", "6 people", dict(blank), "local") == "group_size"
+        assert slots.read_answer("travel_dates", "next friday", dict(blank), "local") == "travel_dates"
+
+        # …and a reply of the wrong shape fills nothing rather than something wrong.
+        assert slots.read_answer("origin", "next friday", dict(blank), "local") is None
+        assert slots.read_answer("origin", "3 days", dict(blank), "local") is None
+        assert slots.read_answer("travel_dates", "shimla", dict(blank), "local") is None
+        assert slots.read_answer("duration_days", "shimla", dict(blank), "local") is None
 
 
 # ── Policy ────────────────────────────────────────────────────────────────────
@@ -513,7 +577,7 @@ class TestSlotPolicy:
         for name, slot in slots.SLOTS.items():
             for lang in ("en", "hi"):
                 assert slot.ask(lang, "outstation", 0), f"{name} has no {lang} question"
-                assert slot.clause(lang, "local"), f"{name} has no {lang} clause"
+                assert slot.ask(lang, "local", 1), f"{name} has no {lang} retry question"
                 assert slots.label_for(name, lang)
 
     def test_a_local_is_asked_where_they_live_not_where_they_are_visiting_from(self):

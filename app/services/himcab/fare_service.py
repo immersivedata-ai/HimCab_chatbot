@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.himcab.models import FareCategoryFare, FareQuote, FareQuoteInput
 from app.services.himcab.quote_builder import select_headline_category
+from app.services.himcab.vehicles import select_cabs_for_group
 
 log = get_logger(__name__)
 
@@ -111,6 +112,7 @@ class FareService:
             base_fare_inr=quote.base_fare_inr,
             category_name=quote.category_name,
             options=len(quote.alternatives),
+            group_size=quote_input.group_size,
         )
         return quote
 
@@ -151,7 +153,11 @@ class FareService:
         data = raw.get("data") if isinstance(raw, dict) else None
         rows = data if isinstance(data, list) else []
 
-        options = self._extract_categories(rows)
+        # The endpoint prices EVERY category, including ones this group cannot use.
+        # Narrowing here means the app, the prompt and the headline all see the same
+        # short list — nothing downstream can reintroduce a minibus for four people.
+        priced = self._extract_categories(rows)
+        options = select_cabs_for_group(priced, q.group_size)
         headline = select_headline_category(options, q.group_size, q.budget_range)
 
         if headline is None:

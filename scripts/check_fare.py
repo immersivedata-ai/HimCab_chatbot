@@ -42,10 +42,10 @@ def calibrate() -> None:
         find_city,
         haversine_km,
     )
-    from app.services.himcab.distances import ROAD_DISTANCES_KM
+    from app.services.himcab.distances import ROAD_ROUTES
 
     unknown, samples = set(), []
-    for (origin, destination), surveyed_km in ROAD_DISTANCES_KM.items():
+    for (origin, destination), (surveyed_km, _minutes) in ROAD_ROUTES.items():
         a, b = find_city(origin), find_city(destination)
         if a is None:
             unknown.add(origin)
@@ -79,12 +79,13 @@ def calibrate() -> None:
     errors = []
     for _, _, _, origin, destination in samples:
         estimated = estimate_road_distance_km(origin, destination)
-        surveyed = ROAD_DISTANCES_KM.get(
+        surveyed = ROAD_ROUTES.get(
             (origin.lower(), destination.lower())
-        ) or ROAD_DISTANCES_KM.get((destination.lower(), origin.lower()))
+        ) or ROAD_ROUTES.get((destination.lower(), origin.lower()))
         if estimated and surveyed:
-            errors.append((abs(estimated - surveyed) / surveyed * 100, origin, destination,
-                           surveyed, estimated))
+            surveyed_km = surveyed[0]
+            errors.append((abs(estimated - surveyed_km) / surveyed_km * 100, origin,
+                           destination, surveyed_km, estimated))
 
     if errors:
         pct = sorted(e[0] for e in errors)
@@ -131,7 +132,7 @@ def main() -> None:
     from app.core.config import settings
     from app.models.session import ExtractedEntities
     from app.services.geo import find_city
-    from app.services.himcab.distances import resolve_distance
+    from app.services.himcab.distances import resolve_route
     from app.services.himcab.fare_service import get_fare_service
     from app.services.himcab.quote_builder import build_fare_quote_input
 
@@ -149,10 +150,10 @@ def main() -> None:
 
     # ── Step 2: distance ──────────────────────────────────────────────────────
     print("\n=== 2. DISTANCE ===")
-    resolved = resolve_distance(args.origin, args.destination)
+    resolved = resolve_route(args.origin, args.destination)
     if resolved:
         kind = "ESTIMATED from coordinates" if resolved.is_approximate else "SURVEYED"
-        print(f"  {resolved.km} km  ({kind})")
+        print(f"  {resolved.km} km, {resolved.duration_text} drive  ({kind})")
     else:
         print("  none — no fare can be quoted for this route")
 
