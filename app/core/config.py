@@ -52,6 +52,27 @@ class Settings(BaseSettings):
     openweather_api_key: str = ""
     java_backend_url: str = "http://34.131.37.50:9002"
 
+    # ── Geocoding (places ↔ coordinates, live) ────────────────────────────────
+    # Nominatim-compatible. There are NO coordinates stored in this codebase: every
+    # place a rider names is resolved here, and which state it sits in comes from the
+    # provider's administrative data. Point this at a self-hosted instance for
+    # production — the public server is rate-limited and asks to be used lightly.
+    geocoding_base_url: str = "https://nominatim.openstreetmap.org"
+    #: Nominatim rejects anonymous traffic. Identify the deployment, with contact info.
+    geocoding_user_agent: str = "HimCabTravelAssistant/1.0 (support@himcab.example)"
+    #: Scopes the search so "Manali" cannot match a hamlet on another continent.
+    geocoding_country_codes: str = "in"
+    #: A town does not move between two messages, and the provider asks for at most one
+    #: request a second — so results are held briefly rather than re-fetched per turn.
+    geocoding_cache_ttl_seconds: int = 86_400     # 24 h
+
+    # ── Routing (real road distance + drive time, live) ────────────────────────
+    # OSRM-compatible `/route/v1` shape. Replaces a table of surveyed routes and the
+    # great-circle fudge factors that filled its gaps.
+    routing_base_url: str = "https://router.project-osrm.org"
+    routing_path: str = "/route/v1/driving"
+    routing_cache_ttl_seconds: int = 21_600       # 6 h
+
     # ── Him Cab fare/cab services (Spring backend) ────────────────────────────
     # NOTE: the fare service is hosted at e.g. http://34.131.37.50:9002 — point
     # java_backend_url (or JAVA_BACKEND_URL env) at the fare host / API gateway.

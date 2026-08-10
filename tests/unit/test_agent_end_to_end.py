@@ -341,9 +341,9 @@ class TestWholeTurns:
         assert fare_events, "no cab_fare card for the app to render"
         assert len(fare_events[0]["payload"]["options"]) == 3
 
-        # Gurgaon is not a surveyed route, so this is the path that used to yield nothing.
-        assert fare_events[0]["payload"]["is_approximate"] is True
-        assert "APPROXIMATE" in agent.writer_prompt
+        # Gurgaon was in no surveyed table, so this is the path that used to yield
+        # nothing at all. The distance now comes from the routing engine.
+        assert fare_events[0]["payload"]["distance_km"] > 0
         assert "9,600" in agent.writer_prompt
 
         # The price also lands on the itinerary the app renders, not just in the text.
@@ -441,10 +441,15 @@ class TestLocalRiderGetsACabNotAnItinerary:
 
         assert final.get("structured_itinerary") is None
         assert "itinerary" not in _event_types(final)
-        assert "Do NOT write a day-by-day itinerary" in agent.writer_prompt
+        assert "FORBIDDEN" in agent.writer_prompt
+        assert "day-by-day plan" in agent.writer_prompt
         assert "ITINERARY JSON" not in agent.writer_prompt
         # The sightseeing brief that used to be added for locals is gone.
         assert "LOCAL VISITOR INSTRUCTIONS" not in agent.writer_prompt
+        # The arrival-day brief is itinerary guidance; in a cab reply it was what
+        # produced "you can enjoy light sightseeing when you arrive".
+        assert "Day 1 must begin" not in agent.writer_prompt
+        assert "travel fatigue" not in agent.writer_prompt
 
     @pytest.mark.asyncio
     async def test_only_cabs_that_seat_the_group_reach_the_rider(self, agent):
@@ -462,11 +467,13 @@ class TestLocalRiderGetsACabNotAnItinerary:
     async def test_the_reply_carries_the_drive_time_and_temperature(self, agent):
         final = await self._local_turn(agent)
 
+        route = final["route_estimate"]
         assert "THIS JOURNEY" in agent.writer_prompt
-        assert "4h 30m" in agent.writer_prompt          # surveyed Shimla → Manali
-        assert "270 km" in agent.writer_prompt
+        # Quoted from the resolved route, whatever the engine returned for it.
+        assert route["duration_text"] in agent.writer_prompt
+        assert f"{round(route['distance_km'])} km" in agent.writer_prompt
         assert "9.4" in agent.writer_prompt             # current temperature
-        assert final["route_estimate"]["duration_text"] == "4h 30m"
+        assert route["distance_km"] > 0
 
     @pytest.mark.asyncio
     async def test_the_rider_is_handed_to_the_booking_screen_with_map_pins(self, agent):
@@ -490,7 +497,7 @@ class TestLocalRiderGetsACabNotAnItinerary:
         """The app owns the booking flow — the assistant only opens the door to it."""
         final = await self._local_turn(agent)
 
-        assert "Do NOT ask whether they want to book" in agent.writer_prompt
+        assert "Do not ask whether they want to book" in agent.writer_prompt
         assert "shall I book" not in agent.writer_prompt.lower()
         assert final["structured_events"]
 

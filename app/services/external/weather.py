@@ -2,7 +2,11 @@
 app/services/external/weather.py
 ──────────────────────────────────
 OpenWeatherMap API wrapper with an in-process response cache.
-Falls back to cached data if API call fails.
+
+The destination's coordinates are geocoded live (`external/geocoding.py`) rather than
+read from a table, so any town a rider names can have a forecast. An unplaceable
+destination raises instead of falling back to a nearby city — labelling one town's
+weather with another's name is worse than having none.
 """
 
 import asyncio
@@ -17,28 +21,24 @@ from app.core.config import settings
 from app.core.exceptions import WeatherServiceError
 from app.core.logging import get_logger
 from app.models.alerts import AlertSeverity, AlertType, TravelAlert, WeatherReport
-from app.services import geo
+from app.services.external.geocoding import get_geocoding_service
 from app.services.local_cache import TTLCache
 
 log = get_logger(__name__)
 
-def _normalize_destination(destination: str) -> tuple[str, tuple[float, float]]:
-    """Resolve a destination to (canonical name, coordinates).
+async def _resolve_destination(destination: str) -> Optional[tuple[str, tuple[float, float]]]:
+    """Geocode a destination to (name, coordinates), or None if it can't be placed.
 
-    Coordinates come from `app/services/geo.py`, which is also what prices a route —
-    one table, so adding a town makes both its weather and its fare work. This module
-    used to keep its own shorter copy, which is how a place could be priceable but
-    have no forecast, or the reverse.
+    Live lookup — this module used to read a table of coordinates, so a town nobody had
+    listed had no forecast. There is no fallback destination: reporting Shimla's weather
+    under another town's name is worse than reporting none, and the reply is built to
+    say nothing about weather rather than say something wrong.
     """
-    found = geo.find_city(destination)
-    if found is not None:
-        return found
-
-    # Shimla is the fallback rather than an error: a rough regional forecast is more
-    # use than none, and the reply only ever quotes it as the destination's weather
-    # when the destination itself resolved.
-    log.warning("weather_destination_fallback", destination=destination, fallback="shimla")
-    return "shimla", geo.CITY_COORDS["shimla"]
+    place = await get_geocoding_service().geocode(destination)
+    if place is None:
+        log.info("weather_destination_unresolved", destination=destination)
+        return None
+    return place.name, place.coords
 
 
 def _parse_weather_response(data: dict, destination: str) -> WeatherReport:
@@ -167,7 +167,10 @@ class WeatherService:
         Fetch weather for a Himachal destination.
         Checks the local cache first, falls back to the API.
         """
-        dest_key, coords = _normalize_destination(destination)
+        resolved = await _resolve_destination(destination)
+        if resolved is None:
+            raise WeatherServiceError(f"Could not locate {destination!r} for a forecast")
+        dest_key, coords = resolved
 
         cached = self._cache.get(dest_key)
         if cached is not None:

@@ -25,11 +25,10 @@ class FareQuoteInput(BaseModel):
     """
     origin: str
     destination: str
-    # Required by the endpoint. None only when a place is unrecognised → skip the quote.
+    #: Required by the endpoint. Always a real road distance from the routing engine —
+    #: the caller resolves the journey before building this, and skips the quote
+    #: entirely when it cannot.
     distance_km: Optional[float] = None
-    # True when the distance was derived from coordinates rather than surveyed, which
-    # makes the resulting fare an estimate the rider must be told is approximate.
-    distance_is_approximate: bool = False
     trip_type: str = "OUTSTATION"                        # OUTSTATION | LOCAL | RENTAL
     booking_time: str = "12:00"                          # HH:mm — drives night-charge calc
     rent_hours: int = 0                                  # >0 only for RENTAL trips
@@ -118,7 +117,6 @@ class FareQuote(BaseModel):
     per_km_inr: Optional[float] = None
     trip_type: str = "OUTSTATION"
     distance_km: Optional[float] = None                  # what the fare was priced on
-    distance_is_approximate: bool = False                # → present the fare as an estimate
     offer_applied_server_side: bool = False              # estimate takes no offerId → always False
     alternatives: list[FareCategoryFare] = Field(default_factory=list)  # all categories returned
     raw: dict = Field(default_factory=dict)              # untouched backend payload, for debugging

@@ -15,7 +15,7 @@ from typing import Optional
 
 from app.core.logging import get_logger
 from app.models.session import ExtractedEntities
-from app.services.himcab.distances import RouteEstimate, resolve_route
+from app.services.geo import Journey
 from app.services.himcab.models import FareCategoryFare, FareQuoteInput
 
 log = get_logger(__name__)
@@ -61,36 +61,27 @@ def classify_trip_type(distance_km: Optional[float]) -> str:
 
 def build_fare_quote_input(
     entities: ExtractedEntities,
+    journey: Journey,
     trip_type: Optional[str] = None,
     booking_time: Optional[str] = None,
     rent_hours: int = 0,
-    route: Optional[RouteEstimate] = None,
 ) -> FareQuoteInput:
-    """Build the estimate input for the main origin→destination journey.
+    """Build the estimate input for a journey the caller has already resolved.
 
-    Pass `route` when the caller has already resolved the journey — the tool executor
-    has, from the rider's GPS fix, and re-deriving it here from city names would price
-    a different trip than the one the reply describes. Without it the route is resolved
-    from the entity names, which is the older, coarser path.
-
-    Distance is surveyed where known and computed from coordinates otherwise (see
-    `distances.resolve_route`); it is None only when a place is unrecognised, in
-    which case the caller must skip the quote — the endpoint requires distanceInMeters.
+    `journey` is required rather than optional: this module used to fall back to
+    re-deriving the route from city names, which priced a DIFFERENT trip than the one
+    the reply described — a rider standing in Solang Valley got the fare from Manali,
+    14 km down the road. One resolution, one distance, one price.
 
     `trip_type` defaults to whatever the distance implies; pass it explicitly to override.
     """
-    # Locals often only give home_city (not origin) — fall back to it so the distance
-    # lookup and the request body still get a usable origin city.
-    origin = entities.origin or entities.home_city or ""
-    destination = entities.destination or ""
-    resolved = route if route is not None else resolve_route(origin, destination)
-
     return FareQuoteInput(
-        origin=origin,
-        destination=destination,
-        distance_km=resolved.km if resolved else None,
-        distance_is_approximate=resolved.is_approximate if resolved else False,
-        trip_type=trip_type or classify_trip_type(resolved.km if resolved else None),
+        # The journey's own names, not the entity strings: these are what the geocoder
+        # resolved and therefore what the distance actually measures.
+        origin=journey.origin.name,
+        destination=journey.destination.name,
+        distance_km=journey.distance_km,
+        trip_type=trip_type or classify_trip_type(journey.distance_km),
         booking_time=booking_time or current_booking_time(),
         rent_hours=rent_hours,
         group_size=entities.group_size,

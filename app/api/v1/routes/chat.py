@@ -141,7 +141,7 @@ def _resolved_location_dto(location: RiderLocation | None) -> ResolvedLocation |
         in_himachal=location.in_himachal,
         place_name=location.place_name,
         place_distance_km=location.place_distance_km,
-        near_border=location.near_border,
+        state=location.state,
     )
 
 
@@ -162,7 +162,7 @@ def _effective_persona(
             requested=requested,
             served=persona,
             reason=reason,
-            near_border=bool(location and location.near_border),
+            state=location.state if location else None,
             user_id=user_id,
         )
     return persona
@@ -360,7 +360,7 @@ async def _handle_start(
     lon: float | None = None,
     accuracy_m: float | None = None,
 ) -> StartChatResponse:
-    location = RiderLocation.resolve(lat, lon, accuracy_m)
+    location = await RiderLocation.resolve(lat, lon, accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
     session = await start_chat(rider.user_id, served, location)
     # The greeting is already stored on the session by start_chat().
@@ -384,7 +384,7 @@ async def _handle_stream(
     accuracy_m: float | None = None,
 ) -> EventSourceResponse:
     _enforce_rate_limit(rider.user_id)
-    location = RiderLocation.resolve(lat, lon, accuracy_m)
+    location = await RiderLocation.resolve(lat, lon, accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
     session = await resolve_chat(
         rider.user_id,
@@ -416,7 +416,7 @@ async def _handle_message(
     rider: RiderIdentity, persona: str, body: ChatMessageRequest
 ) -> ChatResponse:
     _enforce_rate_limit(rider.user_id)
-    location = RiderLocation.resolve(body.lat, body.lon, body.accuracy_m)
+    location = await RiderLocation.resolve(body.lat, body.lon, body.accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
     session = await resolve_chat(
         rider.user_id,
@@ -494,11 +494,11 @@ async def route_by_location(
     it is safe to call on app start, on a location change, or not at all — the chat
     endpoints accept the same coordinates directly and will route themselves.
 
-    `location.near_border` is true within a few kilometres of the state line, where the
-    call could go either way. The rider's own words still win over both: someone who
-    says "I'm coming from Delhi" is treated as a visitor whatever their phone reports.
+    `location.state` carries the administrative state the fix resolved to, which is the
+    evidence behind the call. The rider's own words still win over it: someone who says
+    "I'm coming from Delhi" is treated as a visitor whatever their phone reports.
     """
-    location = RiderLocation.resolve(
+    location = await RiderLocation.resolve(
         coordinates.lat, coordinates.lon, coordinates.accuracy_m
     )
     persona, reason = resolve_persona(OUTSTATION, location)
@@ -507,7 +507,7 @@ async def route_by_location(
         persona=persona,
         reason=reason,
         in_himachal=bool(location and location.in_himachal),
-        near_border=bool(location and location.near_border),
+        state=location.state if location else None,
         user_id=rider.user_id,
     )
     return PersonaRouteResponse(

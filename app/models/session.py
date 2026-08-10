@@ -217,12 +217,12 @@ class StructuredEvent(BaseModel):
       - `snowfall_alert` → {risk: "high"|"critical", message, ...}
       - `cab_fare`       → Him Cab quote: {options[], category_name, fare_inr,
                            vehicle_label, seat_capacity, trip_type, distance_km,
-                           duration_text, distance_source, is_approximate, source,
+                           duration_text, source,
                            best_offer, fare_after_offer_inr}. `options` is already
                            narrowed to cabs that seat the party. `is_approximate` is
                            true when the route distance was computed rather than
                            surveyed — render the price as "approx" in that case.
-                           `distance_source` says which: "surveyed" | "gps" | "city".
+
       - `offers`         → live Him Cab coupons that apply to this trip:
                            {trip_type, fare_inr, offers: [{offer_id, coupon_code,
                            coupon_name, coupon_value_inr, minimum_value_inr,
@@ -253,23 +253,27 @@ class ResolvedLocation(BaseModel):
     lat: float
     lon: float
     in_himachal: bool = Field(
-        description="True when the fix falls inside Himachal Pradesh."
+        description=(
+            "True when the fix falls inside Himachal Pradesh, per the geocoder's "
+            "administrative boundaries."
+        )
     )
     place_name: Optional[str] = Field(
         default=None,
         description=(
-            "Nearest town we know, used as the pickup city for distances and fares. "
-            "Null when the fix is far from every place in our geography tables."
+            "The town the geocoder named for this fix, used as the pickup city for "
+            "distances and fares. Null when it could not name one."
         ),
     )
     place_distance_km: Optional[float] = Field(
-        default=None, description="How far that town is from the fix."
+        default=None, description="How far that town's centre is from the fix."
     )
-    near_border: bool = Field(
-        default=False,
+    state: Optional[str] = Field(
+        default=None,
         description=(
-            "True within a few km of the state line, where the classification could "
-            "go either way. Treat the persona as a default the rider may correct."
+            "The administrative state the fix resolved to — the evidence behind "
+            "`in_himachal`. Informational; the rider's own words still override the "
+            "persona if they say they are travelling from elsewhere."
         ),
     )
 

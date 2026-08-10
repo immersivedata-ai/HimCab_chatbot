@@ -51,12 +51,17 @@ async def lifespan(app: FastAPI):
     log.info("app_shutting_down")
 
     # Close HTTP clients used by external services
+    from app.services.external.geocoding import get_geocoding_service
+    from app.services.external.routing import get_routing_service
     from app.services.external.weather import get_weather_service
     from app.services.himcab import get_fare_service, get_offers_service
     try:
         await get_weather_service().close()
         await get_fare_service().close()
         await get_offers_service().close()
+        # Geography is resolved over the wire now, so these hold pooled connections too.
+        await get_geocoding_service().close()
+        await get_routing_service().close()
     except Exception as e:
         log.warning("http_client_close_failed", error=str(e))
 

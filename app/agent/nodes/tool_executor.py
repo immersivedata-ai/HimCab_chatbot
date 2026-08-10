@@ -9,11 +9,11 @@ Three tools run today:
   2. A real Him Cab fare quote, when the flag is on and a rider JWT was forwarded
   3. The rider's live Him Cab coupons, filtered to ones that apply to THIS trip
 
-It also resolves the journey itself (`_build_route_estimate`) with no network call,
+It also resolves the journey itself (`_resolve_journey`) via live geocoding + routing,
 because the distance, the drive time and the map coordinates all have to agree with the
 fare that was quoted on them. When the app has sent a GPS fix, the journey is measured
 from where the rider actually IS rather than from the centroid of the city they named —
-see `distances.resolve_route_from_fix`.
+see `_resolve_journey`.
 
 Order matters between the three: the fare needs the distance, and the offers need the
 fare (a coupon with a Rs 2,000 minimum is not an offer on a Rs 900 ride). So the route
@@ -40,7 +40,6 @@ from app.services.himcab import (
     get_offers_service,
     usable_offers,
 )
-from app.services.himcab.distances import RouteEstimate, resolve_route, resolve_route_from_fix
 from app.services.himcab.models import FareQuote, Offer
 
 log = get_logger(__name__)
@@ -83,14 +82,18 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
         return None
 
 
-def _resolve_journey(state: AgentState) -> Optional[RouteEstimate]:
-    """How far and how long, measured from the best origin we have.
+async def _resolve_journey(state: AgentState) -> Optional[geo.Journey]:
+    """Resolve the journey live, measured from the best pickup we have.
 
-    A GPS fix beats a city name whenever there is one: it is where the cab will
-    actually pick them up, and for a rider in Solang Valley or halfway down the Kullu
-    road, "Manali" is a different journey by 15-40 km. The fix is skipped only when the
-    rider has named an origin that is somewhere else entirely — booking a Delhi pickup
-    from a Shimla sofa is a real thing people do, and their words win.
+    A GPS fix beats a city name whenever there is one: it is where the cab will actually
+    collect them, and for a rider in Solang Valley or halfway down the Kullu road,
+    "Manali" is a different journey by 15-40 km. The fix is skipped only when the rider
+    has NAMED an origin somewhere else entirely — booking a Delhi pickup from a Shimla
+    sofa is a real thing people do, and their words win over their phone.
+
+    None when any part cannot be resolved. That is a real answer: no distance means the
+    fare endpoint cannot be called, and the reply says the fare is confirmed at booking
+    rather than quoting a guess.
     """
     entities = state.entities
     destination = entities.destination
@@ -101,87 +104,61 @@ def _resolve_journey(state: AgentState) -> Optional[RouteEstimate]:
     fix = state.rider_location
 
     if fix is not None and _fix_matches_origin(fix, named_origin):
-        # Re-resolved from the raw coordinates rather than trusting the stored fields:
-        # the fix may have been persisted turns ago, and the geography tables are the
-        # current ones. Deterministic, so it can only agree or improve.
-        return resolve_route_from_fix(
-            geo.locate(fix.lat, fix.lon), destination, fallback_origin=named_origin
+        return await geo.resolve_journey(
+            destination,
+            origin_name=named_origin,
+            # Re-resolved from the raw coordinates rather than the stored name: the fix
+            # is where the cab goes, and the town it sits in is only a label for it.
+            origin_fix=geo.LocationFix(
+                lat=fix.lat,
+                lon=fix.lon,
+                in_himachal=fix.in_himachal,
+                nearest_city=fix.place_name,
+                nearest_city_km=fix.place_distance_km,
+                state=fix.state,
+            ),
         )
     if named_origin:
-        return resolve_route(named_origin, destination)
+        return await geo.resolve_journey(destination, origin_name=named_origin)
     return None
 
 
 def _fix_matches_origin(fix, named_origin: Optional[str]) -> bool:
     """True when the device fix and the rider's stated starting city agree.
 
-    "Agree" means either they never named one, or the name resolves to the town the
-    fix sits in. Anything else — they said Delhi, the phone says Shimla — means the
-    fix is not the pickup point, so it must not price the trip.
+    "Agree" means either they never named one, or the name matches the town the fix
+    sits in. Anything else — they said Delhi, the phone says Shimla — means the fix is
+    not the pickup point, so it must not price the trip.
     """
     if not named_origin:
         return True
     if not fix.place_name:
         return False
-    return geo.canonical_name(named_origin) == geo.canonical_name(fix.place_name)
+    return geo.same_place(named_origin, fix.place_name)
 
 
-def _build_route_estimate(
-    state: AgentState, route: Optional[RouteEstimate]
-) -> Optional[dict]:
-    """Package the journey: both endpoints, their coordinates, distance and time.
+def _journey_dict(state: AgentState, journey: Optional[geo.Journey]) -> Optional[dict]:
+    """Package the journey for state: both endpoints with coordinates, plus the drive.
 
-    Coordinates are included because the app's booking screen needs to drop pins for
-    the pickup and the drop — handing it two place NAMES would make it geocode them
-    again and possibly land somewhere else than we priced. The pickup pin is the
-    rider's own fix when we have one, for the same reason.
+    Coordinates travel with it because the app's booking screen drops pins for the
+    pickup and the drop — handing it two place NAMES would make it geocode them again
+    and possibly land somewhere other than the point we priced.
     """
-    entities = state.entities
-    destination = entities.destination
-    if route is None or not destination:
+    if journey is None:
         return None
 
+    packaged = journey.as_dict()
+
+    # A vague fix is described as "near <town>" rather than named outright: the nearest
+    # place the geocoder could point at is not the same claim as where the rider is.
     fix = state.rider_location
-    named_origin = entities.origin or entities.home_city
-    from_gps = fix is not None and _fix_matches_origin(fix, named_origin)
-
-    if from_gps:
-        # A vague fix is described as "near <town>" rather than named outright — the
-        # nearest place we can point at is not the same claim as where they are.
-        origin_name = (
-            named_origin.title() if named_origin
-            else fix.place_name if fix.is_precise
-            else f"near {fix.place_name}" if fix.place_name
-            else "your current location"
-        )
-        origin_lat, origin_lon = fix.lat, fix.lon
-    else:
-        origin_place = geo.find_city(named_origin or "")
-        origin_name = (named_origin or "").title()
-        origin_lat = origin_place[1][0] if origin_place else None
-        origin_lon = origin_place[1][1] if origin_place else None
-
-    destination_place = geo.find_city(destination)
-    return {
-        "origin": {
-            "name": origin_name,
-            "lat": origin_lat,
-            "lon": origin_lon,
-        },
-        "destination": {
-            "name": destination.title(),
-            "lat": destination_place[1][0] if destination_place else None,
-            "lon": destination_place[1][1] if destination_place else None,
-        },
-        "distance_km": route.km,
-        "duration_minutes": route.duration_minutes,
-        "duration_text": route.duration_text,
-        # Surveyed routes carry measured figures; the rest are derived, and the reply
-        # has to say so rather than quoting them as fact.
-        "is_approximate": route.is_approximate,
-        # "surveyed" | "gps" | "city" — which of the three produced the number.
-        "source": route.source,
-    }
+    named_origin = state.entities.origin or state.entities.home_city
+    if fix is not None and _fix_matches_origin(fix, named_origin) and not named_origin:
+        if not fix.is_precise and fix.place_name:
+            packaged["origin"]["name"] = f"near {fix.place_name}"
+        elif not fix.place_name:
+            packaged["origin"]["name"] = "your current location"
+    return packaged
 
 
 async def tool_executor_node(state: AgentState) -> dict:
@@ -208,11 +185,12 @@ async def tool_executor_node(state: AgentState) -> dict:
     }
 
     # ── The journey ───────────────────────────────────────────────────────────
-    # Resolved once, in memory, and reused three ways: it prices the fare, it is the
-    # drive time quoted to a local rider, and its coordinates are what the app drops on
-    # its map at the booking handoff.
-    journey = _resolve_journey(state)
-    route_estimate = _build_route_estimate(state, journey)
+    # Resolved ONCE, live, and reused three ways: it prices the fare, it is the drive
+    # time quoted to a local rider, and its coordinates are what the app drops on its
+    # map at the booking handoff. Resolving it per consumer is how a price and a map
+    # end up describing different trips.
+    journey = await _resolve_journey(state)
+    route_estimate = _journey_dict(state, journey)
 
     # ── Real cab fare (Him Cab backend) ───────────────────────────────────────
     # Gated: flag on, a usable pickup point, pricing-relevant intent, and a forwarded
@@ -243,11 +221,11 @@ async def tool_executor_node(state: AgentState) -> dict:
         # trip_type comes from the journey's length, not the rider's persona — a
         # Himachal resident driving 270 km is still an intercity transfer. The route is
         # passed in so the price is built on the same distance the reply quotes.
-        quote_input = build_fare_quote_input(entities, route=journey)
-        # distanceInMeters is required by the endpoint. It is available for any pair of
-        # recognised places and for any GPS fix, so this only fires when the
-        # DESTINATION isn't in the geography tables at all.
-        if quote_input.distance_km is not None:
+        quote_input = build_fare_quote_input(entities, journey) if journey else None
+        # distanceInMeters is required by the endpoint, so no resolved journey means no
+        # quote. That happens when the geocoder cannot place a name or the routing
+        # engine finds no road — both are logged below rather than guessed around.
+        if quote_input is not None and quote_input.distance_km is not None:
             tasks["cab_fare"] = _safe_call(
                 get_fare_service().get_quote(quote_input, rider_jwt=state.rider_jwt),
                 "cab_fare",
@@ -255,11 +233,11 @@ async def tool_executor_node(state: AgentState) -> dict:
         else:
             quote_input = None
             log.warning(
-                "cab_fare_skipped_unknown_place",
+                "cab_fare_skipped_no_route",
                 origin=entities.origin or entities.home_city,
                 destination=destination,
                 session_id=state.session_id,
-                hint="add the place to app/services/geo.py CITY_COORDS",
+                hint="geocoder could not place a name, or no road route was found",
             )
 
     # ── Execute all in parallel ───────────────────────────────────────────────
@@ -298,10 +276,6 @@ async def tool_executor_node(state: AgentState) -> dict:
             # Journey context, so a fare card can show what the price is FOR without
             # the app having to join it against the route event itself.
             "duration_text": (route_estimate or {}).get("duration_text"),
-            "distance_source": (route_estimate or {}).get("source"),
-            # The rider is told the fare is approximate when the distance behind it was
-            # computed rather than surveyed.
-            "is_approximate": fq.distance_is_approximate,
             "options": [a.model_dump() for a in fq.alternatives],  # all categories for the app
             "source": "himcab_api",
         }
@@ -337,9 +311,7 @@ async def tool_executor_node(state: AgentState) -> dict:
         destination=destination,
         weather_ok=weather_obj is not None,
         has_cab_fare=cab_fare is not None,
-        fare_approximate=bool(cab_fare and cab_fare["is_approximate"]),
         route_km=(route_estimate or {}).get("distance_km"),
-        route_source=(route_estimate or {}).get("source"),
         offers=len(offers),
         visitor_type=state.visitor_type,
         session_id=state.session_id,

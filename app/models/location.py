@@ -31,16 +31,18 @@ class RiderLocation(BaseModel):
 
     lat: float
     lon: float
-    #: True when the fix is inside Himachal Pradesh. Decides the assistant persona.
+    #: True when the fix is inside Himachal Pradesh, per the geocoder's administrative
+    #: data. Decides the assistant persona.
     in_himachal: bool
-    #: Nearest town in the geography tables — the origin used for routes and fares.
-    #: None when the fix is far from everything we know.
+    #: The town the geocoder named for this fix — the pickup used for routes and fares.
+    #: None when it could name none.
     place_name: Optional[str] = None
-    #: Distance to that town. Small means the name IS where they are.
+    #: How far that town's centre is from the fix. Small means the name IS where they are.
     place_distance_km: Optional[float] = None
-    #: True when the fix is within a few km of the state line, where the outline in
-    #: `geo.HIMACHAL_OUTLINE` cannot reliably say which side it falls on.
-    near_border: bool = False
+    #: The state the geocoder reported. Kept because it is the EVIDENCE for
+    #: `in_himachal` — a support question about a misclassified rider is answerable
+    #: from this without re-running the lookup.
+    state: Optional[str] = None
     #: Reported by the device, when it sends one. Purely informational — a poor fix is
     #: still used, because it is better than the nothing we had before.
     accuracy_m: Optional[float] = None
@@ -71,12 +73,12 @@ class RiderLocation(BaseModel):
             in_himachal=fix.in_himachal,
             place_name=fix.place_name,
             place_distance_km=fix.nearest_city_km,
-            near_border=fix.near_border,
+            state=fix.state,
             accuracy_m=accuracy_m,
         )
 
     @classmethod
-    def resolve(
+    async def resolve(
         cls,
         lat: Optional[float],
         lon: Optional[float],
@@ -84,11 +86,14 @@ class RiderLocation(BaseModel):
     ) -> Optional["RiderLocation"]:
         """Resolve raw device coordinates, or None when they are unusable.
 
-        Unusable covers a missing pair and the (0, 0) a phone reports before it has a
-        fix — see `geo.valid_coordinates`. Returning None rather than a wrong location
-        keeps the agent on the ask-them path instead of pricing the wrong journey.
+        Unusable covers a missing pair, the (0, 0) a phone reports before it has a fix
+        (see `geo.valid_coordinates`), and a geocoder that cannot place the point.
+        Returning None rather than a wrong location keeps the agent on the ask-them
+        path instead of pricing the wrong journey.
+
+        Async because the lookup is live — there is no coordinate table to consult.
         """
         if lat is None or lon is None:
             return None
-        fix = geo.locate(lat, lon)
+        fix = await geo.locate(lat, lon)
         return cls.from_fix(fix, accuracy_m) if fix else None

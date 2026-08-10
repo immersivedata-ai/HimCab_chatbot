@@ -70,24 +70,26 @@ _PROCEED_PHRASES = (
 )
 
 
-def classify_visitor_type(
+async def classify_visitor_type(
     origin: Optional[str],
     origin_in_himachal: Optional[bool] = None,
 ) -> Optional[str]:
     """Classify the traveller from their starting city.
 
     `origin_in_himachal` is the extraction model's geography call and wins when it is
-    available; `app/services/geo.py` is the offline fallback — the same table that
-    prices the route, so a town is never known to one and unknown to the other.
+    available, because it costs nothing — it came back with the extraction. Otherwise
+    the city is geocoded and the provider's administrative state decides, which is the
+    same source that prices the route, so a town is never known to one and unknown to
+    the other.
 
-    Returns None when there is no origin, or when the origin is in neither, so the
+    Returns None when there is no origin, or when neither source can place it, so the
     caller keeps whatever classification it already had rather than guessing.
     """
     if not origin:
         return None
     if origin_in_himachal is not None:
         return LOCAL if origin_in_himachal else OUTSTATION
-    in_himachal = geo.is_in_himachal(origin)
+    in_himachal = await geo.place_in_himachal(origin)
     if in_himachal is None:
         return None
     return LOCAL if in_himachal else OUTSTATION
@@ -348,7 +350,7 @@ Report what the user has stated. Use null for anything they have not."""
 
     # ── Visitor classification (code, from the origin city) ───────────────────
     visitor_type = (
-        classify_visitor_type(merged.get("origin"), result_dict.get("origin_in_himachal"))
+        await classify_visitor_type(merged.get("origin"), result_dict.get("origin_in_himachal"))
         or state.visitor_type
     )
     if visitor_type:
@@ -364,7 +366,7 @@ Report what the user has stated. Use null for anything they have not."""
         log.info("short_answer_recovered", field=recovered, session_id=state.session_id)
         if recovered == "origin":
             # An origin recovered in code still decides the persona.
-            visitor_type = classify_visitor_type(merged.get("origin")) or visitor_type
+            visitor_type = await classify_visitor_type(merged.get("origin")) or visitor_type
             if visitor_type:
                 merged["visitor_type"] = visitor_type
                 if visitor_type == LOCAL and not merged.get("home_city"):

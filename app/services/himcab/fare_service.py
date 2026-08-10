@@ -78,7 +78,7 @@ class FareService:
 
         Raises on failure (network, 4xx, exhausted 5xx retries) — the caller wraps this
         in tool_executor._safe_call, which turns any exception into None (graceful
-        degradation to approximate pricing). The itinerary is never blocked by a fare miss.
+        degradation to no price at all). The reply is never blocked by a fare miss.
         """
         # Defensive: strip an accidentally-included 'Bearer ' prefix so we never send a
         # doubled 'Bearer Bearer <token>' header (silently rejected as 401 by the backend).
@@ -102,7 +102,6 @@ class FareService:
             url=self._fare_url,
             trip_type=quote_input.trip_type,
             distance_km=quote_input.distance_km,
-            distance_approximate=quote_input.distance_is_approximate,
             has_jwt=bool(rider_jwt),
         )
         raw = await self._post(self._fare_url, body, headers)
@@ -166,7 +165,6 @@ class FareService:
                 base_fare_inr=0,
                 trip_type=q.trip_type,
                 distance_km=q.distance_km,
-                distance_is_approximate=q.distance_is_approximate,
                 alternatives=options,
                 raw=raw if isinstance(raw, dict) else {},
             )
@@ -180,7 +178,6 @@ class FareService:
             seat_capacity=headline.seat_capacity,   # per-category, often null
             trip_type=q.trip_type,
             distance_km=q.distance_km,
-            distance_is_approximate=q.distance_is_approximate,
             offer_applied_server_side=False,        # estimate takes no offerId
             alternatives=options,
             raw=raw if isinstance(raw, dict) else {},

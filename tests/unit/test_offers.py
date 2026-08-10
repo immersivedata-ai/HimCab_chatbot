@@ -466,7 +466,6 @@ class TestOffersReachTheApp:
         assert handoff["offer_id"] == 7
         assert handoff["coupon_code"] == "HIMCAB200"
         assert handoff["fare_after_offer_inr"] == 4000
-        assert handoff["distance_source"] == "surveyed"
 
     def test_an_unverified_coupon_is_not_prefilled(self):
         """No fare came back, so the minimum-spend check never ran. Preselecting the

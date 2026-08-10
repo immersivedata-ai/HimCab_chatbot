@@ -141,7 +141,6 @@ def _build_fare_block(state: AgentState) -> str:
         )
 
     headline = cf.get("category_name")
-    approximate = bool(cf.get("is_approximate"))
     distance_km = cf.get("distance_km")
 
     lines = []
@@ -155,19 +154,13 @@ def _build_fare_block(state: AgentState) -> str:
         flag = "  (recommended for this group/budget)" if name == headline else ""
         lines.append(f"  - {name}: Rs {round(fare):,}{seat_str}{flag}")
 
-    route = f" for the ~{round(distance_km)} km journey" if distance_km else ""
-    if approximate:
-        header = (
-            f"### HIM CAB FARES (APPROXIMATE — use these EXACT figures)\n"
-            f"Estimated Him Cab fares{route}, based on a computed route distance.\n"
-            f"State them as approximate — say \"approx\" or \"around\" — and add that the "
-            f"exact fare is confirmed at booking. Do NOT round, adjust or invent numbers.\n"
-        )
-    else:
-        header = (
-            f"### HIM CAB FARES (real prices — use these EXACT figures)\n"
-            f"Live Him Cab fares{route}. Do NOT round, adjust or invent numbers.\n"
-        )
+    route = f" for the {round(distance_km)} km drive" if distance_km else ""
+    header = (
+        f"### HIM CAB FARES (live prices — use these EXACT figures)\n"
+        f"Him Cab fares{route}, quoted by the backend for the measured road\n"
+        f"distance. Do NOT round, adjust, average or invent a number, and do NOT\n"
+        f"present a range.\n"
+    )
     return header + "\n".join(lines) + "\n"
 
 
@@ -253,12 +246,7 @@ def _apply_real_fare(itinerary: Itinerary, cab_fare: dict) -> None:
     cp.base_fare_inr = fare
     cp.discounted_fare_inr = after_offer if discount else None
     cp.coupon_code = best_offer.get("coupon_code") if discount else None
-    # Distinguishes a fare priced on a surveyed route from one priced on a computed
-    # distance, so the app can render "approx" without re-deriving it.
-    cp.fare_source = (
-        "himcab_api_approx" if cab_fare.get("is_approximate")
-        else cab_fare.get("source", "himcab_api")
-    )
+    cp.fare_source = cab_fare.get("source", "himcab_api")
     if seats is not None:
         cp.seat_capacity = seats
     if vehicle:
@@ -353,11 +341,10 @@ def _build_journey_section(state: AgentState) -> str:
     if not route:
         return ""
 
-    qualifier = " (approximate)" if route.get("is_approximate") else ""
     return (
         f"\n### THIS JOURNEY\n"
         f"- {route['origin']['name']} to {route['destination']['name']}\n"
-        f"- Drive time: about {route['duration_text']}{qualifier}\n"
+        f"- Drive time: about {route['duration_text']}\n"
         f"- Distance: about {round(route['distance_km'])} km\n"
         f"Use these exact figures. Do NOT add traffic, road or weather-delay claims — "
         f"nothing here observes them.\n"
@@ -392,9 +379,6 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         "distance_km": route["distance_km"],
         "duration_minutes": route["duration_minutes"],
         "duration_text": route["duration_text"],
-        "is_approximate": route["is_approximate"],
-        # Where the distance came from: "surveyed" | "gps" | "city".
-        "distance_source": route.get("source"),
         "trip_type": fare.get("trip_type"),
         "passengers": state.entities.group_size,
         "travel_dates": state.entities.travel_dates,
@@ -562,7 +546,12 @@ def _build_system_prompt(state: AgentState) -> str:
         or entities.home_city
         or "not specified"
     )
-    if destination and (entities.origin or route_known):
+    # Itinerary mode ONLY. This block tells the model to open Day 1 with the arrival
+    # journey and to allow for travel fatigue — right for a visitor planning days, wrong
+    # for a resident booking a cab. In RIDE_MODE it was the instruction that produced
+    # "you can enjoy light sightseeing when you arrive" in a reply that was meant to be
+    # four facts and a booking link.
+    if destination and mode == slots.ITINERARY_MODE and (entities.origin or route_known):
         journey_from = origin_display
         travel_section = (
             f"\n**TRAVEL FROM ORIGIN — {journey_from.upper()} to {destination.upper()}:**\n"
@@ -686,7 +675,7 @@ def _build_system_prompt(state: AgentState) -> str:
         + (
             " List EVERY cab category from the HIM CAB FARES section above as its own bullet "
             "with the exact price shown there, and recommend the flagged one. Follow the "
-            "wording rule in that section about whether the prices are exact or approximate."
+            "prices exactly as written."
             if has_fares
             else " No fare is available, so promote Him Cab without stating any price and say "
                  "the exact fare is confirmed at booking."
@@ -723,33 +712,42 @@ def _build_system_prompt(state: AgentState) -> str:
 
     elif mode == slots.RIDE_MODE:
         # A Himachal resident booking a cab. They know the destination — what they are
-        # deciding is which vehicle, what it costs, how long the drive is and what the
-        # weather is doing. An itinerary here is noise wrapped around the useful part.
+        # deciding is which vehicle, what it costs and how long the drive is.
+        #
+        # This reply used to drift back into a travel brochure: bullets like "travelling
+        # with family means comfort matters" and "you can enjoy light sightseeing when
+        # you arrive", then a closing offer to plan their whole trip. Every one of those
+        # is padding around the four facts they came for, so the steps below name the
+        # bullets that are allowed and forbid the rest by exclusion.
         steps = [
             language_step,
             honesty_step,
-            f"Open with ONE line confirming the journey: {origin_display} to "
-            f"{destination_display}.",
-            "Then a JOURNEY line with the drive time and distance from THIS JOURNEY below, "
-            "exactly as given. Say nothing about traffic or road conditions — nothing here "
-            "measures them.",
-            weather_step,
+            f"Line 1: confirm the journey — {origin_display} to {destination_display}. "
+            f"One sentence, no adjectives.",
+            "Then EXACTLY these bullets, in this order, and NOTHING else:",
+            "  (a) Drive time and distance, copied from THIS JOURNEY below.",
             (
-                "Recommend the cabs from HIM CAB FARES as short bullets — vehicle, seats and "
-                "price. They are ALREADY narrowed to what seats this group, so recommend every "
-                "one of them and never mention a larger vehicle."
+                "  (b) One bullet PER CAB from HIM CAB FARES — vehicle, seats, price. "
+                "They are already narrowed to what seats this group: recommend all of "
+                "them, and never mention a larger vehicle or one not listed."
                 if has_fares
-                else "No fare is available for this route, so do NOT state or estimate any "
-                     "price. Say the fare is confirmed when they book."
+                else "  (b) No fare is available, so say in one line that the exact fare "
+                     "is confirmed on the booking screen. Do NOT state, estimate, "
+                     "range or imply any number."
             ),
-            "Do NOT write a day-by-day itinerary, sightseeing plan, hidden gems or any JSON — "
-            "they live here and are booking a ride, not planning a holiday.",
+            "  (c) Current temperature and condition at the destination, if REAL-TIME "
+            "DATA has them. One line.",
             coupons_step,
-            "Close with ONE short line telling them the booking screen is ready with their "
-            "pickup and drop already filled in. Do NOT ask whether they want to book, do not "
-            "ask them to confirm, and do not ask for any more details — the app takes over "
-            "from here.",
-            "Keep the whole reply under about 12 short lines.",
+            "FORBIDDEN — do not write any of these, in any wording: a day-by-day plan, "
+            "sightseeing or things-to-do suggestions, hidden gems, hotel or food "
+            "advice, comfort/safety reassurance, travel tips, trip length, group "
+            "composition, or any JSON. They live here. Every extra line pushes the "
+            "price and the booking link further out of view.",
+            "Last line: state that the booking screen is open with their pickup and "
+            "drop already filled in. It must NOT be a question. Do not ask whether "
+            "they want to book, do not ask them to confirm, do not offer to plan a "
+            "trip or an itinerary, and do not ask for any further detail.",
+            "Hard limit: at most 7 lines in total, including the bullets.",
         ]
         json_block = ""
 

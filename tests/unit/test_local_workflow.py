@@ -315,19 +315,22 @@ class TestWriterLocalContext:
         )
         prompt = _build_system_prompt(state)
 
-        assert "Do NOT write a day-by-day itinerary" in prompt
+        assert "FORBIDDEN" in prompt and "day-by-day plan" in prompt
         assert "ITINERARY JSON" not in prompt
         # The sightseeing brief is gone — matched on the instruction that sells it,
         # not on the words "hidden gems", which the ride prompt uses to FORBID it.
         assert "LOCAL VISITOR INSTRUCTIONS" not in prompt
         assert "prioritise hidden gems" not in prompt
+        # The arrival-day brief is itinerary guidance; in a cab reply it was what
+        # produced "you can enjoy light sightseeing when you arrive".
+        assert "Day 1 must begin" not in prompt
         # …and it must carry the ride facts instead.
         assert "THIS JOURNEY" in prompt
         assert "4h 30m" in prompt
         assert "270 km" in prompt
         assert "Shimla" in prompt and "Manali" in prompt
         # The app owns booking; the reply must not ask for it.
-        assert "Do NOT ask whether they want to book" in prompt
+        assert "Do not ask whether they want to book" in prompt
 
     def test_build_system_prompt_no_local_for_outstation(self):
         """System prompt for outstation visitor should NOT contain local instructions."""
