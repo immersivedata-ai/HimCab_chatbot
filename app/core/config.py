@@ -29,10 +29,8 @@ class Settings(BaseSettings):
 
     # ── Vertex AI / Gemini ────────────────────────────────────────────────────
     vertex_ai_location: str
-    gemini_pro_model: str
     gemini_flash_model: str
-    gemini_max_output_tokens: int = 8192
-    gemini_temperature: float = 0.7
+    llm_call_timeout_seconds: float = 45.0    # hard cap so a stalled Vertex AI call can't hang a request forever
 
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase_project_id: str
@@ -42,38 +40,48 @@ class Settings(BaseSettings):
     firestore_database_id: str = "(default)"
     firestore_sessions_collection: str = "trip_sessions"
     firestore_users_collection: str = "user_profiles"
+    # Durable "which conversation is this rider in" pointer — the system of record
+    # for multi-turn chat.
+    firestore_active_chats_collection: str = "active_chats"
 
-    # ── Redis ─────────────────────────────────────────────────────────────────
-    redis_host: str = "localhost"
-    redis_port: int = 6379
-    redis_password: str = ""
-    redis_db: int = 0
-    redis_ttl_weather: int = 1800      # 30 min
-    redis_ttl_places: int = 86400      # 24 h
-    redis_ttl_session: int = 7200      # 2 h
+    # ── Caching ───────────────────────────────────────────────────────────────
+    # In-process only (see app/services/local_cache.py) — there is no cache server.
+    weather_cache_ttl_seconds: int = 1800     # 30 min
 
     # ── External APIs ─────────────────────────────────────────────────────────
     openweather_api_key: str = ""
-    java_backend_url: str = "http://localhost:8080"
+    java_backend_url: str = "http://34.131.37.50:9002"
+
+    # ── Him Cab fare/cab services (Spring backend) ────────────────────────────
+    # NOTE: the fare service is hosted at e.g. http://34.131.37.50:9002 — point
+    # java_backend_url (or JAVA_BACKEND_URL env) at the fare host / API gateway.
+    enable_real_fares: bool = True            # Feature flag; True = fetch real Him Cab fares
+    himcab_fare_path: str = "/api/rider/fare/estimate"            # per-category fare estimate
+    himcab_fare_getall_path: str = "/api/rider/fare/get-all"      # rate-card catalog (Phase 2)
+    himcab_fare_timeout_seconds: float = 10.0
+
+    # ── Conversation policy ───────────────────────────────────────────────────
+    # How the agent balances "ask for the missing detail" against "just answer".
+    # These are the only knobs on that trade-off — the slot policy itself lives in
+    # app/agent/slots.py.
+    # How many times one detail may be asked for before the agent stops asking and
+    # proceeds with a stated assumption instead. Also caps consecutive turns that
+    # tell us nothing new. Set to 0 to never ask for anything optional — the
+    # destination is still asked for, since nothing can be planned without it.
+    max_clarification_attempts: int = 2
+    # Trip length used when the user never gives one. Always disclosed in the reply
+    # ("assuming a 3-day trip") — never presented as something the user said.
+    default_trip_duration_days: int = 3
 
     # ── Rate Limiting ─────────────────────────────────────────────────────────
+    # Enforced in-process (app/services/local_cache.py), so this is the budget per
+    # server instance rather than a global one.
     rate_limit_per_minute: int = 30
-    rate_limit_burst: int = 10
-
-    # ── Pub/Sub ───────────────────────────────────────────────────────────────
-    pubsub_alert_topic: str = "himachal-travel-alerts"
-    pubsub_alert_subscription: str = "alert-consumer-sub"
 
     # ── Derived helpers ───────────────────────────────────────────────────────
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
-
-    @property
-    def redis_url(self) -> str:
-        if self.redis_password:
-            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
-        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     @field_validator("cors_origins", mode="before")
     @classmethod

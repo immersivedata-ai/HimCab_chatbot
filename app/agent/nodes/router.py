@@ -20,21 +20,32 @@ Intent categories:
 Prompt template: app/prompts/templates/router_system.yaml
 """
 
+import asyncio
 import json
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agent.state import AgentState
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.prompts.builder import build_router_prompt
 from app.services.vertex_ai import get_vertex_ai_service
 
 log = get_logger(__name__)
 
+ROUTER_SYSTEM_PROMPT = build_router_prompt()
+
 
 async def router_node(state: AgentState) -> dict:
     """
     LangGraph Router Node.
-    Takes the latest user message and classifies intent + language + visitor_type.
+    Classifies the user's intent (for routing) and detected language.
+
+    NOTE: the router does NOT set `visitor_type`. That is owned by the persona seed
+    (which front-end page the user is on, set in app/api/v1/routes/chat.py) and, once an
+    origin city is known, by the planner's code-based classification. The router's LLM
+    guess at visitor_type was unreliable (e.g. it would flip an outstation visitor to
+    "local" on a bare HP place name), so we deliberately leave the field untouched here —
+    LangGraph keeps the seeded value for any channel a node doesn't write.
     """
     log.info("router_node_entered", session_id=state.session_id)
 
@@ -49,16 +60,18 @@ async def router_node(state: AgentState) -> dict:
         return {
             "intent": "general_query",
             "language": state.language,
-            "visitor_type": state.visitor_type,
             "node_trace": ["router"],
         }
 
     try:
         llm = get_vertex_ai_service().get_flash_model(streaming=False)
-        response = await llm.ainvoke([
-            SystemMessage(content=ROUTER_SYSTEM_PROMPT),
-            HumanMessage(content=f"User message: {latest_message}"),
-        ])
+        response = await asyncio.wait_for(
+            llm.ainvoke([
+                SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+                HumanMessage(content=f"User message: {latest_message}"),
+            ]),
+            timeout=settings.llm_call_timeout_seconds,
+        )
 
         raw = response.content.strip()
         if raw.startswith("```"):
@@ -70,33 +83,41 @@ async def router_node(state: AgentState) -> dict:
         intent = result.get("intent", "general_query")
         detected_language = result.get("language", "en")
         confidence = result.get("confidence", 0.5)
-        visitor_type = result.get("visitor_type", "unknown")
 
-        # Don't downgrade a previously classified visitor_type
-        if visitor_type == "unknown" and state.visitor_type:
-            visitor_type = state.visitor_type
+        # A bare reply to our own question ("delhi", "5") carries no signal of its own,
+        # so the classifier drops it into general_query — which would answer it as an
+        # open question instead of continuing the trip. When a question is in flight,
+        # that specific bucket is reclassified as the answer it almost certainly is.
+        # A recognisable topic switch ("actually, what's the weather there?") keeps its
+        # own intent and is still answered.
+        if intent == "general_query" and state.entities.last_asked_field:
+            log.info(
+                "intent_reclassified_as_answer",
+                asked_about=state.entities.last_asked_field,
+                session_id=state.session_id,
+            )
+            intent = "clarification"
 
         log.info(
             "intent_classified",
             intent=intent,
             language=detected_language,
             confidence=confidence,
-            visitor_type=visitor_type,
+            # informational only — NOT written to state (see docstring)
+            router_visitor_guess=result.get("visitor_type", "unknown"),
             session_id=state.session_id,
         )
 
         return {
             "intent": intent,
             "language": detected_language,
-            "visitor_type": visitor_type,
             "node_trace": ["router"],
         }
 
-    except (json.JSONDecodeError, Exception) as e:
-        log.warning("router_fallback", error=str(e))
+    except Exception as e:
+        log.warning("router_fallback", error=str(e), error_type=type(e).__name__)
         return {
             "intent": "general_query",
             "language": state.language,
-            "visitor_type": state.visitor_type,
             "node_trace": ["router"],
         }

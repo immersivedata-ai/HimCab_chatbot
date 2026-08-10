@@ -32,13 +32,10 @@ graph TB
     end
 
     subgraph Services["Service Layer"]
-        VAI["Vertex AI<br/>(Gemini Pro + Flash)"]
+        VAI["Vertex AI<br/>(Gemini Flash)"]
         FS["Firestore<br/>(Sessions + Users)"]
-        RC["Redis Cache<br/>(Hot Data)"]
         WS["Weather Service<br/>(OpenWeatherMap)"]
-        PS2["Places Service<br/>(Overpass API)"]
-        OF["Offers Engine<br/>(Local Compute)"]
-        BK["Booking Service<br/>(Java Backend)"]
+        FARE["Him Cab Fare Service<br/>(Java Backend)"]
     end
 
     APP --> GW
@@ -50,14 +47,11 @@ graph TB
     P -->|needs_clarification| CL --> PS
     P -->|ready| TE --> W --> PS
     TE --> WS
-    TE --> PS2
-    TE --> OF
-    TE --> BK
+    TE --> FARE
     R --> VAI
     P --> VAI
     W --> VAI
     PS --> FS
-    PS --> RC
     CTX --> FS
 ```
 
@@ -88,7 +82,7 @@ sequenceDiagram
         Agent-->>API: Clarification question
         API-->>App: SSE: token events
     else Ready to Plan
-        Agent->>Tools: Parallel: weather, places, offers
+        Agent->>Tools: Parallel: weather + Him Cab fare quote
         Agent->>LLM: Writer: generate response + JSON
         Agent->>DB: Persist: save message + itinerary
         Agent-->>API: Final response + structured events
@@ -101,24 +95,26 @@ sequenceDiagram
 | Component | GCP Service | Purpose |
 |-----------|------------|---------|
 | API Server | Cloud Run | Auto-scaling containerized backend |
-| Database | Firestore | Session + user profile persistence |
-| Cache | Memorystore (Redis) | Hot cache, rate limiting |
+| Database | Firestore | Session + user profile persistence — the only stateful dependency |
 | AI Models | Vertex AI (Gemini) | LLM inference |
 | Auth | Firebase Auth | JWT-based user authentication |
 | Secrets | Secret Manager | API keys, credentials |
 | Container Registry | Artifact Registry | Docker images |
-| Scheduler | Cloud Scheduler | Alert refresh jobs |
 
 ## Key Design Decisions
 
 1. **LangGraph over raw LangChain**: Provides stateful, graph-based agent execution with clear node boundaries and conditional routing.
 
-2. **Gemini Pro for planning, Flash for writing**: Pro handles complex JSON extraction (planner), Flash handles fast response generation (writer, router).
+2. **Flash everywhere**: routing and extraction are classification tasks and the writer is latency-critical, so all three use Gemini Flash. A Pro client was being constructed at startup and never called.
 
-3. **Redis as hot cache, Firestore as cold store**: Redis for sub-second reads (weather, places, sessions), Firestore for durable persistence.
+3. **Firestore only, no cache tier**: caching and rate limiting are in-process (`app/services/local_cache.py`). The cache held a conversation pointer that Firestore already mirrored, an alerts response, and a request counter — none worth an external dependency that could be down. The trade is that the rate limit is per instance; see `docs/api_reference.md`.
 
-4. **Parallel tool execution**: All external API calls (`weather`, `places`, `offers`) run concurrently via `asyncio.gather()` — total latency = slowest single call.
+4. **Parallel tool execution**: external calls run concurrently via `asyncio.gather()` — total latency = slowest single call, not their sum.
 
-5. **SSE streaming**: Token-by-token streaming for chat UX, with structured JSON events for mobile card rendering.
+5. **The conversation policy lives in code, not in a prompt**: `app/agent/slots.py` decides what to ask and when; the LLM only extracts what the user said. Letting the model own the flow produced questions in the wrong language, for details already given, and for details the request never needed.
 
-6. **Prompt templates in YAML**: Prompts are the most iterated component — extracting them into versioned YAML templates enables prompt engineering without code changes.
+6. **Live data overrides generated data**: the real fare and the real weather report are stamped onto the itinerary after validation, so a price or forecast can never be something the model invented — or something it forgot to include.
+
+7. **SSE streaming**: Token-by-token streaming for chat UX, with structured JSON events for mobile card rendering.
+
+8. **Prompt templates in YAML**: Prompts are the most iterated component — extracting them into versioned YAML templates enables prompt engineering without code changes.

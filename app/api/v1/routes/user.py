@@ -6,13 +6,17 @@ User profile and trip history endpoints.
 GET  /v1/user/profile   — Get user's profile and preferences
 PUT  /v1/user/profile   — Update preferences
 GET  /v1/user/trips     — Get past trip sessions
+
+AUTH: the same `Authorization: Bearer <Him Cab rider JWT>` as /v1/chat/* and
+/v1/session/*. These routes used to require a Firebase ID token, which is why a token
+accepted by chat was rejected here with 401. See app/api/v1/routes/session.py.
 """
 
 from fastapi import APIRouter, Depends
 
-from app.api.middleware.auth import FirebaseUser, get_current_user
+from app.api.middleware.rider_auth import RiderIdentity, get_rider
 from app.core.logging import get_logger
-from app.models.user import TravelPreferences, UserProfile
+from app.models.user import TravelPreferences
 from app.services.firestore import get_session_service, get_user_profile_service
 
 log = get_logger(__name__)
@@ -20,12 +24,12 @@ router = APIRouter(prefix="/user", tags=["User"])
 
 
 @router.get("/profile")
-async def get_profile(user: FirebaseUser = Depends(get_current_user)):
+async def get_profile(rider: RiderIdentity = Depends(get_rider)):
     """Get authenticated user's profile and travel preferences."""
     profile_svc = get_user_profile_service()
     profile = await profile_svc.get_or_create_profile(
-        user_id=user.uid,
-        firebase_uid=user.uid,
+        user_id=rider.user_id,
+        firebase_uid=rider.user_id,
     )
     return profile.model_dump()
 
@@ -33,13 +37,13 @@ async def get_profile(user: FirebaseUser = Depends(get_current_user)):
 @router.put("/profile")
 async def update_profile(
     preferences: TravelPreferences,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
 ):
     """Update user's travel preferences."""
     profile_svc = get_user_profile_service()
     profile = await profile_svc.get_or_create_profile(
-        user_id=user.uid,
-        firebase_uid=user.uid,
+        user_id=rider.user_id,
+        firebase_uid=rider.user_id,
     )
     profile.preferences = preferences
     await profile_svc.update_profile(profile)
@@ -48,7 +52,7 @@ async def update_profile(
 
 @router.get("/trips")
 async def get_past_trips(
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
     limit: int = 10,
 ):
     """
@@ -56,10 +60,10 @@ async def get_past_trips(
     Each session contains the full itinerary and conversation history.
     """
     session_svc = get_session_service()
-    sessions = await session_svc.list_user_sessions(user_id=user.uid, limit=limit)
+    sessions = await session_svc.list_user_sessions(user_id=rider.user_id, limit=limit)
 
     return {
-        "user_id": user.uid,
+        "user_id": rider.user_id,
         "trips": [
             {
                 "session_id": s.session_id,

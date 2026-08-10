@@ -3,7 +3,7 @@ app/agent/nodes/context.py
 ───────────────────────────
 Context Node — loads long-term user memory and injects it into agent state.
 Responsibilities:
-  1. Fetch UserProfile from Firestore (or Redis cache)
+  1. Fetch UserProfile from Firestore
   2. Convert past trips and preferences into a context summary string
   3. Hydrate state.user_profile and state.user_context_summary
   4. Detect frequent travellers and set loyalty tier info

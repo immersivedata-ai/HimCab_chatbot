@@ -34,11 +34,11 @@ test-cov: ## Run tests with coverage report
 # ── Code Quality ─────────────────────────────────────────────────────────────
 
 lint: ## Run linter (ruff)
-	ruff check app/ tests/ workers/
+	ruff check app/ tests/
 
 format: ## Auto-format code (ruff)
-	ruff format app/ tests/ workers/
-	ruff check --fix app/ tests/ workers/
+	ruff format app/ tests/
+	ruff check --fix app/ tests/
 
 type-check: ## Run type checker (mypy)
 	mypy app/ --ignore-missing-imports --no-error-summary
@@ -47,7 +47,7 @@ check: lint type-check ## Run all static checks (lint + type-check)
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 
-docker-up: ## Start Docker Compose stack (API + Redis)
+docker-up: ## Start the Docker Compose stack (API only — no cache server)
 	docker-compose up -d --build
 
 docker-down: ## Stop Docker Compose stack

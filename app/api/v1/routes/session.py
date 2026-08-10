@@ -8,18 +8,23 @@ GET    /v1/session/{id}      — Get session details
 GET    /v1/session/{id}/history    — Conversation history
 GET    /v1/session/{id}/itinerary  — Latest itinerary
 DELETE /v1/session/{id}      — Delete session
+
+AUTH: the same `Authorization: Bearer <Him Cab rider JWT>` the /v1/chat/* endpoints
+take. These routes previously required a Firebase ID token instead, so a token that
+worked for chat got a 401 here — which broke conversation restore in the app, since
+/history is how a client rehydrates a chat it already owns. One credential now works
+across the whole v1 API.
 """
 
 from fastapi import APIRouter, Depends
 
-from app.api.middleware.auth import FirebaseUser, get_current_user
-from app.core.exceptions import AuthorizationError, SessionNotFoundError
+from app.api.middleware.rider_auth import RiderIdentity, get_rider
+from app.core.exceptions import AuthorizationError
 from app.core.logging import get_logger
 from app.models.session import (
     CreateSessionRequest,
     CreateSessionResponse,
     TripSession,
-    SessionStatus,
 )
 from app.services.firestore import get_session_service
 
@@ -30,7 +35,7 @@ router = APIRouter(prefix="/session", tags=["Session"])
 @router.post("", response_model=CreateSessionResponse)
 async def create_session(
     body: CreateSessionRequest,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
 ):
     """
     Create a new trip planning session.
@@ -39,7 +44,7 @@ async def create_session(
     """
     session_svc = get_session_service()
     session = TripSession(
-        user_id=user.uid,
+        user_id=rider.user_id,
         language=body.language,
     )
 
@@ -50,7 +55,7 @@ async def create_session(
 
     await session_svc.create_session(session)
 
-    log.info("session_created_api", session_id=session.session_id, user_id=user.uid)
+    log.info("session_created_api", session_id=session.session_id, user_id=rider.user_id)
 
     return CreateSessionResponse(
         session_id=session.session_id,
@@ -62,13 +67,13 @@ async def create_session(
 @router.get("/{session_id}")
 async def get_session(
     session_id: str,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
 ):
     """Get session metadata and current status."""
     session_svc = get_session_service()
     session = await session_svc.get_session(session_id)
 
-    if session.user_id != user.uid:
+    if session.user_id != rider.user_id:
         raise AuthorizationError("You do not own this session")
 
     return {
@@ -85,7 +90,7 @@ async def get_session(
 @router.get("/{session_id}/history")
 async def get_session_history(
     session_id: str,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
     limit: int = 50,
 ):
     """
@@ -95,7 +100,7 @@ async def get_session_history(
     session_svc = get_session_service()
     session = await session_svc.get_session(session_id)
 
-    if session.user_id != user.uid:
+    if session.user_id != rider.user_id:
         raise AuthorizationError("You do not own this session")
 
     messages = session.messages[-limit:]
@@ -109,7 +114,7 @@ async def get_session_history(
 @router.get("/{session_id}/itinerary")
 async def get_session_itinerary(
     session_id: str,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
 ):
     """
     Get the latest generated itinerary for a session.
@@ -118,7 +123,7 @@ async def get_session_itinerary(
     session_svc = get_session_service()
     session = await session_svc.get_session(session_id)
 
-    if session.user_id != user.uid:
+    if session.user_id != rider.user_id:
         raise AuthorizationError("You do not own this session")
 
     if not session.current_itinerary:
@@ -133,13 +138,13 @@ async def get_session_itinerary(
 @router.delete("/{session_id}")
 async def delete_session(
     session_id: str,
-    user: FirebaseUser = Depends(get_current_user),
+    rider: RiderIdentity = Depends(get_rider),
 ):
     """Hard-delete a session and all its data."""
     session_svc = get_session_service()
     session = await session_svc.get_session(session_id)
 
-    if session.user_id != user.uid:
+    if session.user_id != rider.user_id:
         raise AuthorizationError("You do not own this session")
 
     await session_svc.delete_session(session_id)

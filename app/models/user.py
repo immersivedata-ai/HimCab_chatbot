@@ -6,13 +6,21 @@ Used by the Context Node to personalise the AI response.
 """
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.itinerary import BudgetRange, GroupType
-from app.models.offers import LoyaltyTier
 from app.models.session import Language
+
+
+class LoyaltyTier(str, Enum):
+    """Loyalty tiers auto-computed from total trip count."""
+    NEW = "new"             # 0 trips
+    REGULAR = "regular"     # 1-2 trips
+    FREQUENT = "frequent"   # 3-5 trips
+    PREMIUM = "premium"     # 6+ trips
 
 
 class TravelPreferences(BaseModel):

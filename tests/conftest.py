@@ -65,35 +65,6 @@ def places_query_state():
 # ── Mock Service Fixtures ────────────────────────────────────────────────────
 
 @pytest.fixture
-def mock_vertex_ai():
-    """Mock the Vertex AI service to avoid real API calls."""
-    with patch("app.services.vertex_ai.get_vertex_ai_service") as mock:
-        service = MagicMock()
-        mock.return_value = service
-        yield service
-
-
-@pytest.fixture
-def mock_redis():
-    """Mock Redis cache service."""
-    with patch("app.services.redis_cache.get_redis_cache") as mock:
-        cache = AsyncMock()
-        cache.get.return_value = None
-        cache.set.return_value = True
-        cache.get_places.return_value = None
-        cache.set_places.return_value = True
-        cache.get_weather.return_value = None
-        cache.set_weather.return_value = True
-        cache.get_crowd_data.return_value = None
-        cache.get_himachal_alerts.return_value = None
-        cache.ping.return_value = True
-        cache.check_rate_limit.return_value = (True, 1)
-        cache.invalidate_session.return_value = None
-        mock.return_value = cache
-        yield cache
-
-
-@pytest.fixture
 def mock_firestore():
     """Mock Firestore services."""
     with patch("app.services.firestore.get_session_service") as session_mock, \
@@ -106,23 +77,6 @@ def mock_firestore():
 
 
 # ── Sample Data Fixtures ─────────────────────────────────────────────────────
-
-@pytest.fixture
-def sample_places_data():
-    """Sample places data as returned by the Overpass service."""
-    return {
-        "hotels": [
-            {"name": "Hotel Mountain View", "address": "Mall Road", "rating": None, "price_level": "3", "maps_url": "https://osm.org/node/123", "types": ["hotel"], "source": "OpenStreetMap"},
-            {"name": "The Himalayan Retreat", "address": "Jogiwara Road", "rating": None, "price_level": "4", "maps_url": "https://osm.org/node/456", "types": ["hotel"], "source": "OpenStreetMap"},
-        ],
-        "restaurants": [
-            {"name": "Tibet Kitchen", "address": "Jogiwara Road", "rating": None, "price_level": "unknown", "maps_url": "https://osm.org/node/789", "types": ["restaurant"], "source": "OpenStreetMap"},
-        ],
-        "attractions": [
-            {"name": "Dalai Lama Temple Complex", "address": "McLeod Ganj", "rating": None, "price_level": "unknown", "maps_url": "https://osm.org/node/321", "types": ["attraction"], "source": "OpenStreetMap"},
-        ],
-    }
-
 
 @pytest.fixture
 def sample_weather_data():

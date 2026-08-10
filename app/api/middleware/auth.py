@@ -112,18 +112,3 @@ async def get_current_user(
         log.warning("auth_failed", error=str(e), error_type=type(e).__name__)
         raise AuthenticationError("Authentication failed.")
 
-
-async def optional_auth(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(_security),
-) -> FirebaseUser | None:
-    """
-    Optional auth dependency — returns None if no token provided.
-    Use for endpoints that work both authenticated and anonymously.
-    """
-    if credentials is None:
-        return None
-    try:
-        return await get_current_user(request, credentials)
-    except AuthenticationError:
-        return None

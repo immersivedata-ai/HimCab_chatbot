@@ -19,10 +19,8 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source
+# Copy application source (endpoints only — frontend/ is served locally, not deployed)
 COPY app/ ./app/
-COPY workers/ ./workers/
-COPY frontend/ ./frontend/
 
 # Set ownership
 RUN chown -R appuser:appuser /app

@@ -1,7 +1,7 @@
 """
 app/services/external/weather.py
 ──────────────────────────────────
-OpenWeatherMap API wrapper with Redis caching.
+OpenWeatherMap API wrapper with an in-process response cache.
 Falls back to cached data if API call fails.
 """
 
@@ -17,54 +17,28 @@ from app.core.config import settings
 from app.core.exceptions import WeatherServiceError
 from app.core.logging import get_logger
 from app.models.alerts import AlertSeverity, AlertType, TravelAlert, WeatherReport
-from app.services.redis_cache import get_redis_cache
+from app.services import geo
+from app.services.local_cache import TTLCache
 
 log = get_logger(__name__)
 
-# Himachal Pradesh destination → lat/lon mapping
-HIMACHAL_COORDS: dict[str, tuple[float, float]] = {
-    "dharamshala":    (32.2190, 76.3234),
-    "mcleod ganj":   (32.2431, 76.3214),
-    "manali":         (32.2396, 77.1887),
-    "shimla":         (31.1048, 77.1734),
-    "kullu":          (31.9579, 77.1095),
-    "kasol":          (32.0109, 77.3160),
-    "spiti":          (32.2461, 78.0338),
-    "dalhousie":      (32.5383, 75.9738),
-    "chail":          (30.9632, 77.2085),
-    "kufri":          (31.0985, 77.2675),
-    "bir billing":    (32.0392, 76.7125),
-    "khajjiar":       (32.5447, 76.0527),
-    "kinnaur":        (31.5800, 78.3000),
-    "chitkul":        (31.3530, 78.4370),
-    "tirthan valley": (31.6300, 77.4000),
-    "jibhi":          (31.6200, 77.3400),
-    "sangla":         (31.4200, 78.2500),
-    "narkanda":       (31.2600, 77.4500),
-    "manikaran":      (32.0050, 77.3450),
-    "solang valley":  (32.3200, 77.1700),
-    "palampur":       (32.1100, 76.5400),
-    "mandi":          (31.7100, 76.9300),
-}
-
-
 def _normalize_destination(destination: str) -> tuple[str, tuple[float, float]]:
-    """Find the closest matching Himachal destination and its coordinates."""
-    dest_lower = destination.lower().strip()
+    """Resolve a destination to (canonical name, coordinates).
 
-    # Exact prefix/suffix match
-    for key, coords in HIMACHAL_COORDS.items():
-        if key in dest_lower or dest_lower in key:
-            return key, coords
+    Coordinates come from `app/services/geo.py`, which is also what prices a route —
+    one table, so adding a town makes both its weather and its fare work. This module
+    used to keep its own shorter copy, which is how a place could be priceable but
+    have no forecast, or the reverse.
+    """
+    found = geo.find_city(destination)
+    if found is not None:
+        return found
 
-    # Partial word match (e.g. "mcleodganj" → "mcleod ganj")
-    for key, coords in HIMACHAL_COORDS.items():
-        if any(word in dest_lower for word in key.split() if len(word) > 3):
-            return key, coords
-
-    # Default to Shimla for unknown destinations
+    # Shimla is the fallback rather than an error: a rough regional forecast is more
+    # use than none, and the reply only ever quotes it as the destination's weather
+    # when the destination itself resolved.
     log.warning("weather_destination_fallback", destination=destination, fallback="shimla")
-    return "shimla", HIMACHAL_COORDS["shimla"]
+    return "shimla", geo.CITY_COORDS["shimla"]
 
 
 def _parse_weather_response(data: dict, destination: str) -> WeatherReport:
@@ -145,9 +119,13 @@ def _parse_weather_response(data: dict, destination: str) -> WeatherReport:
 
 class WeatherService:
     """
-    Async weather service with Redis caching layer.
+    Async weather service with an in-process response cache.
     Uses OpenWeatherMap free 2.5 endpoint — no paid subscription needed.
-    Free tier: 1,000 calls/day, sufficient for production with Redis caching.
+
+    The cache is per process (see app/services/local_cache.py), so the free tier's
+    1,000 calls/day is shared across instances rather than pooled. With a handful of
+    destinations on a 30-minute TTL that is roughly 48 calls per destination per
+    instance per day — comfortably inside the budget.
     """
 
     CURRENT_URL = "https://api.openweathermap.org/data/2.5/weather"
@@ -155,7 +133,7 @@ class WeatherService:
     _TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
 
     def __init__(self) -> None:
-        self._cache = get_redis_cache()
+        self._cache = TTLCache()
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -187,23 +165,19 @@ class WeatherService:
     async def get_weather(self, destination: str) -> WeatherReport:
         """
         Fetch weather for a Himachal destination.
-        Checks Redis cache first (30-min TTL), falls back to API.
+        Checks the local cache first, falls back to the API.
         """
         dest_key, coords = _normalize_destination(destination)
 
-        # 1. Check Redis cache
-        cached = await self._cache.get_weather(dest_key)
-        if cached:
+        cached = self._cache.get(dest_key)
+        if cached is not None:
             log.debug("weather_cache_hit", destination=dest_key)
-            return WeatherReport.model_validate(cached)
+            return cached
 
-        # 2. Fetch from API
         try:
             raw = await self._fetch_from_api(*coords)
             report = _parse_weather_response(raw, dest_key)
-
-            # 3. Cache the result
-            await self._cache.set_weather(dest_key, report.model_dump(mode="json"))
+            self._cache.set(dest_key, report, settings.weather_cache_ttl_seconds)
             log.info("weather_fetched", destination=dest_key)
             return report
 
@@ -219,14 +193,16 @@ class WeatherService:
             log.error("weather_fetch_failed", destination=dest_key, error=str(e), error_type=type(e).__name__)
             raise WeatherServiceError(f"Could not fetch weather for {destination}")
 
-    async def get_snowfall_risk(self, destination: str) -> dict:
-        """
-        Assess snowfall risk for a destination.
+    @staticmethod
+    def snowfall_from_report(report: WeatherReport) -> dict:
+        """Assess snowfall risk from an already-fetched weather report — pure, no I/O.
+
+        Callers that already have a WeatherReport (e.g. the tool executor, which fetches
+        weather once) should use this instead of get_snowfall_risk() to avoid a second
+        weather fetch for the same destination.
         Returns: {"risk": "high/medium/low/none", "expected_mm": float, "message": str}
         """
-        report = await self.get_weather(destination)
         total_snow = sum(d.get("snow_mm", 0) for d in report.forecast_7day[:3])
-
         if total_snow > 20:
             return {"risk": "high", "expected_mm": total_snow, "message": "Heavy snowfall expected. Road closures possible."}
         elif total_snow > 5:
@@ -234,6 +210,14 @@ class WeatherService:
         elif total_snow > 0:
             return {"risk": "low", "expected_mm": total_snow, "message": "Light snowfall possible."}
         return {"risk": "none", "expected_mm": 0.0, "message": "No snowfall expected."}
+
+    async def get_snowfall_risk(self, destination: str) -> dict:
+        """
+        Assess snowfall risk for a destination (fetches weather, then derives risk).
+        Returns: {"risk": "high/medium/low/none", "expected_mm": float, "message": str}
+        """
+        report = await self.get_weather(destination)
+        return self.snowfall_from_report(report)
 
     async def close(self) -> None:
         """Close the HTTP client and release connections."""

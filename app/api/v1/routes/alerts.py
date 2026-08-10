@@ -14,11 +14,10 @@ from uuid import uuid4
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.api.middleware.auth import optional_auth
 from app.core.logging import get_logger
 from app.models.alerts import AlertSeverity, AlertType, HimachalAlertsSummary, TravelAlert
 from app.services.external.weather import get_weather_service
-from app.services.redis_cache import get_redis_cache
+from app.services.local_cache import TTLCache
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
@@ -27,6 +26,12 @@ router = APIRouter(prefix="/alerts", tags=["Alerts"])
 MONITORED_DESTINATIONS = [
     "shimla", "manali", "dharamshala", "kasol", "spiti", "dalhousie"
 ]
+
+# This endpoint is public and hits the weather API several times, so the result is
+# cached. In-process rather than shared — see app/services/local_cache.py.
+_ALERTS_CACHE_KEY = "himachal"
+_ALERTS_TTL_SECONDS = 900          # 15 min
+_alerts_cache = TTLCache()
 
 
 def _compute_overall_severity(alerts: list[TravelAlert]) -> AlertSeverity:
@@ -45,15 +50,12 @@ async def get_himachal_alerts():
     """
     Get aggregated travel alerts for all major Himachal destinations.
     This endpoint is public — no auth required (shown on home screen).
-    Cached in Redis for 15 minutes.
+    Cached for 15 minutes.
     """
-    cache = get_redis_cache()
-
-    # Check cache first
-    cached = await cache.get_himachal_alerts()
-    if cached:
+    cached = _alerts_cache.get(_ALERTS_CACHE_KEY)
+    if cached is not None:
         log.debug("himachal_alerts_cache_hit")
-        return HimachalAlertsSummary.model_validate(cached)
+        return cached
 
     # Fetch weather for key destinations
     weather_svc = get_weather_service()
@@ -101,9 +103,7 @@ async def get_himachal_alerts():
         advisory=advisory,
     )
 
-    # Cache for 15 minutes
-    await cache.set_himachal_alerts(summary.model_dump(mode="json"), ttl=900)
-
+    _alerts_cache.set(_ALERTS_CACHE_KEY, summary, _ALERTS_TTL_SECONDS)
     return summary
 
 

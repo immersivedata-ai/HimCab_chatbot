@@ -434,9 +434,9 @@
       <div class="welcome-logo">
         <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20h18L12 4 3 20z"/><path d="M12 4v8"/></svg>
       </div>
-      <h1 class="welcome-title">अपनी हिमाचल यात्रा प्लान करें</h1>
+      <h1 class="welcome-title">Plan Your Himachal Trip</h1>
       <p class="welcome-desc">
-        Him Cab का AI ट्रैवल कंसीयर्ज। मनाली, शिमला, धर्मशाला — जहाँ भी जाना हो, पूछें!
+        Him Cab's AI travel concierge. Manali, Shimla, Dharamshala — wherever you want to go, just ask!
       </p>
     </div>
     <div id="messages"></div>
@@ -447,22 +447,36 @@
       <span id="error-text"></span>
     </div>
     <div class="input-wrapper">
-      <textarea id="msg-input" rows="1" placeholder="अपनी हिमाचल यात्रा के बारे में पूछें..." autofocus></textarea>
+      <textarea id="msg-input" rows="1" placeholder="Ask about your Himachal trip..." autofocus></textarea>
       <button id="send-btn" title="Send" disabled>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
     <div class="input-footer">
-      <span class="input-hint">Enter दबाएं भेजने के लिए · Shift+Enter नई लाइन के लिए</span>
+      <span class="input-hint">Press Enter to send · Shift+Enter for new line</span>
       <span class="session-info" id="session-info"></span>
     </div>
   </div>
 
   <script>
+    // Reference implementation of the chat contract. The ONLY thing this page sends
+    // is the rider's JWT — no session id, no persona, no rider id.
     const API_BASE = window.location.origin;
-    const AUTH_TOKEN = "dev-test-token";
+    const CHAT_API = `${API_BASE}/v1/chat/outstation`;
 
-    let sessionId = null;
+    // The rider's Him Cab JWT. This page does NOT log in to Him Cab itself — the
+    // native app already holds this token from its own cab-booking login and hands it
+    // over when it opens the chat WebView, as `?rider_token=<JWT>` in the URL.
+    // Falls back to the dev token so the page is usable standalone (dev only), in
+    // which case real fares are skipped and pricing stays approximate.
+    const RIDER_TOKEN =
+      new URLSearchParams(window.location.search).get("rider_token") || "dev-test-token";
+
+    const authHeaders = (extra = {}) => ({
+      "Authorization": `Bearer ${RIDER_TOKEN}`,
+      ...extra,
+    });
+
     let isStreaming = false;
 
     const $messages    = document.getElementById("messages");
@@ -506,29 +520,28 @@
       updateSendBtn();
     });
 
-    async function createSession() {
+    // One call when the dialog opens. The backend creates the conversation and hands
+    // back the greeting to show as the first assistant bubble.
+    async function startChat() {
       try {
-        const res = await fetch(`${API_BASE}/v1/session`, {
+        const res = await fetch(`${CHAT_API}/start`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${AUTH_TOKEN}`,
-          },
-          body: JSON.stringify({ language: "hi" }),
+          headers: authHeaders(),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.detail || err.message || `HTTP ${res.status}`);
         }
         const data = await res.json();
-        sessionId = data.session_id;
-        $sessionInfo.textContent = `session: ${sessionId.slice(0, 8)}`;
+
+        $sessionInfo.textContent = `session: ${data.session_id.slice(0, 8)}`;
         setStatus(true);
-        return sessionId;
+        addMessage("assistant", data.message);
+        return true;
       } catch (e) {
-        showError("Session creation failed: " + e.message);
+        showError("Could not start chat: " + e.message);
         setStatus(false);
-        return null;
+        return false;
       }
     }
 
@@ -600,11 +613,6 @@
     async function sendMessage(userText) {
       if (!userText.trim() || isStreaming) return;
 
-      if (!sessionId) {
-        const sid = await createSession();
-        if (!sid) return;
-      }
-
       isStreaming = true;
       updateSendBtn();
       addMessage("user", userText);
@@ -613,11 +621,8 @@
       updateSendBtn();
       showTyping();
 
-      const url = `${API_BASE}/v1/chat/stream?` + new URLSearchParams({
-        session_id: sessionId,
-        message: userText,
-        language: "hi",
-      });
+      // Just the message text — the backend resolves the conversation from the JWT.
+      const url = `${CHAT_API}/stream?` + new URLSearchParams({ message: userText });
 
       let fullText = "";
       let bubble = null;
@@ -625,9 +630,7 @@
       let nodeTrace = [];
 
       try {
-        const response = await fetch(url, {
-          headers: { "Authorization": `Bearer ${AUTH_TOKEN}` },
-        });
+        const response = await fetch(url, { headers: authHeaders() });
 
         if (!response.ok) {
           const err = await response.json().catch(() => ({}));
@@ -722,11 +725,12 @@
       }
     });
 
-    $btnNew.addEventListener("click", () => {
-      sessionId = null;
+    // "New chat" — /start always begins a fresh conversation server-side.
+    $btnNew.addEventListener("click", async () => {
       $messages.innerHTML = "";
       $welcome.style.display = "flex";
       $sessionInfo.textContent = "";
+      await startChat();
       $input.focus();
     });
 
@@ -741,6 +745,9 @@
 
     checkHealth();
     setInterval(checkHealth, 30000);
+
+    // Opening the dialog greets the user straight away.
+    startChat();
     $input.focus();
   </script>
 </body>

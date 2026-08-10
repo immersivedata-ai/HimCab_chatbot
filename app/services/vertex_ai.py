@@ -9,14 +9,13 @@ Provides async wrappers for:
 """
 
 import asyncio
-from typing import AsyncGenerator, Optional
+from typing import Optional
 
 import vertexai
 from langchain_google_vertexai import ChatVertexAI
 from vertexai.generative_models import GenerativeModel
 
 from app.core.config import settings
-from app.core.exceptions import LLMRateLimitError, AgentExecutionError
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -39,15 +38,9 @@ class VertexAIService:
     def __init__(self) -> None:
         _init_vertex_ai()
 
-        # Gemini Pro — used in Planner node (complex reasoning + structured output)
-        self.gemini_pro = ChatVertexAI(
-            model_name=settings.gemini_pro_model,
-            project=settings.gcp_project_id,
-            location=settings.vertex_ai_location,
-            temperature=settings.gemini_temperature,
-            max_output_tokens=settings.gemini_max_output_tokens,
-            streaming=False,
-        )
+        # Flash only. The Pro model was instantiated on every startup and never called:
+        # the router and planner do classification and extraction, and the writer is
+        # latency-critical — Flash is the right tier for all three.
 
         # Gemini Flash — used in Writer node (speed + streaming)
         self.gemini_flash = ChatVertexAI(
@@ -69,26 +62,16 @@ class VertexAIService:
             streaming=False,
         )
 
-        log.info(
-            "vertex_ai_initialized",
-            pro_model=settings.gemini_pro_model,
-            flash_model=settings.gemini_flash_model,
-        )
-
-    def get_pro_model(self) -> ChatVertexAI:
-        """Return Gemini Pro for complex planning tasks."""
-        return self.gemini_pro
+        log.info("vertex_ai_initialized", flash_model=settings.gemini_flash_model)
 
     def get_flash_model(self, streaming: bool = True) -> ChatVertexAI:
         """Return Gemini Flash for fast streaming responses."""
         return self.gemini_flash if streaming else self.gemini_flash_structured
 
-    async def count_tokens(self, text: str, model: str = "flash") -> int:
+    async def count_tokens(self, text: str) -> int:
         """Estimate token count for a given text string."""
         try:
-            _model = GenerativeModel(
-                settings.gemini_flash_model if model == "flash" else settings.gemini_pro_model
-            )
+            _model = GenerativeModel(settings.gemini_flash_model)
             response = await asyncio.to_thread(
                 _model.count_tokens, [text]
             )

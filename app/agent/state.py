@@ -4,9 +4,13 @@ app/agent/state.py
 LangGraph AgentState — the single shared state object passed between nodes.
 Every node reads from and writes to this state.
 This is what makes the graph stateful.
+
+Every field here is written by one node and read by another. A channel that nothing
+reads is a channel that quietly costs serialisation, confuses the next reader, and
+hides the fact that a feature was never wired up — so if a field stops being used,
+it is removed rather than left as a placeholder.
 """
 
-from enum import Enum
 from typing import Annotated, Any, Optional
 from operator import add
 
@@ -17,18 +21,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.itinerary import Itinerary
 from app.models.session import ExtractedEntities, Language
 from app.models.user import UserProfile
-
-
-class IntentType(str, Enum):
-    """All recognised user intents for the router node."""
-    PLAN_TRIP = "plan_trip"
-    WEATHER_QUERY = "weather_query"
-    HOTEL_QUERY = "hotel_query"
-    PLACES_QUERY = "places_query"
-    COST_QUERY = "cost_query"
-    SHOW_ITINERARY = "show_itinerary"
-    GENERAL_QUERY = "general_query"
-    CLARIFICATION = "clarification"
 
 
 class AgentState(BaseModel):
@@ -52,6 +44,15 @@ class AgentState(BaseModel):
     visitor_type: Optional[str] = None    # "outstation" | "local" — classified by Router/Planner
     needs_clarification: bool = False     # True if Planner needs more info
     clarification_question: Optional[str] = None
+    last_asked_field: Optional[str] = None  # Which entity field was asked last turn — prevents re-asking
+
+    # ── What the Planner could NOT confirm (from app/agent/slots.py) ──────────
+    # Details the agent gave up asking for and is proceeding without. The Writer is
+    # required to state each one as an assumption — this is what separates "assuming
+    # a 3-day trip, tell me if that's wrong" from silently inventing a trip length.
+    # Everything that shapes a plan is asked for BEFORE the plan is written, so this
+    # list is only ever populated when the user declined to answer.
+    assumed_fields: list[str] = Field(default_factory=list)
 
     # ── User context (from Context node) ─────────────────────────────────────
     user_profile: Optional[UserProfile] = None
@@ -60,34 +61,27 @@ class AgentState(BaseModel):
     # ── Extracted information (from Planner node) ─────────────────────────────
     entities: ExtractedEntities = Field(default_factory=ExtractedEntities)
 
-    # ── Booking ───────────────────────────────────────────────────────────────
-    booking_intent_active: bool = False
-    booking_details: dict = Field(default_factory=dict)
-    user_confirmed_booking: bool = False
-    final_booking_id: Optional[str] = None
+    # ── Rider identity for Him Cab backend (the caller's Bearer token) ────────
+    # exclude=True: never serialized by model_dump() (SSE/Firestore safe).
+    # repr=False: kept out of reprs/logs.
+    rider_jwt: Optional[str] = Field(default=None, exclude=True, repr=False)
+
+    # ── Live token streaming ──────────────────────────────────────────────────
+    # An asyncio.Queue set by the SSE endpoint; the Writer pushes real LLM tokens
+    # onto it for token-by-token delivery. None on the non-streaming path.
+    # exclude=True: runtime-only, never serialized.
+    token_stream: Optional[Any] = Field(default=None, exclude=True, repr=False)
 
     # ── Tool results (from Tool Executor node) ────────────────────────────────
     weather_data: Optional[dict] = None
     snowfall_data: Optional[dict] = None
-    places_data: dict[str, list] = Field(default_factory=dict)  # category → places
-    drive_times: dict[str, dict] = Field(default_factory=dict)
-    travel_estimate: Optional[dict] = None   # origin→destination travel info (duration, distance, mode)
-    route_plan: Optional[dict] = None        # Full multi-leg route plan for outstation visitors
-    crowd_data: dict[str, dict] = Field(default_factory=dict)
-    available_offers: list[dict] = Field(default_factory=list)  # Personalised offers from OffersService
-
-    # ── Frequent Traveller (from Context node) ────────────────────────────────
-    is_frequent_traveller: bool = False
+    cab_fare: Optional[dict] = None          # Real fare quote (base + cab details) or None
 
     # ── Generated output (from Writer node) ───────────────────────────────────
     final_response_text: str = ""
     structured_itinerary: Optional[Itinerary] = None
     structured_events: Annotated[list[dict], add] = Field(default_factory=list)
 
-    # ── Streaming ─────────────────────────────────────────────────────────────
-    streaming_tokens: Annotated[list[str], add] = Field(default_factory=list)
-
     # ── Metadata ──────────────────────────────────────────────────────────────
     error: Optional[str] = None
-    tokens_used: int = 0
     node_trace: Annotated[list[str], add] = Field(default_factory=list)

@@ -18,6 +18,9 @@ graphify-out/
 .benchmarks/
 .agents/
 
+# ── Frontend (test UI — served locally only, not part of the API deployment) ──
+frontend/
+
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/

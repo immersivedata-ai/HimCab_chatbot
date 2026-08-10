@@ -44,34 +44,6 @@ class SessionNotFoundError(HimCabBaseError):
     message = "Trip session not found"
 
 
-class SessionExpiredError(HimCabBaseError):
-    status_code = 410
-    error_code = "SESSION_EXPIRED"
-    message = "Trip session has expired"
-
-
-# ── Agent ─────────────────────────────────────────────────────────────────────
-
-class AgentExecutionError(HimCabBaseError):
-    status_code = 500
-    error_code = "AGENT_EXECUTION_FAILED"
-    message = "AI agent encountered an error during execution"
-
-
-class ToolExecutionError(HimCabBaseError):
-    status_code = 502
-    error_code = "TOOL_EXECUTION_FAILED"
-    message = "A tool called by the AI agent failed"
-
-
-class LLMRateLimitError(HimCabBaseError):
-    status_code = 429
-    error_code = "LLM_RATE_LIMIT"
-    message = "AI service rate limit reached. Please try again shortly."
-
-
-# ── External Services ─────────────────────────────────────────────────────────
-
 class ExternalServiceError(HimCabBaseError):
     status_code = 502
     error_code = "EXTERNAL_SERVICE_ERROR"
@@ -83,22 +55,12 @@ class WeatherServiceError(ExternalServiceError):
     message = "Weather data could not be fetched"
 
 
-class PlacesServiceError(ExternalServiceError):
-    error_code = "PLACES_SERVICE_ERROR"
-    message = "Places/Maps data could not be fetched"
-
-
-# ── Validation ────────────────────────────────────────────────────────────────
-
-class ValidationError(HimCabBaseError):
-    status_code = 422
-    error_code = "VALIDATION_ERROR"
-    message = "Request validation failed"
-
-
-# ── Rate Limit ────────────────────────────────────────────────────────────────
-
 class RateLimitExceededError(HimCabBaseError):
+    """429 for the caller sending too many requests.
+
+    Pass `retry_after=<seconds>` so the client is told when to come back; it surfaces
+    both as a `Retry-After` response header and in `error.details.retry_after`.
+    """
     status_code = 429
     error_code = "RATE_LIMIT_EXCEEDED"
     message = "Too many requests. Please wait before trying again."
@@ -107,6 +69,13 @@ class RateLimitExceededError(HimCabBaseError):
 # ── Exception Handlers ────────────────────────────────────────────────────────
 
 def _error_response(exc: HimCabBaseError) -> JSONResponse:
+    headers: dict[str, str] = {}
+
+    # Standard back-off signal for 429/503 — clients should honour it before retrying.
+    retry_after = exc.context.get("retry_after")
+    if retry_after is not None:
+        headers["Retry-After"] = str(int(retry_after))
+
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -116,6 +85,7 @@ def _error_response(exc: HimCabBaseError) -> JSONResponse:
                 "details": exc.context if exc.context else None,
             }
         },
+        headers=headers or None,
     )
 
 

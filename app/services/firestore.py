@@ -35,6 +35,27 @@ def get_firestore_client() -> AsyncClient:
     return _firestore_client
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _pointer_doc_id(user_id: str, persona: str) -> str:
+    """Build a Firestore-legal document id for the active-conversation pointer.
+
+    `user_id` looks like `rider:7428186933`. Firestore forbids '/' in document ids and
+    reserves ids of the form `__x__`, so both are neutralised here.
+    """
+    raw = f"{persona}__{user_id}"
+    cleaned = raw.replace("/", "_").replace("\\", "_")
+    return cleaned.strip("_") or "unknown"
+
+
+def _sort_key_updated_at(session: TripSession) -> datetime:
+    """Timezone-safe sort key — Firestore round-trips can yield naive datetimes."""
+    value = session.updated_at or session.created_at
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 # ── Session Service ───────────────────────────────────────────────────────────
 
 class SessionService:
@@ -46,6 +67,7 @@ class SessionService:
     def __init__(self) -> None:
         self._db = get_firestore_client()
         self._col = self._db.collection(settings.firestore_sessions_collection)
+        self._pointers = self._db.collection(settings.firestore_active_chats_collection)
 
     async def create_session(self, session: TripSession) -> TripSession:
         """Persist a new session to Firestore."""
@@ -64,13 +86,6 @@ class SessionService:
             raise SessionNotFoundError(f"Session {session_id} not found")
         data = doc.to_dict()
         return TripSession.from_firestore_dict(data)
-
-    async def update_session(self, session: TripSession) -> None:
-        """Persist updated session data."""
-        session.updated_at = datetime.now(timezone.utc)
-        doc_ref = self._col.document(session.session_id)
-        await doc_ref.set(session.to_firestore_dict())
-        log.debug("session_updated", session_id=session.session_id)
 
     async def append_message(
         self,
@@ -115,14 +130,39 @@ class SessionService:
         user_id: str,
         limit: int = 10,
     ) -> list[TripSession]:
-        """Fetch all sessions for a user, ordered by most recent."""
-        query = (
-            self._col
-            .where("user_id", "==", user_id)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-        sessions = []
+        """Fetch a user's sessions, most recent first.
+
+        The ordered query needs a composite index on (user_id, created_at). If that
+        index is missing Firestore raises FAILED_PRECONDITION, which used to take the
+        whole conversation-resume path down with it. Fall back to an unordered scan
+        sorted in memory so a missing index degrades result quality, not correctness.
+        """
+        try:
+            query = (
+                self._col
+                .where("user_id", "==", user_id)
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .limit(limit)
+            )
+            sessions = await self._collect(query)
+            return sessions
+        except Exception as e:
+            log.warning(
+                "session_list_ordered_query_failed",
+                user_id=user_id,
+                error=str(e),
+                hint="create a composite index on (user_id ASC, created_at DESC)",
+            )
+
+        # Unordered fallback: over-fetch, then sort client-side.
+        query = self._col.where("user_id", "==", user_id).limit(max(limit * 5, 25))
+        sessions = await self._collect(query)
+        sessions.sort(key=_sort_key_updated_at, reverse=True)
+        return sessions[:limit]
+
+    async def _collect(self, query) -> list[TripSession]:
+        """Stream a query into TripSession models, skipping undeserialisable docs."""
+        sessions: list[TripSession] = []
         async for doc in query.stream():
             try:
                 sessions.append(TripSession.from_firestore_dict(doc.to_dict()))
@@ -130,6 +170,64 @@ class SessionService:
                 log.warning("session_parse_failed", doc_id=doc.id, error=str(e))
                 continue
         return sessions
+
+    # ── Active-conversation pointer (durable) ─────────────────────────────────
+    #
+    # "Which conversation is this rider currently in?" is the single fact that makes
+    # the chat multi-turn. It used to live only in Redis, so with Redis down every
+    # message started a brand-new session and the agent had no memory of the previous
+    # turn. Mirroring it into its own Firestore document keeps multi-turn working when
+    # the cache is unavailable. A direct document get by id — no index required.
+
+    async def set_active_session(self, user_id: str, persona: str, session_id: str) -> None:
+        """Record `session_id` as this rider's current conversation for `persona`."""
+        try:
+            await self._pointer_ref(user_id, persona).set({
+                "user_id": user_id,
+                "persona": persona,
+                "session_id": session_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            log.warning(
+                "active_session_pointer_write_failed",
+                user_id=user_id, persona=persona, error=str(e),
+            )
+
+    async def get_active_session_id(self, user_id: str, persona: str) -> Optional[str]:
+        """Read back this rider's current conversation id (None if there isn't one)."""
+        try:
+            doc = await self._pointer_ref(user_id, persona).get()
+            if not doc.exists:
+                return None
+            value = (doc.to_dict() or {}).get("session_id")
+            return value if isinstance(value, str) and value else None
+        except Exception as e:
+            log.warning(
+                "active_session_pointer_read_failed",
+                user_id=user_id, persona=persona, error=str(e),
+            )
+            return None
+
+    def _pointer_ref(self, user_id: str, persona: str):
+        return self._pointers.document(_pointer_doc_id(user_id, persona))
+
+    async def ping(self) -> bool:
+        """True if Firestore is reachable. Used by /v1/health.
+
+        Reads one document that is never expected to exist — a missing document is a
+        successful round-trip, so this costs nothing and needs no index. Unlike the
+        pointer accessors, this deliberately does NOT swallow the error, since the
+        whole point is to detect it.
+
+        The id avoids the `__x__` form, which Firestore reserves and rejects.
+        """
+        try:
+            await self._pointers.document("health-probe").get()
+            return True
+        except Exception as e:
+            log.warning("firestore_ping_failed", error=str(e))
+            return False
 
     async def delete_session(self, session_id: str) -> None:
         """Hard-delete a session."""

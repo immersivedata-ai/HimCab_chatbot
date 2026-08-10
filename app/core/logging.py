@@ -7,7 +7,6 @@ All log records include trace_id, user_id, and environment for Cloud Logging.
 
 import logging
 import sys
-from typing import Any
 
 import structlog
 from structlog.types import EventDict, Processor

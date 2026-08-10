@@ -25,12 +25,18 @@ def _mock_llm_response(json_str: str):
 
 # ── Router Tests ──────────────────────────────────────────────────────────────
 
-class TestRouterLocalClassification:
+class TestRouterClassification:
+    """The router classifies INTENT (for routing) but deliberately does NOT own
+    visitor_type — that is set by the persona seed (front-end page) and confirmed by the
+    planner's origin-based classification. So the router must never write visitor_type,
+    which guarantees a seeded value can't be flipped by an unreliable per-turn LLM guess.
+    """
+
     @pytest.mark.asyncio
-    async def test_local_visitor_from_shimla(self):
-        """Router should classify Shimla origin as local visitor."""
+    async def test_router_classifies_intent(self):
+        """Router returns the intent used for graph routing."""
         state = AgentState(
-            session_id="test-local-1",
+            session_id="test-1",
             user_id="user-1",
             messages=[HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye")],
         )
@@ -43,33 +49,14 @@ class TestRouterLocalClassification:
             )
             result = await router_node(state)
 
-        assert result["visitor_type"] == "local"
         assert result["intent"] == "plan_trip"
 
     @pytest.mark.asyncio
-    async def test_local_visitor_from_kullu(self):
-        """Router should classify Kullu origin as local visitor."""
+    async def test_router_does_not_write_visitor_type(self):
+        """Even when the LLM guesses a visitor_type, the router must not put it in state —
+        so LangGraph keeps whatever the persona seed / planner set."""
         state = AgentState(
-            session_id="test-local-2",
-            user_id="user-1",
-            messages=[HumanMessage(content="I'm from Kullu, want to visit Dharamshala")],
-        )
-        mock_response = _mock_llm_response(
-            '{"intent": "plan_trip", "language": "en", "confidence": 0.93, "visitor_type": "local"}'
-        )
-        with patch("app.agent.nodes.router.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_flash_model.return_value.ainvoke = AsyncMock(
-                return_value=mock_response
-            )
-            result = await router_node(state)
-
-        assert result["visitor_type"] == "local"
-
-    @pytest.mark.asyncio
-    async def test_outstation_visitor_still_works(self):
-        """Outstation classification should not be broken."""
-        state = AgentState(
-            session_id="test-outstation-1",
+            session_id="test-2",
             user_id="user-1",
             messages=[HumanMessage(content="Coming from Delhi to Manali for 5 days")],
         )
@@ -82,19 +69,20 @@ class TestRouterLocalClassification:
             )
             result = await router_node(state)
 
-        assert result["visitor_type"] == "outstation"
+        assert "visitor_type" not in result
 
     @pytest.mark.asyncio
-    async def test_visitor_type_preserved_from_previous_state(self):
-        """Router should not downgrade previously classified local visitor."""
+    async def test_seeded_visitor_type_not_overwritten(self):
+        """A persona-seeded local visitor must survive the router untouched, even when the
+        LLM guesses something else (the exact bug where 'manali' flipped it)."""
         state = AgentState(
-            session_id="test-local-preserve",
+            session_id="test-3",
             user_id="user-1",
             visitor_type="local",
-            messages=[HumanMessage(content="haan 2 din ke liye")],
+            messages=[HumanMessage(content="manali")],
         )
         mock_response = _mock_llm_response(
-            '{"intent": "clarification", "language": "hinglish", "confidence": 0.85, "visitor_type": "unknown"}'
+            '{"intent": "plan_trip", "language": "en", "confidence": 0.85, "visitor_type": "outstation"}'
         )
         with patch("app.agent.nodes.router.get_vertex_ai_service") as mock_svc:
             mock_svc.return_value.get_flash_model.return_value.ainvoke = AsyncMock(
@@ -102,96 +90,127 @@ class TestRouterLocalClassification:
             )
             result = await router_node(state)
 
-        assert result["visitor_type"] == "local"
+        # Router didn't write visitor_type, so the seeded "local" is preserved by the graph.
+        assert "visitor_type" not in result
 
 
 # ── Planner Tests ─────────────────────────────────────────────────────────────
 
+def _mock_structured_llm(structured_response):
+    """Helper to mock get_flash_model(...).with_structured_output(...).ainvoke()."""
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(return_value=structured_response)
+    return mock_llm
+
+
 class TestPlannerLocalFlow:
     @pytest.mark.asyncio
-    async def test_local_visitor_no_return_journey_question(self):
-        """Planner should NOT ask about return_journey_preference for local visitors."""
-        from app.agent.nodes.planner import planner_node
+    async def test_local_visitor_return_journey_confirmed(self):
+        """Once return_journey_preference is known, clarification resolves for locals too."""
+        from app.agent.nodes.planner import planner_node, PlannerExtraction
 
         state = AgentState(
             session_id="test-local-planner-1",
             user_id="user-1",
             visitor_type="local",
             messages=[
-                HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye, is weekend"),
+                HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye, is weekend, return cab book kar li hai"),
             ],
         )
-        planner_response = {
-            "destination": "Manali",
-            "origin": "Shimla",
-            "duration_days": 2,
-            "travel_dates": "this weekend",
-            "group_type": None,
-            "group_size": None,
-            "budget_range": None,
-            "interests": [],
-            "special_requirements": [],
-            "visitor_type": "local",
-            "return_journey_preference": None,
-            "home_city": "Shimla",
-            "needs_clarification": False,
-            "clarification_question": None,
-            "confidence": 0.95,
-        }
-        import json
-        mock_response = _mock_llm_response(json.dumps(planner_response))
+        planner_response = PlannerExtraction(
+            destination="Manali",
+            origin="Shimla",
+            duration_days=2,
+            group_size=2,
+            travel_dates="this weekend",
+            return_journey_preference="booked",
+            home_city="Shimla",
+            origin_in_himachal=True,
+            confidence=0.95,
+        )
 
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_pro_model.return_value.ainvoke = AsyncMock(
-                return_value=mock_response
-            )
+            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
             result = await planner_node(state)
 
         assert result["needs_clarification"] is False
         assert result["visitor_type"] == "local"
         assert result["entities"].home_city == "Shimla"
+        assert result["entities"].return_journey_preference == "booked"
+
+    @pytest.mark.asyncio
+    async def test_return_journey_does_not_block_the_itinerary(self):
+        """The return cab is worth knowing, but it is not worth withholding the plan for.
+
+        It used to be the sixth mandatory question, so a user who had given every
+        trip detail still got interrogated instead of an itinerary. It is now carried
+        in `open_questions` and asked in the itinerary's closing line instead.
+        """
+        from app.agent.nodes.planner import planner_node, PlannerExtraction
+
+        state = AgentState(
+            session_id="test-local-planner-1b",
+            user_id="user-1",
+            visitor_type="local",
+            messages=[
+                HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye, is weekend"),
+            ],
+        )
+        planner_response = PlannerExtraction(
+            destination="Manali",
+            origin="Shimla",
+            duration_days=2,
+            group_size=2,
+            travel_dates="this weekend",
+            return_journey_preference=None,
+            home_city="Shimla",
+            origin_in_himachal=True,
+            confidence=0.95,
+        )
+
+        with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
+            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
+            result = await planner_node(state)
+
+        assert result["needs_clarification"] is False
         assert result["entities"].return_journey_preference is None
+        # Never silently assumed either — the writer is told nothing about it.
+        assert "return_journey_preference" not in result["assumed_fields"]
 
     @pytest.mark.asyncio
     async def test_local_visitor_asks_home_city(self):
         """Planner should ask local visitor their home city when unknown."""
-        from app.agent.nodes.planner import planner_node
+        from app.agent.nodes.planner import planner_node, PlannerExtraction
 
         state = AgentState(
             session_id="test-local-planner-2",
             user_id="user-1",
+            visitor_type="local",
             messages=[
                 HumanMessage(content="Kasol jaana hai weekend pe"),
             ],
         )
-        planner_response = {
-            "destination": "Kasol",
-            "origin": None,
-            "duration_days": 2,
-            "travel_dates": "this weekend",
-            "group_type": None,
-            "group_size": None,
-            "budget_range": None,
-            "interests": [],
-            "special_requirements": [],
-            "visitor_type": None,
-            "return_journey_preference": None,
-            "home_city": None,
-            "needs_clarification": True,
-            "clarification_question": "Sounds great! Which city in Himachal are you based in?",
-            "confidence": 0.82,
-        }
-        import json
-        mock_response = _mock_llm_response(json.dumps(planner_response))
+        planner_response = PlannerExtraction(
+            destination="Kasol",
+            origin=None,
+            duration_days=2,
+            travel_dates="this weekend",
+            return_journey_preference=None,
+            home_city=None,
+            needs_clarification=True,
+            clarification_question="Sounds great! Which city in Himachal are you based in?",
+            confidence=0.82,
+        )
 
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_pro_model.return_value.ainvoke = AsyncMock(
-                return_value=mock_response
-            )
+            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
             result = await planner_node(state)
 
         assert result["needs_clarification"] is True
-        assert "home" in result["clarification_question"].lower() or "city" in result["clarification_question"].lower() or "based" in result["clarification_question"].lower()
+        # The question may be in Hindi (हिमाचल/शहर/रहते) or English (home/city/based)
+        q = result["clarification_question"].lower()
+        assert ("home" in q or "city" in q or "based" in q
+                or "हिमाचल" in q or "शहर" in q or "रहते" in q)
 
 
 # ── State & Entity Tests ──────────────────────────────────────────────────────
@@ -212,16 +231,15 @@ class TestLocalEntities:
         entities = ExtractedEntities(destination="Manali")
         assert entities.home_city is None
 
-    def test_agent_state_local_fields(self):
-        """AgentState should have is_frequent_traveller and available_offers."""
+    def test_agent_state_carries_the_planner_persona(self):
         state = AgentState(
             session_id="test-state-1",
             user_id="user-1",
-            is_frequent_traveller=True,
-            available_offers=[{"title": "Test", "discount_percent": 10}],
+            visitor_type="local",
+            entities=ExtractedEntities(visitor_type="local", home_city="Shimla"),
         )
-        assert state.is_frequent_traveller is True
-        assert len(state.available_offers) == 1
+        assert state.visitor_type == "local"
+        assert state.entities.home_city == "Shimla"
 
 
 # ── User Profile Tests ───────────────────────────────────────────────────────
@@ -271,46 +289,6 @@ class TestUserProfileEnhancements:
 # ── Writer Context Tests ──────────────────────────────────────────────────────
 
 class TestWriterLocalContext:
-    def test_build_offers_section_with_offers(self):
-        """_build_offers_section should format offers correctly."""
-        from app.agent.nodes.writer import _build_offers_section
-
-        state = AgentState(
-            session_id="test-writer-1",
-            user_id="user-1",
-            available_offers=[
-                {
-                    "title": "HP Resident Special",
-                    "description": "7% off for locals",
-                    "promo_code": "HIMLOCAL7",
-                    "discount_percent": 7.0,
-                    "applicable_to": ["cab"],
-                    "conditions": "HP ID required",
-                },
-                {
-                    "title": "Frequent Traveller 10% Off",
-                    "description": "10% off for frequent users",
-                    "promo_code": "HIMFREQ10",
-                    "discount_percent": 10.0,
-                    "applicable_to": ["cab", "package"],
-                    "conditions": "Includes free sightseeing",
-                },
-            ],
-        )
-        section = _build_offers_section(state)
-        assert "HIMLOCAL7" in section
-        assert "HIMFREQ10" in section
-        assert "7%" in section or "7.0%" in section
-        assert "10%" in section or "10.0%" in section
-
-    def test_build_offers_section_empty(self):
-        """_build_offers_section should return empty string when no offers."""
-        from app.agent.nodes.writer import _build_offers_section
-
-        state = AgentState(session_id="test-writer-2", user_id="user-1")
-        section = _build_offers_section(state)
-        assert section == ""
-
     def test_build_system_prompt_has_local_instructions(self):
         """System prompt for local visitor should contain local-specific instructions."""
         from app.agent.nodes.writer import _build_system_prompt

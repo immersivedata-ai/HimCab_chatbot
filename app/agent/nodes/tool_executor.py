@@ -1,39 +1,31 @@
 """
 app/agent/nodes/tool_executor.py
 ──────────────────────────────────
-Tool Executor Node — calls all external tools IN PARALLEL using asyncio.gather().
-Responsibilities:
-  1. Fetch weather + snowfall data
-  2. Fetch relevant POIs (hotels, temples, cafes, restaurants, attractions)
-  3. Fetch drive time estimates
-  4. Fetch crowd predictions
-  5. Generate personalised offers (frequent traveller / local / seasonal)
-  6. Populate state with all tool results
+Tool Executor Node — calls the external services IN PARALLEL using asyncio.gather().
 
-All tools are called concurrently — total latency = slowest single call, not sum.
-Failed tools degrade gracefully and return None (not an error).
-Individual tool calls are wrapped with a timeout to prevent the pipeline from stalling.
+Two tools run today:
+  1. Weather + snowfall risk for the destination (one fetch; the risk is derived
+     from that same report rather than fetched again)
+  2. A real Him Cab fare quote, when the flag is on and a rider JWT was forwarded
+
+Both are called concurrently, so total latency is the slower of the two rather than
+their sum. Each is wrapped in a timeout and degrades to None instead of raising —
+a missing tool result costs detail in the reply, never the reply itself.
 """
 
 import asyncio
-from datetime import datetime, timezone
 from typing import Any
 
+from app.agent import slots
 from app.agent.state import AgentState
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.session import ExtractedEntities
-from app.services.external.places import get_places_service
 from app.services.external.weather import get_weather_service
-from app.services.offers import get_offers_service
-from app.services.redis_cache import get_redis_cache
-from app.models.booking import TripDTORequest, DirectionDTO
-from app.services.trip_booking import book_trip_api
+from app.services.himcab import build_fare_quote_input, get_fare_service
+from app.services.himcab.models import FareQuote
 
 log = get_logger(__name__)
-
-# Which place categories to fetch for a full trip plan
-FULL_TRIP_CATEGORIES = ["hotels", "restaurants", "temples", "cafes", "attractions"]
-PARTIAL_CATEGORIES = ["attractions", "restaurants"]
 
 # Per-tool timeout — prevents a single slow API from stalling the entire pipeline
 TOOL_TIMEOUT_SECONDS = 20
@@ -73,35 +65,10 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
         return None
 
 
-def _generate_offers_sync(state: AgentState) -> dict:
-    """
-    Synchronous helper to generate personalised offers.
-    Runs in ~0ms (no API calls) — safe for parallel execution.
-    """
-    try:
-        offers_svc = get_offers_service()
-        visitor_type = state.visitor_type or state.entities.visitor_type
-        bundle = offers_svc.generate_offers(
-            user_profile=state.user_profile,
-            entities=state.entities,
-            visitor_type=visitor_type,
-        )
-        return bundle.to_display_dict()
-    except Exception as e:
-        log.warning("offers_generation_failed", error=str(e))
-        return {"offers": [], "loyalty_tier": "new", "total_trips": 0, "best_discount": 0.0}
-
-
-async def _async_generate_offers(state: AgentState) -> dict:
-    """Thin async wrapper around the sync offers generator."""
-    return _generate_offers_sync(state)
-
-
 async def tool_executor_node(state: AgentState) -> dict:
     """
     LangGraph Tool Executor Node.
-    Dispatches all external tool calls in parallel with per-tool timeouts.
-    Also generates personalised offers for frequent travellers and local users.
+    Dispatches the external tool calls in parallel with per-tool timeouts.
     """
     log.info("tool_executor_entered", session_id=state.session_id)
 
@@ -109,189 +76,120 @@ async def tool_executor_node(state: AgentState) -> dict:
     destination = entities.destination
 
     if not destination:
-        log.warning("tool_executor_no_destination")
+        # A general question can reach the writer with no destination; there is simply
+        # nothing to look up for it.
+        log.info("tool_executor_no_destination", intent=state.intent)
         return {"node_trace": ["tool_executor"]}
 
     weather_svc = get_weather_service()
-    places_svc = get_places_service()
-    cache = get_redis_cache()
-
     intent = state.intent or "plan_trip"
-    is_full_plan = intent == "plan_trip"
-
-    # ── Define all parallel tasks ─────────────────────────────────────────────
 
     tasks: dict[str, Any] = {
-        "weather": _safe_call(
-            weather_svc.get_weather(destination),
-            "weather",
-        ),
-        "snowfall": _safe_call(
-            weather_svc.get_snowfall_risk(destination),
-            "snowfall",
-        ),
+        "weather": _safe_call(weather_svc.get_weather(destination), "weather"),
     }
 
-    # Determine which place categories to fetch based on intent
-    # if is_full_plan:
-    #     categories = FULL_TRIP_CATEGORIES
-    # elif intent == "hotel_query":
-    #     categories = ["hotels"]
-    # elif intent == "places_query":
-    #     categories = PARTIAL_CATEGORIES
-    # else:
-    #     categories = ["attractions"]
-
-    categories = []  # Overpass removed for now
-    
-    # for category in categories:
-    #     tasks[f"places_{category}"] = _safe_call(
-    #         places_svc.get_places(destination, category),
-    #         f"places_{category}",
-    #     )
-
-    # Drive time from origin — ALWAYS fetch when origin is available
-    # (critical for outstation visitors regardless of intent)
-    # if entities.origin:
-    #     tasks["drive_time"] = _safe_call(
-    #         places_svc.get_drive_time(entities.origin, destination),
-    #         "drive_time",
-    #     )
-    #     # For outstation visitors, also compute the full route plan (origin → dest → origin)
-    #     if state.visitor_type == "outstation" or (entities.visitor_type == "outstation"):
-    #         tasks["route_plan"] = _safe_call(
-    #             places_svc.get_optimal_route(
-    #                 origin=entities.origin,
-    #                 destination=destination,
-    #                 return_to_origin=True,
-    #             ),
-    #             "route_plan",
-    #         )
-
-    # Crowd data from Redis (precomputed by workers)
-    current_month = datetime.now(timezone.utc).strftime("%B").lower()
-    # tasks["crowd"] = _safe_call(
-    #     cache.get_crowd_data(destination, current_month),
-    #     "crowd",
-    # )
-
-    # Offers generation — runs synchronously (~0ms, no API calls)
-    # Wrapped in _safe_call so failures are non-fatal
-    tasks["offers"] = _safe_call(
-        _async_generate_offers(state),
-        "offers",
-    )
-
-    # ── Booking execution ─────────────────────────────────────────────────────
-    if state.user_confirmed_booking and state.booking_details:
-        pickup = state.booking_details.get("pickup", "")
-        dropoff = state.booking_details.get("dropoff", "")
-        time = state.booking_details.get("time", "12:00:00")
-        if len(time) == 5:
-            time += ":00" # HH:mm to HH:mm:ss
-        
-        trip_type = "LOCAL" if state.visitor_type == "local" else "OUTSTATION"
-        date = datetime.now(timezone.utc).strftime("%Y-%m-%d") # Use today as default if not in details
-        
-        request = TripDTORequest(
-            fromDirectionAddress=DirectionDTO(address=pickup),
-            toDirectionAddress=[DirectionDTO(address=dropoff)],
-            date=date,
-            bookingTime=time,
-            tripType=trip_type,
-            riderId=1 # mocked for now
-        )
-        tasks["booking_result"] = _safe_call(
-            book_trip_api(request),
-            "booking_result",
-        )
+    # ── Real cab fare (Him Cab backend) ───────────────────────────────────────
+    # Gated: flag on, origin known, pricing-relevant intent, and a forwarded rider JWT.
+    # Any failure degrades gracefully to None via _safe_call → no price is quoted.
+    fare_gate = {
+        "enable_real_fares": settings.enable_real_fares,
+        # Locals often only give home_city (not origin) — either satisfies the gate.
+        "has_origin": bool(entities.origin or entities.home_city),
+        # Exactly the intents that produce an itinerary — the same predicate the writer
+        # uses, so a new planning intent can never be added and silently lose its fare.
+        "pricing_intent": slots.response_mode(intent) == slots.ITINERARY_MODE,
+        "has_rider_jwt": bool(state.rider_jwt),
+    }
+    should_quote = all(fare_gate.values())
+    if not should_quote:
+        # Log exactly which condition blocked it — this is the single most useful line
+        # for diagnosing "why didn't I get a fare" without needing more round-trips.
+        log.info("fare_gate_blocked", intent=intent, session_id=state.session_id, **fare_gate)
+    else:
+        # trip_type comes from the journey's length, not the rider's persona — a
+        # Himachal resident driving 270 km is still an intercity transfer.
+        quote_input = build_fare_quote_input(entities)
+        # distanceInMeters is required by the endpoint. It is now available for any
+        # pair of recognised places (surveyed or computed), so this only fires when a
+        # place name isn't in the geography tables at all.
+        if quote_input.distance_km is not None:
+            tasks["cab_fare"] = _safe_call(
+                get_fare_service().get_quote(quote_input, rider_jwt=state.rider_jwt),
+                "cab_fare",
+            )
+        else:
+            log.warning(
+                "cab_fare_skipped_unknown_place",
+                origin=entities.origin or entities.home_city,
+                destination=destination,
+                session_id=state.session_id,
+                hint="add the place to app/services/geo.py CITY_COORDS",
+            )
 
     # ── Execute all in parallel ───────────────────────────────────────────────
     task_keys = list(tasks.keys())
-    task_coroutines = list(tasks.values())
-    raw_results = await asyncio.gather(*task_coroutines, return_exceptions=False)
+    raw_results = await asyncio.gather(*tasks.values(), return_exceptions=False)
     results = dict(zip(task_keys, raw_results))
 
-    # ── Build tool success/failure summary for debugging ──────────────────────
-    succeeded = [k for k, v in results.items() if v is not None]
     failed = [k for k, v in results.items() if v is None]
     if failed:
         log.warning(
             "tools_partial_failure",
-            succeeded=succeeded,
+            succeeded=[k for k, v in results.items() if v is not None],
             failed=failed,
             session_id=state.session_id,
         )
 
     # ── Package results into state ────────────────────────────────────────────
     weather_obj = results.get("weather")
-    places_data: dict[str, list] = {}
-    total_places = 0
-    for category in categories:
-        result = results.get(f"places_{category}")
-        if result:
-            places_data[category] = result
-            total_places += len(result)
+    # Derive snowfall risk from the weather report we already have (no second fetch).
+    snowfall_data = weather_svc.snowfall_from_report(weather_obj) if weather_obj else None
 
-    drive_times = {}
-    travel_estimate = None
-    if results.get("drive_time") and entities.origin:
-        drive_info = results["drive_time"]
-        drive_times[f"{entities.origin}_to_{destination}"] = drive_info
-        # Build a dedicated travel_estimate for the writer node
-        travel_estimate = {
-            "origin": entities.origin,
-            "destination": destination,
-            "duration_minutes": drive_info.get("duration_minutes"),
-            "duration_hours": drive_info.get("duration_hours"),
-            "distance_km": drive_info.get("distance_km"),
-            "recommended_mode": drive_info.get("recommended_mode", "cab"),
-            "note": drive_info.get("note"),
+    # Real cab fare — gross prices straight from /fare/estimate. No coupons/discounts are
+    # applied here; the app's own booking flow handles real coupons.
+    cab_fare = None
+    fq = results.get("cab_fare")
+    if isinstance(fq, FareQuote) and fq.base_fare_inr > 0:
+        cab_fare = {
+            "fare_inr": round(fq.base_fare_inr),
+            "currency": fq.currency,
+            "category_id": fq.category_id,
+            "category_name": fq.category_name,
+            "vehicle_label": fq.vehicle_label,
+            "seat_capacity": fq.seat_capacity,
+            "trip_type": fq.trip_type,
+            "distance_km": fq.distance_km,
+            # The rider is told the fare is approximate when the distance behind it was
+            # computed rather than surveyed.
+            "is_approximate": fq.distance_is_approximate,
+            "options": [a.model_dump() for a in fq.alternatives],  # all categories for the app
+            "source": "himcab_api",
         }
-
-    crowd_data = {}
-    if results.get("crowd"):
-        crowd_data[destination] = results["crowd"]
-
-    # Route plan for outstation visitors
-    route_plan = results.get("route_plan")
-
-    # Offers bundle
-    offers_result = results.get("offers")
-    available_offers = []
-    if offers_result and isinstance(offers_result, dict):
-        available_offers = offers_result.get("offers", [])
+    elif "cab_fare" in tasks:
+        # The call was made and produced nothing usable. Distinguishing this from
+        # "never attempted" is the difference between chasing a gate and chasing the
+        # backend, so it gets its own line.
+        log.warning(
+            "cab_fare_unavailable",
+            reason="call failed or returned no priced categories",
+            origin=entities.origin or entities.home_city,
+            destination=destination,
+            session_id=state.session_id,
+        )
 
     log.info(
         "tools_completed",
         destination=destination,
         weather_ok=weather_obj is not None,
-        categories_fetched=list(places_data.keys()),
-        total_places=total_places,
-        has_travel_estimate=travel_estimate is not None,
-        has_route_plan=route_plan is not None,
-        offers_count=len(available_offers),
+        has_cab_fare=cab_fare is not None,
+        fare_approximate=bool(cab_fare and cab_fare["is_approximate"]),
         visitor_type=state.visitor_type,
-        tools_succeeded=len(succeeded),
-        tools_failed=len(failed),
         session_id=state.session_id,
     )
 
-    # Extract Booking
-    booking_result = results.get("booking_result")
-    final_booking_id = None
-    if booking_result and not booking_result.get("error"):
-        final_booking_id = booking_result.get("id")
-
     return {
         "weather_data": weather_obj.model_dump(mode="json") if weather_obj else None,
-        "snowfall_data": results.get("snowfall"),
-        "places_data": places_data,
-        "drive_times": drive_times,
-        "travel_estimate": travel_estimate,
-        "route_plan": route_plan,
-        "crowd_data": crowd_data,
-        "available_offers": available_offers,
-        "final_booking_id": str(final_booking_id) if final_booking_id else None,
+        "snowfall_data": snowfall_data,
+        "cab_fare": cab_fare,
         "node_trace": ["tool_executor"],
     }

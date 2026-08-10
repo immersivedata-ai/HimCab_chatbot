@@ -28,8 +28,8 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     """
     Application startup and shutdown lifecycle.
-    - Startup: warm up connections, compile LangGraph, verify services
-    - Shutdown: close Redis pool, close HTTP clients
+    - Startup: compile the LangGraph, warm the Vertex AI client
+    - Shutdown: close the HTTP clients
     """
     # ── Startup ───────────────────────────────────────────────────────────────
     log.info("app_starting", env=settings.app_env, debug=settings.app_debug)
@@ -44,30 +44,18 @@ async def lifespan(app: FastAPI):
     get_vertex_ai_service()
     log.info("vertex_ai_warmed_up")
 
-    # Verify Redis connectivity (non-blocking — warn but don't crash)
-    from app.services.redis_cache import get_redis_cache
-    cache = get_redis_cache()
-    redis_ok = await cache.ping()
-    if redis_ok:
-        log.info("redis_connected")
-    else:
-        log.warning("redis_unavailable_at_startup", msg="Caching will be degraded")
-
     log.info("app_started", version="1.0.0")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("app_shutting_down")
 
-    # Close Redis connection pool
-    await cache.close()
-
     # Close HTTP clients used by external services
     from app.services.external.weather import get_weather_service
-    from app.services.external.places import get_places_service
+    from app.services.himcab import get_fare_service
     try:
         await get_weather_service().close()
-        await get_places_service().close()
+        await get_fare_service().close()
     except Exception as e:
         log.warning("http_client_close_failed", error=str(e))
 

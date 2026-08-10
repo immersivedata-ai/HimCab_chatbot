@@ -70,93 +70,43 @@ class TestToolExecutorNode:
         assert result == {"node_trace": ["tool_executor"]}
 
     @pytest.mark.asyncio
-    async def test_full_plan_fetches_all_categories(self, plan_trip_state):
-        """Full trip plan should fetch all 5 place categories + weather."""
-        mock_weather = MagicMock()
-        mock_weather.model_dump.return_value = {"temp": 22}
+    async def test_fetches_weather_and_derives_snowfall_once(self, plan_trip_state):
+        """Weather is fetched exactly ONCE and snowfall risk is derived from that same
+        report (no second get_weather call). Also confirms weather + snowfall reach state."""
+        mock_report = MagicMock()
+        mock_report.model_dump.return_value = {"temp": 22}
 
-        with patch("app.agent.nodes.tool_executor.get_weather_service") as weather_mock, \
-             patch("app.agent.nodes.tool_executor.get_places_service") as places_mock, \
-             patch("app.agent.nodes.tool_executor.get_redis_cache") as cache_mock:
-
-            weather_svc = AsyncMock()
-            weather_svc.get_weather.return_value = mock_weather
-            weather_svc.get_snowfall_risk.return_value = {"risk": "none", "expected_mm": 0}
+        with patch("app.agent.nodes.tool_executor.get_weather_service") as weather_mock:
+            weather_svc = MagicMock()
+            weather_svc.get_weather = AsyncMock(return_value=mock_report)
+            # snowfall_from_report is the pure derivation (no I/O) used instead of a 2nd fetch
+            weather_svc.snowfall_from_report = MagicMock(
+                return_value={"risk": "none", "expected_mm": 0}
+            )
             weather_mock.return_value = weather_svc
-
-            places_svc = AsyncMock()
-            places_svc.get_places.return_value = [{"name": "Test Place"}]
-            places_svc.get_drive_time.return_value = {"duration_minutes": 540, "distance_km": 490}
-            places_mock.return_value = places_svc
-
-            cache = AsyncMock()
-            cache.get_crowd_data.return_value = None
-            cache_mock.return_value = cache
 
             result = await tool_executor_node(plan_trip_state)
 
         assert "tool_executor" in result["node_trace"]
         assert result["weather_data"] is not None
-        assert result["snowfall_data"] is not None
-        assert len(result["places_data"]) > 0
-        assert result["drive_times"] is not None
+        assert result["snowfall_data"] == {"risk": "none", "expected_mm": 0}
+        # The dedup fix: get_weather called once, snowfall derived (not re-fetched).
+        weather_svc.get_weather.assert_awaited_once()
+        weather_svc.snowfall_from_report.assert_called_once_with(mock_report)
 
     @pytest.mark.asyncio
     async def test_graceful_degradation_on_weather_failure(self, plan_trip_state):
-        """If weather fails, other tools should still work."""
-        with patch("app.agent.nodes.tool_executor.get_weather_service") as weather_mock, \
-             patch("app.agent.nodes.tool_executor.get_places_service") as places_mock, \
-             patch("app.agent.nodes.tool_executor.get_redis_cache") as cache_mock:
-
-            weather_svc = AsyncMock()
-            weather_svc.get_weather.side_effect = Exception("API down")
-            weather_svc.get_snowfall_risk.side_effect = Exception("API down")
+        """A dead weather API costs detail in the reply, never the reply itself."""
+        with patch("app.agent.nodes.tool_executor.get_weather_service") as weather_mock:
+            weather_svc = MagicMock()
+            weather_svc.get_weather = AsyncMock(side_effect=Exception("API down"))
+            weather_svc.snowfall_from_report = MagicMock(return_value={"risk": "none"})
             weather_mock.return_value = weather_svc
-
-            places_svc = AsyncMock()
-            places_svc.get_places.return_value = [{"name": "Temple"}]
-            places_svc.get_drive_time.return_value = {"duration_minutes": 300}
-            places_mock.return_value = places_svc
-
-            cache = AsyncMock()
-            cache.get_crowd_data.return_value = None
-            cache_mock.return_value = cache
 
             result = await tool_executor_node(plan_trip_state)
 
-        # Weather should be None but places should still have data
         assert result["weather_data"] is None
-        assert len(result["places_data"]) > 0
-
-    @pytest.mark.asyncio
-    async def test_places_query_intent(self, places_query_state):
-        """Places query intent should only fetch attractions and restaurants."""
-        with patch("app.agent.nodes.tool_executor.get_weather_service") as weather_mock, \
-             patch("app.agent.nodes.tool_executor.get_places_service") as places_mock, \
-             patch("app.agent.nodes.tool_executor.get_redis_cache") as cache_mock:
-
-            weather_svc = AsyncMock()
-            mock_weather = MagicMock()
-            mock_weather.model_dump.return_value = {}
-            weather_svc.get_weather.return_value = mock_weather
-            weather_svc.get_snowfall_risk.return_value = {"risk": "none"}
-            weather_mock.return_value = weather_svc
-
-            places_svc = AsyncMock()
-            places_svc.get_places.return_value = [{"name": "Place"}]
-            places_mock.return_value = places_svc
-
-            cache = AsyncMock()
-            cache.get_crowd_data.return_value = None
-            cache_mock.return_value = cache
-
-            result = await tool_executor_node(places_query_state)
-
-        # Should have fetched attractions and restaurants (PARTIAL_CATEGORIES)
-        call_categories = [
-            call.args[1] for call in places_svc.get_places.call_args_list
-        ]
-        assert "attractions" in call_categories
-        assert "restaurants" in call_categories
-        # Should NOT have fetched hotels, temples, cafes
-        assert "hotels" not in call_categories
+        assert result["snowfall_data"] is None
+        assert "tool_executor" in result["node_trace"]
+        # No derivation is attempted from a report that was never fetched.
+        weather_svc.snowfall_from_report.assert_not_called()

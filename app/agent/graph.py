@@ -8,13 +8,16 @@ Graph topology:
                                             │
                                        tool_executor → writer → persist → END
                                                             │
-                                                     [clarify] → END
+                                                     [clarify] → persist → END
 
 Conditional edges:
-  - After `planner`: if needs_clarification → go to `clarify_node` (skip tools)
-                     else → go to `tool_executor`
-  - After `router`:  intent == "show_itinerary" → go directly to `writer` (no tools needed)
-                     otherwise → full planning flow
+  - After `router`:  a request to see an itinerary we already have skips straight to
+                     the writer; everything else goes through the full flow.
+  - After `planner`: ask the user (clarify) or answer them (tool_executor → writer).
+
+Both branch decisions are pure functions of state and are unit-tested directly —
+routing is where "the agent asked instead of answering" is decided, so it is kept
+free of I/O and of the LLM.
 
 The graph is compiled once at startup and reused across all requests.
 """
@@ -38,17 +41,48 @@ log = get_logger(__name__)
 # ── Inline nodes ──────────────────────────────────────────────────────────────
 
 async def clarify_node(state: AgentState) -> dict:
-    """
-    Lightweight node that surfaces a clarification question to the user
-    without invoking any tools or the writer LLM.
+    """Put the planner's question to the user, with no tool calls and no writer LLM.
+
+    The planner always supplies the question (it is the only thing that decides to
+    ask), so this node is deliberately thin. The fallback below re-runs the same slot
+    policy rather than inventing wording of its own, so there is exactly one place
+    where a question's text is chosen.
     """
     from langchain_core.messages import AIMessage
-    question = state.clarification_question or (
-        "आपकी यात्रा के बारे में थोड़ी और जानकारी दे सकते हैं? आप कहाँ जाना चाहते हैं और कितने दिनों के लिए?"
-    )
+
+    from app.agent import slots
+    from app.agent.language import detect_reply_language
+    from app.core.config import settings
+
+    question = state.clarification_question
+    asked_field = state.last_asked_field
+
+    if not question:
+        lang_key, _ = detect_reply_language(state)
+        decision = slots.decide(
+            state.entities,
+            state.intent,
+            state.visitor_type,
+            lang_key,
+            max_attempts=settings.max_clarification_attempts,
+        )
+        question, asked_field = decision.question, decision.ask_field
+
+    if not question:
+        # Reached only if the graph routed here with nothing left to ask — treat it
+        # as "go ahead" rather than showing the user an empty bubble.
+        log.warning("clarify_without_question", session_id=state.session_id)
+        lang_key, _ = detect_reply_language(state)
+        question = (
+            "ठीक है, मैं आपकी यात्रा की योजना बना रहा हूँ..."
+            if lang_key == "hi"
+            else "Alright — putting your trip plan together..."
+        )
+
     return {
         "final_response_text": question,
         "messages": [AIMessage(content=question)],
+        "last_asked_field": asked_field,
         "node_trace": ["clarify"],
     }
 
@@ -56,23 +90,37 @@ async def clarify_node(state: AgentState) -> dict:
 # ── Conditional routing functions ─────────────────────────────────────────────
 
 def route_after_router(state: AgentState) -> str:
+    """Decide what happens after the intent is known.
+
+    Only a `show_itinerary` request for a trip we already have a destination for can
+    skip the planner. Without one there is nothing to show, and jumping to the writer
+    would have it invent a trip out of thin air — so it goes through the normal flow
+    and gets asked where they want to go.
     """
-    After the router classifies intent, decide which node comes next.
-    - show_itinerary → skip to writer (no tool calls needed)
-    - everything else → context → planner → tools → writer
-    """
-    if state.intent == "show_itinerary":
+    if state.intent == "show_itinerary" and state.entities.destination:
         return "writer"
     return "context"
 
 
 def route_after_planner(state: AgentState) -> str:
+    """Ask the user, or answer them.
+
+    The destination guard is a backstop, not policy — the slot policy already makes
+    `destination` mandatory wherever it matters. It is here because an itinerary
+    without a destination is a fabricated itinerary, which is worth catching as a
+    question. It deliberately does NOT apply to a general question ("when's the best
+    time to visit Himachal?"), which can be answered without one.
     """
-    After the planner extracts entities, decide:
-    - If we need more info → ask user (clarify)
-    - If we have enough → call tools
-    """
+    from app.agent import slots
+
     if state.needs_clarification:
+        return "clarify"
+    if slots.response_mode(state.intent) == slots.ITINERARY_MODE and not state.entities.destination:
+        log.warning(
+            "planner_cleared_without_destination",
+            session_id=state.session_id,
+            intent=state.intent,
+        )
         return "clarify"
     return "tool_executor"
 

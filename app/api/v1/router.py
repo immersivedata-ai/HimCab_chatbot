@@ -25,22 +25,27 @@ _startup_time = datetime.now(timezone.utc)
 async def health_check():
     """
     Health check endpoint for Cloud Run readiness/liveness probes.
-    Checks Redis and reports service uptime.
+
+    Firestore is the only external dependency worth probing: it is the system of
+    record for conversations, so losing it is what actually breaks the product. There
+    is no cache tier to report on any more — caching and rate limiting are in-process.
     """
-    from app.services.redis_cache import get_redis_cache
-    cache = get_redis_cache()
-    redis_ok = await cache.ping()
+    from app.services.firestore import get_session_service
+
+    # Cheap round-trip against the pointer collection — proves we can read Firestore
+    # without writing anything or depending on any composite index.
+    firestore_ok = await get_session_service().ping()
 
     now = datetime.now(timezone.utc)
-    uptime_seconds = (now - _startup_time).total_seconds()
 
     return {
-        "status": "healthy" if redis_ok else "degraded",
+        "status": "healthy" if firestore_ok else "unhealthy",
         "version": "1.0.0",
-        "uptime_seconds": round(uptime_seconds, 1),
+        "uptime_seconds": round((now - _startup_time).total_seconds(), 1),
         "timestamp": now.isoformat(),
         "services": {
-            "redis": "ok" if redis_ok else "unavailable",
+            "firestore": "ok" if firestore_ok else "unavailable",
             "api": "ok",
         },
+        "conversation_memory": "ok" if firestore_ok else "unavailable",
     }
