@@ -37,9 +37,10 @@ travel_assistant/
 │   │   ├── firestore.py        # Firestore session & profile service
 │   │   ├── local_cache.py      # In-process TTL cache + rate limiter
 │   │   ├── vertex_ai.py        # Vertex AI / Gemini client
-│   │   ├── himcab/             # Him Cab backend clients (fare quotes, distances)
+│   │   ├── geo.py              # Coordinates → local/visitor, nearest town, distances
+│   │   ├── himcab/             # Him Cab backend clients (fares, offers, distances)
 │   │   └── external/           # 3rd party API wrappers (weather)
-│   ├── models/                 # Pydantic models (session, itinerary, user, alerts)
+│   ├── models/                 # Pydantic models (session, itinerary, user, alerts, location)
 │   ├── prompts/                # Prompt templates & builder
 │   └── main.py                 # FastAPI app entrypoint
 ├── tests/
@@ -83,14 +84,26 @@ docker-compose up
 
 Auth is a single header, `Authorization: Bearer <him cab rider jwt>`. No session id,
 persona, or rider id is ever sent: the backend owns the session and resolves it from
-the token. Use the `local` routes for in-state riders, `outstation` for visitors.
+the token.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `POST` | `/v1/chat/route` | Send the device's GPS fix → which persona to use |
 | `POST` | `/v1/chat/{local\|outstation}/start` | Open the dialog → returns welcome greeting |
 | `GET` | `/v1/chat/{local\|outstation}/stream` | SSE: send `?message=` , stream the reply |
 | `POST` | `/v1/chat/{local\|outstation}/message` | Non-streaming fallback |
 | `GET` | `/v1/chat/{local\|outstation}/history` | Replay the conversation to restore a chat panel |
+
+**Which persona?** Don't guess from the screen the rider tapped from — send coordinates.
+A fix inside Himachal gets the `local` assistant (Hindi, cab-first: they know the
+place, they want a ride); anywhere else gets `outstation` (English, itinerary-first).
+`/start`, `/stream` and `/message` all accept `lat`/`lon` too and route themselves,
+returning the persona they actually served.
+
+Coordinates are optional everywhere and worth sending everywhere — they are what let
+the assistant skip *"are you local or visiting?"* and *"which city are you starting
+from?"*, and price the trip from where the rider actually is rather than a city
+centroid. Send nothing and everything still works; the assistant just asks.
 
 See [docs/api_reference.md](docs/api_reference.md) for the full contract.
 
@@ -118,8 +131,19 @@ event: structured
 data: {"type": "itinerary", "payload": {...}}
 
 event: structured
+data: {"type": "cab_fare", "payload": {"fare_inr": 5100, "distance_km": 270, ...}}
+
+event: structured
+data: {"type": "offers", "payload": {"best_offer": {"coupon_code": "HIMCAB300", ...}}}
+
+event: structured
 data: {"type": "weather_alert", "payload": {"severity": "high"}}
 
 event: done
-data: {"session_id": "uuid", "node_trace": ["router", "context", "planner", "tool_executor", "writer", "persist"]}
+data: {"session_id": "uuid", "persona": "local", "node_trace": ["router", "context", "planner", "tool_executor", "writer", "persist"]}
 ```
+
+Fares and coupons are the real ones from the Him Cab Spring backend
+(`/api/rider/fare/estimate`, `/api/rider/offer/*`), priced on the route distance and
+filtered to what this rider can actually use. The assistant may quote only what those
+endpoints returned — with no live coupon it is forbidden to mention discounts at all.

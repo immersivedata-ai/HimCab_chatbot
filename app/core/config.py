@@ -60,6 +60,20 @@ class Settings(BaseSettings):
     himcab_fare_getall_path: str = "/api/rider/fare/get-all"      # rate-card catalog (Phase 2)
     himcab_fare_timeout_seconds: float = 10.0
 
+    # ── Him Cab offers (real coupons, same Spring backend) ────────────────────
+    # The assistant quotes ONLY these — see app/services/himcab/offers_service.py for
+    # why it fetches them rather than staying silent about discounts.
+    enable_offers: bool = True                # Feature flag; False = never mention coupons
+    #: Personalised, used whenever the rider's numeric id is known. `{riderId}` is
+    #: substituted at call time.
+    himcab_offers_by_trip_type_path: str = "/api/rider/offer/getOffersByTripType/{riderId}"
+    #: Unpersonalised fallback for a JWT with no rider-id claim; filtered on our side.
+    himcab_offers_all_path: str = "/api/rider/offer/get-all"
+    himcab_offers_page_size: int = 50
+    #: How many coupons the reply may name. More than a couple reads as a spam email
+    #: rather than a recommendation; the app's offers screen has the full list.
+    max_offers_in_reply: int = 3
+
     # ── Conversation policy ───────────────────────────────────────────────────
     # How the agent balances "ask for the missing detail" against "just answer".
     # These are the only knobs on that trade-off — the slot policy itself lives in

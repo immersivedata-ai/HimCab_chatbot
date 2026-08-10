@@ -17,10 +17,13 @@ Three response shapes, chosen by `slots.response_mode(intent, visitor_type)`:
                 the place; what they are choosing is the ride.
   • ANSWER    — a short direct answer to a question about somewhere
 
-Live data always beats generated data. Whatever the model writes, the real cab fare
-and the real weather report are stamped onto the validated itinerary afterwards
-(`_apply_real_fare`, `_apply_weather`) — so the app never renders a price or a
-forecast the model made up, or an empty one it forgot to copy across.
+Live data always beats generated data. Whatever the model writes, the real cab fare,
+the real weather report and the measured journey are stamped onto the validated
+itinerary afterwards (`_apply_real_fare`, `_apply_weather`, `_apply_travel_info`) — so
+the app never renders a price, a forecast or a distance the model made up, or an empty
+one it forgot to copy across. Coupons follow the same rule in reverse: the reply may
+quote only the codes the backend returned (`_build_offers_block`), and when there are
+none it is forbidden to mention discounts at all.
 
 This is the most visible node — its output IS the user experience.
 """
@@ -43,6 +46,7 @@ from app.models.itinerary import (
     CostBreakdown,
     GroupType,
     Itinerary,
+    TravelInfo,
     WeatherForecast,
 )
 from app.models.session import ExtractedEntities
@@ -167,16 +171,75 @@ def _build_fare_block(state: AgentState) -> str:
     return header + "\n".join(lines) + "\n"
 
 
+def _build_offers_block(state: AgentState) -> str:
+    """The HIM CAB OFFERS section — real coupons, or an instruction to stay silent.
+
+    The reply used to be told never to mention a discount at all, which was right when
+    the only coupons available were ones the model made up. Now that offers come from
+    the backend (`app/services/himcab/offers_service.py`), staying silent means a rider
+    pays full price with a valid coupon sitting in their account.
+
+    The rule is therefore narrower, not looser: quote these codes exactly, and nothing
+    else. `offers` is already filtered to this trip type, this fare and today's date,
+    so anything here is a coupon the rider can genuinely apply.
+    """
+    offers = state.offers or []
+    if not offers:
+        return (
+            "\n### HIM CAB OFFERS\n"
+            "No coupon applies to this trip. Do NOT mention, invent or hint at any "
+            "discount, promo or coupon code.\n"
+        )
+
+    lines = []
+    for offer in offers:
+        code = offer.get("coupon_code")
+        value = offer.get("coupon_value_inr")
+        after = offer.get("fare_after_offer_inr")
+        name = offer.get("coupon_name") or "Him Cab offer"
+        saving = f"Rs {round(value):,} off" if value else "a discount"
+        landed = f", bringing it to Rs {round(after):,}" if after else ""
+        minimum = offer.get("minimum_value_inr")
+        min_note = f" (on fares over Rs {round(minimum):,})" if minimum else ""
+        lines.append(f"  - {code}: {name} — {saving}{landed}{min_note}")
+
+    # Eligibility can only be CHECKED against a fare. Without one — the quote failed —
+    # a coupon with a minimum spend is live on the account but not proven to apply to
+    # this trip, and the prompt has to say the weaker thing.
+    all_verified = all(o.get("applies_to_this_fare") for o in offers)
+    applicability = (
+        "These coupons apply to THIS trip."
+        if all_verified
+        else "These coupons are live on this rider's account. No fare came back for this "
+             "route, so do NOT claim they apply to this trip — say the discount is "
+             "applied if the fare qualifies."
+    )
+
+    return (
+        "\n### HIM CAB OFFERS (real, live on this rider's account)\n"
+        f"{applicability} Mention the best one in a single short line, with its exact "
+        "code and exact rupee saving as written below. Quote ONLY these codes — never "
+        "invent, adapt or recall a coupon from anywhere else — and say the coupon is "
+        "applied on the booking screen. Never state a total that is not written here.\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 def _apply_real_fare(itinerary: Itinerary, cab_fare: dict) -> None:
-    """Force the real (gross) Him Cab fare onto the validated itinerary (mutates in place).
+    """Force the real Him Cab fare onto the validated itinerary (mutates in place).
 
     The LLM's numbers are advisory when a real fare exists — this guarantees the cab cost
-    and total match the backend fare exactly. No coupons/discounts are applied here; the
-    app's booking flow handles real coupons.
+    and total match the backend fare exactly. The only discount applied is a real coupon
+    from the backend (`best_offer`), subtracted the same way the Spring booking flow
+    subtracts it, so the total here matches the one the rider will be charged.
     """
     fare = cab_fare.get("fare_inr") or 0
     vehicle = cab_fare.get("vehicle_label")
     seats = cab_fare.get("seat_capacity")
+    best_offer = cab_fare.get("best_offer") or {}
+    after_offer = cab_fare.get("fare_after_offer_inr")
+    discount = max(0.0, fare - after_offer) if after_offer is not None else 0.0
 
     # cab_package — create if the LLM omitted it
     if itinerary.cab_package is None:
@@ -188,7 +251,8 @@ def _apply_real_fare(itinerary: Itinerary, cab_fare: dict) -> None:
     cp = itinerary.cab_package
     cp.estimated_cost_inr = fare
     cp.base_fare_inr = fare
-    cp.discounted_fare_inr = None
+    cp.discounted_fare_inr = after_offer if discount else None
+    cp.coupon_code = best_offer.get("coupon_code") if discount else None
     # Distinguishes a fare priced on a surveyed route from one priced on a computed
     # distance, so the app can render "approx" without re-deriving it.
     cp.fare_source = (
@@ -208,7 +272,33 @@ def _apply_real_fare(itinerary: Itinerary, cab_fare: dict) -> None:
         food=existing.food_estimate_inr if existing else 0.0,
         entry_fees=existing.entry_fees_inr if existing else 0.0,
         misc=existing.miscellaneous_inr if existing else 0.0,
+        discount=discount,
     )
+
+
+def _apply_travel_info(itinerary: Itinerary, state: AgentState) -> None:
+    """Stamp the measured journey onto the itinerary's travel_info (mutates in place).
+
+    Same rule as the fare and the weather: live numbers come from the service, never
+    from the model. `travel_info` used to be built by the LLM with both figures pinned
+    to null, because at the time nothing measured them — so an itinerary that clearly
+    knew the journey shipped with `estimated_distance_km: null` and the app had nothing
+    to render on its route line.
+    """
+    route = state.route_estimate
+    if not route:
+        return
+
+    info = itinerary.travel_info or TravelInfo()
+    # Endpoints AND figures both come from the route. Keeping the model's endpoints
+    # while stamping our numbers over them would let the JSON pair one journey's
+    # cities with another journey's distance — a route line that is wrong in a way
+    # nothing downstream can detect.
+    info.origin = route["origin"]["name"]
+    info.destination = route["destination"]["name"]
+    info.estimated_distance_km = route["distance_km"]
+    info.estimated_duration_hours = round(route["duration_minutes"] / 60, 1)
+    itinerary.travel_info = info
 
 
 def _apply_weather(itinerary: Itinerary, state: AgentState) -> None:
@@ -290,6 +380,12 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         return None
 
     fare = state.cab_fare or {}
+    # Prefill the coupon only when eligibility was actually checked against a fare.
+    # Preselecting one we could not verify puts a code on the booking screen that the
+    # payment step may then reject — worse than leaving the field empty.
+    best_offer = next(
+        (o for o in (state.offers or []) if o.get("applies_to_this_fare")), {}
+    )
     return {
         "origin": route["origin"],
         "destination": route["destination"],
@@ -297,6 +393,8 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         "duration_minutes": route["duration_minutes"],
         "duration_text": route["duration_text"],
         "is_approximate": route["is_approximate"],
+        # Where the distance came from: "surveyed" | "gps" | "city".
+        "distance_source": route.get("source"),
         "trip_type": fare.get("trip_type"),
         "passengers": state.entities.group_size,
         "travel_dates": state.entities.travel_dates,
@@ -304,6 +402,11 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         "recommended_category_id": fare.get("category_id"),
         "recommended_category_name": fare.get("category_name"),
         "fare_inr": fare.get("fare_inr"),
+        # The coupon the reply just told them about, so the booking screen can prefill
+        # it. `offerId` is exactly what POST /trip/book-ride takes.
+        "offer_id": best_offer.get("offer_id"),
+        "coupon_code": best_offer.get("coupon_code"),
+        "fare_after_offer_inr": fare.get("fare_after_offer_inr"),
         "options": fare.get("options", []),
     }
 
@@ -441,16 +544,34 @@ def _build_system_prompt(state: AgentState) -> str:
         snowfall_section = f"\n**Snowfall Risk:** {s.get('risk', 'none').upper()} — {s.get('message', '')}"
 
     # ── Travel from the origin ────────────────────────────────────────────────
-    # Rendered only when BOTH ends of the journey are known. There is no routing or
-    # geocoding service, so no travel time or distance is ever asserted — saying so
-    # explicitly is what stops the model filling the gap with a plausible number.
+    # Rendered only when BOTH ends of the journey are known, and deliberately silent
+    # about distance and time when THIS JOURNEY (`_build_journey_section`) has them —
+    # this section used to assert "no verified travel time or distance" while that one
+    # gave both, and a prompt that contradicts itself gets whichever half the model
+    # happened to read.
+    route_known = state.route_estimate is not None
     travel_section = ""
-    origin_display = entities.origin or "not specified"
-    if destination and entities.origin:
+    # How the pickup point is NAMED comes from the resolved route, which is the one
+    # place that knows how much the fix can be trusted: it says "Shimla" for a fix in
+    # Shimla and "near Mandi" for one 40 km out. Re-deriving the name here from the
+    # raw fix is how the prompt ended up asserting "the traveller starts from Mandi"
+    # to somebody who had never been there.
+    origin_display = (
+        (state.route_estimate or {}).get("origin", {}).get("name")
+        or entities.origin
+        or entities.home_city
+        or "not specified"
+    )
+    if destination and (entities.origin or route_known):
+        journey_from = origin_display
         travel_section = (
-            f"\n**TRAVEL FROM ORIGIN — {entities.origin.upper()} to {destination.upper()}:**\n"
-            "- No verified travel time or distance for this route — do NOT state one.\n"
-            f"IMPORTANT: the traveller starts from {entities.origin}, so Day 1 must begin with "
+            f"\n**TRAVEL FROM ORIGIN — {journey_from.upper()} to {destination.upper()}:**\n"
+            + (
+                "- Use the distance and drive time from THIS JOURNEY above; state no others.\n"
+                if route_known
+                else "- No verified travel time or distance for this route — do NOT state one.\n"
+            )
+            + f"IMPORTANT: the traveller starts from {journey_from}, so Day 1 must begin with "
             "that journey. Account for travel fatigue — lighter activities on arrival day.\n"
         )
 
@@ -496,20 +617,26 @@ def _build_system_prompt(state: AgentState) -> str:
 
 """
 
-    # ── Him Cab fares (all categories, gross — no coupons) ────────────────────
+    # ── Him Cab fares (all categories, before any coupon) and the live coupons ─
     fare_block = _build_fare_block(state)
+    offers_block = _build_offers_block(state)
 
     # ── travel_info JSON template (only when both ends of the journey are known) ──
-    # Duration and distance stay null: nothing measures them, so the model must not
-    # fill them in. The app renders whatever is present and omits what is not.
+    # The figures are given to the model rather than asked of it, and stamped over
+    # afterwards by `_apply_travel_info` regardless. They stay null only when nothing
+    # measured the route — the model must not fill that gap in.
     travel_info_json = ""
-    if entities.origin and destination:
+    if (entities.origin or state.route_estimate) and destination:
+        route = state.route_estimate or {}
+        json_origin = entities.origin or (route.get("origin") or {}).get("name") or ""
+        distance_json = route.get("distance_km") if route else None
+        hours_json = round(route["duration_minutes"] / 60, 1) if route else None
         travel_info_json = f"""
   "travel_info": {{
-    "origin": "{entities.origin}",
+    "origin": "{json_origin}",
     "destination": "{destination}",
-    "estimated_duration_hours": null,
-    "estimated_distance_km": null,
+    "estimated_duration_hours": {hours_json if hours_json is not None else "null"},
+    "estimated_distance_km": {distance_json if distance_json is not None else "null"},
     "recommended_mode": "cab"
   }},"""
 
@@ -565,9 +692,18 @@ def _build_system_prompt(state: AgentState) -> str:
                  "the exact fare is confirmed at booking."
         )
     )
-    no_coupons_step = (
-        "NEVER mention or invent any coupon, promo, or discount code — Him Cab handles coupons "
-        "inside the app."
+    # Coupons: quote the real ones, invent none. The blanket ban this replaces was
+    # correct only while there was no source of truth for offers — now that the backend
+    # supplies them, staying silent means the rider pays full price with a valid coupon
+    # in their account. See `_build_offers_block`.
+    has_offers = bool(state.offers)
+    coupons_step = (
+        "Mention the BEST coupon from HIM CAB OFFERS in one short line — its exact code "
+        "and exact saving, and that it applies on the booking screen. Never quote a code "
+        "that is not listed there, and never invent or adjust a discount."
+        if has_offers
+        else "NEVER mention or invent any coupon, promo, or discount code — no offer "
+             "applies to this trip."
     )
 
     if mode == slots.ANSWER_MODE:
@@ -580,7 +716,7 @@ def _build_system_prompt(state: AgentState) -> str:
             weather_step,
             "Keep it to 3-6 short bullets. Do NOT write a day-by-day itinerary and do NOT "
             "output any JSON.",
-            no_coupons_step,
+            coupons_step,
             "End with ONE short line offering to plan the full trip if they'd like.",
         ]
         json_block = ""
@@ -608,7 +744,7 @@ def _build_system_prompt(state: AgentState) -> str:
             ),
             "Do NOT write a day-by-day itinerary, sightseeing plan, hidden gems or any JSON — "
             "they live here and are booking a ride, not planning a holiday.",
-            no_coupons_step,
+            coupons_step,
             "Close with ONE short line telling them the booking screen is ready with their "
             "pickup and drop already filled in. Do NOT ask whether they want to book, do not "
             "ask them to confirm, and do not ask for any more details — the app takes over "
@@ -637,7 +773,7 @@ def _build_system_prompt(state: AgentState) -> str:
             )
         steps.extend([
             him_cab_step,
-            no_coupons_step,
+            coupons_step,
             followup_step,
             "After the text, append the itinerary as a ```json block (format below). Do NOT put "
             "any price, fare, cab_package, cost_breakdown, coupon, or offer fields in the JSON — "
@@ -711,7 +847,7 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
 {chr(10).join(trip_facts)}
 {user_context}
 {assumptions_section}{journey_section}{travel_section}{outstation_instructions}{local_instructions}
-{fare_block}
+{fare_block}{offers_block}
 ## REAL-TIME DATA
 {weather_section}{snowfall_section}
 
@@ -905,6 +1041,7 @@ async def writer_node(state: AgentState) -> dict:
             if state.cab_fare:
                 _apply_real_fare(validated_itinerary, state.cab_fare)
             _apply_weather(validated_itinerary, state)
+            _apply_travel_info(validated_itinerary, state)
 
         # Build structured SSE events for mobile
         if validated_itinerary is not None:
@@ -946,6 +1083,20 @@ async def writer_node(state: AgentState) -> dict:
                 "payload": state.cab_fare,
             })
 
+        # Live coupons that apply to this trip. Emitted only when there ARE some — an
+        # empty offers card is worse than no card, and the app should never have to
+        # decide whether a zero-length list means "none" or "not fetched".
+        if state.offers:
+            structured_events.append({
+                "type": "offers",
+                "payload": {
+                    "trip_type": (state.cab_fare or {}).get("trip_type"),
+                    "fare_inr": (state.cab_fare or {}).get("fare_inr"),
+                    "offers": state.offers,
+                    "best_offer": state.offers[0],
+                },
+            })
+
         # Hand a local rider straight to the booking screen, with both endpoints and
         # their coordinates so the map opens on the journey we just priced. This is a
         # handoff, not a booking — nothing is reserved here, which is why the reply
@@ -965,6 +1116,7 @@ async def writer_node(state: AgentState) -> dict:
             response_length=len(full_response),
             has_itinerary=validated_itinerary is not None,
             assumed_fields=state.assumed_fields,
+            offers_quoted=len(state.offers or []),
             structured_events=len(structured_events),
             session_id=state.session_id,
         )

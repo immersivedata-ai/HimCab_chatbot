@@ -51,6 +51,22 @@ class FakeSessionService:
         owned = [s for s in self.sessions.values() if s.user_id == user_id]
         return sorted(owned, key=lambda s: s.updated_at, reverse=True)[:limit]
 
+    async def update_persona(self, session_id: str, persona: str, language: str) -> None:
+        from app.models.session import Language
+
+        session = self.sessions[session_id]
+        session.persona = persona
+        session.language = Language(language)
+
+    async def update_location(self, session_id: str, location: dict, entities=None) -> None:
+        from app.models.location import RiderLocation
+        from app.models.session import ExtractedEntities
+
+        session = self.sessions[session_id]
+        session.rider_location = RiderLocation.model_validate(location)
+        if entities is not None:
+            session.entities = ExtractedEntities.model_validate(entities)
+
     async def set_active_session(self, user_id: str, persona: str, session_id: str) -> None:
         if self.pointers_should_raise:
             return  # the real service swallows write failures
@@ -296,6 +312,234 @@ class TestSendMessage:
         assert resp.status_code == 401
 
 
+# ── Coordinates: which assistant, and where from ──────────────────────────────
+
+SHIMLA = {"lat": 31.1048, "lon": 77.1734}
+DELHI = {"lat": 28.6139, "lon": 77.2090}
+
+
+class TestPersonaRouting:
+    """The screen a rider tapped from is a guess; their coordinates are not.
+
+    A visitor browsing the home screen lands on /local and would be greeted in Hindi
+    about a state they have never driven in; a Shimla resident opening the outstation
+    screen would be handed a three-day itinerary for the town they live in. A GPS fix
+    settles it, so when one is sent it decides the persona whichever path was called.
+    """
+
+    def test_route_endpoint_sends_a_himachal_rider_to_local(self, api):
+        client, _, _, _ = api
+        body = client.post("/v1/chat/route", headers=AUTH, json=SHIMLA).json()
+
+        assert body["persona"] == "local"
+        assert body["base_path"] == "/v1/chat/local"
+        assert body["reason"] == "coordinates"
+        assert body["location"]["in_himachal"] is True
+        assert body["location"]["place_name"] == "Shimla"
+
+    def test_route_endpoint_sends_a_visitor_to_outstation(self, api):
+        client, _, _, _ = api
+        body = client.post("/v1/chat/route", headers=AUTH, json=DELHI).json()
+
+        assert body["persona"] == "outstation"
+        assert body["base_path"] == "/v1/chat/outstation"
+        assert body["location"]["place_name"] == "Delhi"
+
+    def test_route_endpoint_creates_nothing(self, api):
+        """A pure lookup — safe to call on app start or on every location change."""
+        client, sessions, _, _ = api
+        client.post("/v1/chat/route", headers=AUTH, json=SHIMLA)
+        assert sessions.sessions == {}
+        assert sessions.pointers == {}
+
+    def test_route_endpoint_requires_the_same_single_credential(self, api):
+        client, _, _, _ = api
+        assert client.post("/v1/chat/route", json=SHIMLA).status_code == 401
+
+    def test_unusable_coordinates_keep_the_requested_persona(self, api):
+        """(0, 0) is what a phone reports before it has a fix. Trusting it would put a
+        Shimla rider in the Atlantic and hand them an English itinerary."""
+        client, _, _, _ = api
+        body = client.post(
+            "/v1/chat/route", headers=AUTH, json={"lat": 0.0, "lon": 0.0}
+        ).json()
+
+        assert body["reason"] == "default"
+        assert body["location"] is None
+
+    def test_start_on_the_wrong_path_is_served_as_the_right_persona(self, api):
+        """/local/start with a Delhi fix returns persona=outstation — and the greeting
+        that goes with it, in English."""
+        client, _, _, _ = api
+        body = client.post("/v1/chat/local/start", headers=AUTH, params=DELHI).json()
+
+        assert body["persona"] == "outstation"
+        assert body["language"] == "en"
+        assert body["location"]["in_himachal"] is False
+
+    def test_start_without_coordinates_keeps_the_path_persona(self, api):
+        """No fix, no change — a client that sends nothing behaves exactly as before."""
+        client, _, _, _ = api
+        body = client.post("/v1/chat/local/start", headers=AUTH).json()
+
+        assert body["persona"] == "local"
+        assert body["language"] == "hi"
+        assert body["location"] is None
+
+    def test_message_reports_the_persona_it_served(self, api):
+        client, _, _, _ = api
+        body = client.post(
+            "/v1/chat/outstation/message",
+            headers=AUTH,
+            json={"message": "Manali jaana hai", **SHIMLA},
+        ).json()
+
+        assert body["persona"] == "local"
+
+
+class TestLocationReachesTheAgent:
+    """Coordinates are only worth sending if they change what the agent can do: they
+    are the pickup point the fare is priced from and the pin the booking screen opens
+    on. Every one of these asserts they arrived somewhere that matters."""
+
+    def test_fix_is_attached_to_the_agent_state(self, api):
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message",
+            headers=AUTH,
+            json={"message": "Manali", **SHIMLA},
+        )
+
+        location = graph.last_state.rider_location
+        assert location is not None
+        assert location.place_name == "Shimla"
+        assert location.in_himachal is True
+
+    def test_a_precise_fix_answers_the_starting_city_question(self, api):
+        """The assistant used to have to ask "which city are you travelling from?"
+        before it could price anything. A fix on a known town answers it."""
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message",
+            headers=AUTH,
+            json={"message": "Manali", **SHIMLA},
+        )
+
+        entities = graph.last_state.entities
+        assert entities.origin == "Shimla"
+        assert entities.home_city == "Shimla"
+
+    def test_a_vague_fix_does_not_invent_a_starting_city(self, api):
+        """A point 26 km from Mandi is fine for measuring a distance and useless as a
+        place name — announcing "your trip from Mandi" to someone who has never been
+        there is worse than asking."""
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message",
+            headers=AUTH,
+            json={"message": "Manali", "lat": 31.50, "lon": 77.05},
+        )
+
+        assert graph.last_state.entities.origin is None
+        assert graph.last_state.rider_location is not None
+
+    def test_a_named_origin_outranks_the_phone(self, api):
+        """Booking a Delhi pickup from a Shimla sofa is a real thing people do."""
+        client, sessions, graph, _ = api
+        started = client.post("/v1/chat/outstation/start", headers=AUTH).json()
+        session = sessions.sessions[started["session_id"]]
+        session.entities.origin = "Delhi"
+
+        client.post(
+            "/v1/chat/outstation/message",
+            headers=AUTH,
+            json={"message": "Manali", **SHIMLA},
+        )
+
+        assert graph.last_state.entities.origin == "Delhi"
+
+    def test_a_persona_switch_carries_the_conversation_across(self, api):
+        """The likeliest way a rider's persona changes is that they ARRIVED — they
+        planned the trip from Delhi and are now standing in Manali. Dropping them into
+        an empty chat at that point loses everything they already told us."""
+        client, sessions, graph, _ = api
+        started = client.post("/v1/chat/outstation/start", headers=AUTH).json()
+        client.post(
+            "/v1/chat/outstation/message",
+            headers=AUTH,
+            json={"message": "3 days in Manali for 4 people"},
+        )
+
+        body = client.post(
+            "/v1/chat/outstation/message",
+            headers=AUTH,
+            json={"message": "we've landed", **SHIMLA},
+        ).json()
+
+        assert body["persona"] == "local"
+        assert body["session_id"] == started["session_id"]
+        # Re-filed durably, not just in memory: `list_user_sessions` consumers filter
+        # on the stored persona, so a document left saying "outstation" becomes
+        # unresumable the moment the active-chat pointer is lost.
+        adopted = sessions.sessions[started["session_id"]]
+        assert adopted.persona == "local"
+        assert adopted.language == "hi"
+        # The history came with it — that is the whole point.
+        assert any(
+            "3 days in Manali" in m.content for m in graph.last_state.messages
+        )
+
+    def test_the_newest_fix_wins(self, api):
+        """Riders move between turns — they open the chat at home and send the next
+        message from the taxi rank."""
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH, json={"message": "hi", **SHIMLA}
+        )
+        client.post(
+            "/v1/chat/local/message",
+            headers=AUTH,
+            json={"message": "actually from here", "lat": 32.2396, "lon": 77.1887},
+        )
+
+        assert graph.last_state.rider_location.place_name == "Manali"
+
+    def test_a_fix_persists_across_turns_without_being_resent(self, api):
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH, json={"message": "hi", **SHIMLA}
+        )
+        client.post("/v1/chat/local/message", headers=AUTH, json={"message": "Manali"})
+
+        assert graph.last_state.rider_location.place_name == "Shimla"
+
+    def test_rider_id_from_the_jwt_reaches_the_agent(self, api):
+        """It personalises the offer lookup; without it the agent falls back to the
+        unpersonalised catalogue rather than showing no offers."""
+        client, _, graph, _ = api
+        token = _fake_jwt({"riderId": 4321, "sub": "9816000000"})
+        client.post(
+            "/v1/chat/local/message",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Manali"},
+        )
+
+        assert graph.last_state.rider_id == 4321
+
+    def test_a_phone_number_subject_is_not_read_as_a_rider_id(self, api):
+        """`sub` on this backend is the rider's phone number. Sending it as a riderId
+        would query offers for whichever account happens to have that id."""
+        client, _, graph, _ = api
+        token = _fake_jwt({"sub": "9816000000"})
+        client.post(
+            "/v1/chat/local/message",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Manali"},
+        )
+
+        assert graph.last_state.rider_id is None
+
+
 # ── Session resolution edge cases ─────────────────────────────────────────────
 
 class TestSessionResolution:
@@ -466,7 +710,8 @@ class TestResponsePayload:
         from app.models.session import StructuredEventType
 
         assert {t.value for t in StructuredEventType} == {
-            "itinerary", "weather_alert", "snowfall_alert", "cab_fare", "booking_handoff",
+            "itinerary", "weather_alert", "snowfall_alert", "cab_fare", "offers",
+            "booking_handoff",
         }
 
     def test_rate_limit_returns_429_with_retry_after(self, api):

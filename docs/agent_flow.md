@@ -87,6 +87,26 @@ planning a holiday somewhere unfamiliar. Telling them what to see on Mall Road i
 same mistake as answering a weather question with a four-day plan. They are still
 asked the same questions — the mode changes the answer, not the interview.
 
+### Which persona, and who decides
+
+Three sources, in increasing authority:
+
+1. **The screen the chat was opened from.** A guess: a Delhi visitor browsing the home
+   screen lands on `/local`, and a Shimla resident on the outstation screen lands on
+   `/outstation`. Used only when nothing better is available.
+2. **The device's GPS fix.** Inside Himachal → `local`, outside → `outstation`
+   (`geo.locate` against `geo.HIMACHAL_OUTLINE`, `chat_session.resolve_persona`). This
+   overrides the path the app called, and the response says which persona it served.
+3. **The rider's own words.** Once they name a starting city, `classify_visitor_type`
+   reclassifies from that. Someone who says "I'm coming from Delhi" is a visitor
+   whatever their phone reports — they might be booking from anywhere.
+
+A fix that changes the persona mid-conversation carries the conversation across rather
+than starting a fresh one (`chat_session._adopt_conversation`). The likeliest way for
+that to happen is that the rider has ARRIVED — they planned the trip from Delhi and are
+now standing in Manali — and dropping them into an empty chat at that point discards
+everything they have already told the assistant.
+
 The reply ends by announcing the booking screen rather than asking whether to book:
 the app owns that flow, and `booking_handoff` carries both endpoints **with
 coordinates** so its map can drop pins without geocoding the names again.
@@ -126,20 +146,33 @@ coordinates** so its map can drop pins without geocoding the names again.
 - **Output**: `final_response_text` (the question itself)
 
 ### 5. Tool Executor Node (`tool_executor.py`)
-- **Purpose**: Call the external services in parallel
-- **Tools called** (via `asyncio.gather`):
+- **Purpose**: Call the external services, in parallel where they are independent
+- **Tools called**:
   - Weather + snowfall risk (OpenWeatherMap; one fetch, risk derived from it)
-  - Him Cab fare quote (gated on flag + origin + pricing intent + rider JWT)
+  - Him Cab fare quote (gated on flag + a pickup point + pricing intent + rider JWT)
+  - Him Cab offers (gated on flag + pricing intent + rider JWT)
+- **Order**: the route is resolved first, in memory; weather and the fare then run
+  concurrently; offers follow the fare. That order is forced by the data — the fare
+  needs the distance, and whether a coupon applies depends on the fare.
+- **Where the journey is measured from**: the rider's own GPS fix when the app sent one
+  and they have not named a different origin (`distances.resolve_route_from_fix`).
+  A fix within 15 km of a surveyed town keeps the measured distance; beyond that the
+  coordinates are the better number, because "Manali" and a point 30 km down the Kullu
+  road are not the same journey. Falls back to city-to-city when there is no fix.
 - **How a fare gets priced**: `/fare/estimate` is distance-driven, so the route needs a
   distance. Surveyed routes use the measured figure (`himcab/distances.py`); everything
-  else is computed from city coordinates (`services/geo.py`) and the fare is labelled
-  approximate all the way to the reply. Requiring a surveyed pair is what made most
-  itineraries arrive with no price at all.
+  else is computed (`services/geo.py`) and the fare is labelled approximate all the way
+  to the reply. `bookingTime` is the rider's clock in IST, so the night-charge window is
+  the same one the booking will be priced in.
 - **Which cabs are offered**: the endpoint prices EVERY category, so the raw list always
   includes vehicles the group cannot sensibly book. `himcab/vehicles.py` narrows it to
   what seats them, smallest suitable first — repeating the backend's list verbatim is
   how a party of four was recommended a Mini Bus. Seat counts come from the response
   when present and from the category name otherwise.
+- **Which coupons are offered**: only ones the backend returned, filtered to this trip
+  type, today's date and the quoted fare, best saving first, capped at
+  `MAX_OFFERS_IN_REPLY`. The saving is computed here, not by the model — the rider will
+  check it against their receipt.
 - **Trip type** is decided by the journey's length, not the rider's persona: a Himachal
   resident driving 270 km is an intercity transfer, not a local run.
 - **Timeout**: 20s per tool, graceful degradation on failure — a missing tool result
@@ -154,10 +187,16 @@ coordinates** so its map can drop pins without geocoding the names again.
   in a `DETAILS THE USER NEVER GAVE` block with an explicit instruction — substitute a
   stated default and open by saying so, or work around the gap. An unknown value never
   reaches the model as the literal text `None`, which is what used to invite invention.
-- **Live data wins**: after validation, the real cab fare and the real weather report
-  are stamped onto the itinerary (`_apply_real_fare`, `_apply_weather`). The model
-  used to skip copying the forecast into its JSON, so the app rendered an itinerary
-  with no weather even though it had been fetched.
+- **Live data wins**: after validation, the real cab fare, the real weather report and
+  the measured journey are stamped onto the itinerary (`_apply_real_fare`,
+  `_apply_weather`, `_apply_travel_info`). The model used to skip copying the forecast
+  into its JSON, so the app rendered an itinerary with no weather even though it had
+  been fetched — and `travel_info` shipped with both distance and duration null even
+  when the route was known.
+- **Coupons**: the prompt carries either the real ones (`_build_offers_block`, quoted
+  verbatim with their exact codes and savings) or a flat ban on mentioning discounts —
+  never both. The blanket ban was right while nothing supplied real offers; keeping it
+  afterwards would mean a rider pays full price with a valid coupon in their account.
 
 ### 7. Persist Node (`persist.py`)
 - **Purpose**: Save everything to Firestore

@@ -9,7 +9,12 @@ rider's Spring JWT forwarded by the mobile app.
 """
 
 from app.services.himcab.fare_service import FareService, get_fare_service
-from app.services.himcab.models import FareQuote, FareQuoteInput
+from app.services.himcab.models import FareQuote, FareQuoteInput, Offer
+from app.services.himcab.offers_service import (
+    OffersService,
+    get_offers_service,
+    usable_offers,
+)
 from app.services.himcab.quote_builder import build_fare_quote_input
 
 __all__ = [
@@ -17,5 +22,9 @@ __all__ = [
     "get_fare_service",
     "FareQuote",
     "FareQuoteInput",
+    "Offer",
+    "OffersService",
+    "get_offers_service",
+    "usable_offers",
     "build_fare_quote_input",
 ]

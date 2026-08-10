@@ -8,8 +8,10 @@ The mobile app sends exactly ONE thing on every chat request:
     Authorization: Bearer <Him Cab rider JWT>
 
 That same token does two jobs:
-  1. Identifies the caller  → used as the session owner (`user_id`)
-  2. Authorizes fare quotes → forwarded verbatim to the Him Cab fare microservice
+  1. Identifies the caller  → used as the session owner (`user_id`), and for the
+     numeric `rider_id` the offer endpoints personalise on
+  2. Authorizes backend calls → forwarded verbatim to the Him Cab fare and offer
+     microservices
 
 There is deliberately no second header, no rider id, and no session id — see
 app/api/v1/routes/chat.py for the full front-end contract.
@@ -52,24 +54,42 @@ DEV_USER_ID = "dev-test-user"
 # preference order. The first one present wins.
 _ID_CLAIMS = ("riderId", "rider_id", "userId", "user_id", "sub", "id", "email")
 
+#: Above this, a numeric claim is a phone number rather than a database id — an Indian
+#: mobile number is ten digits starting at 6, and no autoincrement id on this backend
+#: is anywhere near a billion. Used only to reject; see `_rider_id_from`.
+_MAX_PLAUSIBLE_RIDER_ID = 1_000_000_000
+
 
 class RiderIdentity:
     """The authenticated caller, derived from the single Bearer token.
 
     Attributes:
-        user_id: stable id used to own sessions in Firestore.
-        jwt:     the raw token, forwarded to the fare service. None in dev mode.
-        claims:  decoded JWT payload (empty dict if the token isn't a readable JWT).
+        user_id:  stable id used to own sessions in Firestore.
+        jwt:      the raw token, forwarded to the fare and offer services. None in dev mode.
+        claims:   decoded JWT payload (empty dict if the token isn't a readable JWT).
+        rider_id: the rider's NUMERIC Spring id, when the token carries one. Needed to
+                  personalise offers (`/offer/getOffersByTripType/{riderId}`); None
+                  falls back to the unpersonalised catalogue rather than no offers.
     """
 
-    def __init__(self, user_id: str, jwt: Optional[str], claims: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        user_id: str,
+        jwt: Optional[str],
+        claims: dict[str, Any],
+        rider_id: Optional[int] = None,
+    ) -> None:
         self.user_id = user_id
         self.jwt = jwt
         self.claims = claims
+        self.rider_id = rider_id
 
     def __repr__(self) -> str:
         # Never include the raw token — this shows up in logs and tracebacks.
-        return f"RiderIdentity(user_id={self.user_id!r}, has_jwt={bool(self.jwt)})"
+        return (
+            f"RiderIdentity(user_id={self.user_id!r}, rider_id={self.rider_id!r}, "
+            f"has_jwt={bool(self.jwt)})"
+        )
 
 
 def _b64url_decode(segment: str) -> bytes:
@@ -111,6 +131,33 @@ def _user_id_from(token: str, claims: dict[str, Any]) -> str:
     return f"anon:{digest}"
 
 
+def _rider_id_from(claims: dict[str, Any]) -> Optional[int]:
+    """The rider's numeric Spring id, if the token carries one anywhere.
+
+    Only the offer endpoints need this, and only to personalise: without it they fall
+    back to the whole live catalogue. So an unparseable or absent claim is a normal
+    outcome, not a failure — never raise, never guess.
+
+    A claim like `sub: "9816000000"` is a phone number, not a rider id, so values are
+    only accepted from id-shaped claims. `sub` is deliberately NOT one of them — and
+    because a Spring backend might just as easily put the phone number in `userId`,
+    anything large enough to BE a phone number is rejected too. Sending one as a
+    riderId would silently fetch a different account's offers, which is worse than the
+    unpersonalised catalogue we fall back to.
+    """
+    for claim in ("riderId", "rider_id", "userId", "user_id", "id"):
+        value = claims.get(claim)
+        if isinstance(value, bool) or value in (None, ""):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < parsed < _MAX_PLAUSIBLE_RIDER_ID:
+            return parsed
+    return None
+
+
 def _normalize_bearer(token: str) -> str:
     """Strip a doubled 'Bearer ' prefix.
 
@@ -150,5 +197,11 @@ async def get_rider(
 
     claims = _decode_claims(token)
     user_id = _user_id_from(token, claims)
-    log.debug("rider_auth_ok", user_id=user_id, has_claims=bool(claims))
-    return RiderIdentity(user_id=user_id, jwt=token, claims=claims)
+    rider_id = _rider_id_from(claims)
+    log.debug(
+        "rider_auth_ok",
+        user_id=user_id,
+        has_claims=bool(claims),
+        has_rider_id=rider_id is not None,
+    )
+    return RiderIdentity(user_id=user_id, jwt=token, claims=claims, rider_id=rider_id)

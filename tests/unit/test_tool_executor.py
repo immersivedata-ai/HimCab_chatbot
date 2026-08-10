@@ -110,3 +110,133 @@ class TestToolExecutorNode:
         assert "tool_executor" in result["node_trace"]
         # No derivation is attempted from a report that was never fetched.
         weather_svc.snowfall_from_report.assert_not_called()
+
+
+# ── The journey, measured from the rider's own position ───────────────────────
+
+def _quiet_weather():
+    """Patch context that keeps the weather call out of the way of a route assertion."""
+    weather_svc = MagicMock()
+    weather_svc.get_weather = AsyncMock(side_effect=Exception("not under test"))
+    weather_svc.snowfall_from_report = MagicMock(return_value=None)
+    return patch(
+        "app.agent.nodes.tool_executor.get_weather_service", return_value=weather_svc
+    )
+
+
+def _located_state(lat: float, lon: float, **entity_overrides):
+    from app.agent.state import AgentState
+    from app.models.location import RiderLocation
+    from app.models.session import ExtractedEntities
+
+    entities = {"destination": "Manali"}
+    entities.update(entity_overrides)
+    return AgentState(
+        session_id="route-1",
+        user_id="rider:1",
+        intent="plan_trip",
+        visitor_type="local",
+        entities=ExtractedEntities(**entities),
+        rider_location=RiderLocation.resolve(lat, lon),
+    )
+
+
+class TestRouteFromCoordinates:
+    """`route_estimate` is what the reply quotes, what the fare is priced on and what
+    the app pins on its map. All three have to describe the same journey."""
+
+    @pytest.mark.asyncio
+    async def test_a_fix_alone_is_enough_to_resolve_the_journey(self):
+        """No origin was ever typed — the fix supplies it. Before coordinates, this
+        rider got no distance and therefore no fare at all."""
+        state = _located_state(31.1048, 77.1734)   # Shimla
+
+        with _quiet_weather():
+            result = await tool_executor_node(state)
+
+        route = result["route_estimate"]
+        assert route is not None
+        assert route["distance_km"] > 0
+        assert route["destination"]["name"] == "Manali"
+
+    @pytest.mark.asyncio
+    async def test_the_pickup_pin_is_the_riders_own_fix(self):
+        """Solang Valley is 14 km up the road from Manali. Handing the app the town
+        centroid instead of the fix would drop the pin on the wrong village."""
+        state = _located_state(32.3200, 77.1700, destination="Kasol")
+
+        with _quiet_weather():
+            result = await tool_executor_node(state)
+
+        origin = result["route_estimate"]["origin"]
+        assert origin["lat"] == pytest.approx(32.3200)
+        assert origin["lon"] == pytest.approx(77.1700)
+
+    @pytest.mark.asyncio
+    async def test_a_named_origin_elsewhere_beats_the_fix(self):
+        """Their words win: someone arranging a Delhi pickup from their Shimla sofa
+        must be quoted the Delhi journey."""
+        from app.services.himcab.distances import resolve_route
+
+        state = _located_state(31.1048, 77.1734, origin="Delhi")
+
+        with _quiet_weather():
+            result = await tool_executor_node(state)
+
+        assert result["route_estimate"]["distance_km"] == resolve_route("Delhi", "Manali").km
+
+    @pytest.mark.asyncio
+    async def test_the_fare_is_priced_on_the_distance_the_reply_quotes(self):
+        """The single most damaging inconsistency available here: quoting one distance
+        in the text and pricing the cab on another."""
+        from app.core.config import settings
+        from app.services.himcab.models import FareCategoryFare, FareQuote
+
+        state = _located_state(32.3200, 77.1700, destination="Kasol")
+        state.rider_jwt = "jwt-token"
+
+        captured = {}
+
+        async def fake_quote(quote_input, rider_jwt):
+            captured["input"] = quote_input
+            return FareQuote(
+                base_fare_inr=1500,
+                category_name="Sedan",
+                trip_type=quote_input.trip_type,
+                distance_km=quote_input.distance_km,
+                distance_is_approximate=quote_input.distance_is_approximate,
+                alternatives=[FareCategoryFare(category_name="Sedan", total_fare_inr=1500)],
+            )
+
+        fare_svc = MagicMock()
+        fare_svc.get_quote = fake_quote
+
+        with _quiet_weather(), \
+             patch("app.agent.nodes.tool_executor.get_fare_service", return_value=fare_svc), \
+             patch.object(settings, "enable_offers", False):
+            result = await tool_executor_node(state)
+
+        assert captured["input"].distance_km == result["route_estimate"]["distance_km"]
+        assert result["cab_fare"]["distance_km"] == result["route_estimate"]["distance_km"]
+        # Journey context travels with the fare so a fare card needs no second lookup.
+        assert result["cab_fare"]["duration_text"] == result["route_estimate"]["duration_text"]
+        assert result["cab_fare"]["distance_source"] == result["route_estimate"]["source"]
+
+    @pytest.mark.asyncio
+    async def test_a_fix_alone_opens_the_fare_gate(self):
+        """The gate used to demand a named origin, so a rider whose phone knew exactly
+        where they were still saw no price until they typed the town out."""
+        from app.core.config import settings
+
+        state = _located_state(31.1048, 77.1734)
+        state.rider_jwt = "jwt-token"
+
+        fare_svc = MagicMock()
+        fare_svc.get_quote = AsyncMock(side_effect=Exception("backend down"))
+
+        with _quiet_weather(), \
+             patch("app.agent.nodes.tool_executor.get_fare_service", return_value=fare_svc), \
+             patch.object(settings, "enable_offers", False):
+            await tool_executor_node(state)
+
+        fare_svc.get_quote.assert_awaited_once()

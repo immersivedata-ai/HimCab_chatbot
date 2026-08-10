@@ -9,6 +9,7 @@ inside FareService (`_build_quote_request` / `_parse_quote_response`), so a chan
 backend contract touches only those two fenced methods, never these models or their consumers.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -43,6 +44,63 @@ class FareCategoryFare(BaseModel):
     category_image: Optional[str] = None
     total_fare_inr: float = Field(ge=0)
     seat_capacity: Optional[int] = None                  # present per-category (often null)
+
+
+class Offer(BaseModel):
+    """One live Him Cab coupon, as the rider would use it in the app.
+
+    Parsed from GET /api/rider/offer/getOffersByTripType/{riderId} (or the unpersonalised
+    /offer/get-all). `coupon_value` is a flat rupee discount — the Spring side subtracts
+    it from the total fare at booking (see TripService: `totalFare.subtract(offerValue)`),
+    so the same subtraction here is the real saving rather than an illustration.
+    """
+
+    offer_id: Optional[int] = None
+    coupon_code: Optional[str] = None
+    coupon_name: Optional[str] = None
+    coupon_value_inr: float = Field(default=0.0, ge=0)
+    #: Minimum fare the offer applies to. An offer above the quoted fare is filtered
+    #: out rather than shown — a coupon the rider cannot use on this trip is noise.
+    minimum_value_inr: float = Field(default=0.0, ge=0)
+    #: Trip types it is valid for, upper-cased: ALL | LOCAL | OUTSTATION | RENTAL.
+    trip_types: list[str] = Field(default_factory=list)
+    #: NEW_USER | EXISTING_USER | None.
+    user_type: Optional[str] = None
+    terms_and_conditions: Optional[str] = None
+    image: Optional[str] = None
+    live_date: Optional[datetime] = None
+    expire_date: Optional[datetime] = None
+
+    def applies_to(self, trip_type: str) -> bool:
+        """True when this coupon covers the given trip type (empty list = all types)."""
+        if not self.trip_types:
+            return True
+        wanted = (trip_type or "").upper()
+        return "ALL" in self.trip_types or wanted in self.trip_types
+
+    def is_live(self, now: Optional[datetime] = None) -> bool:
+        """True when the coupon's window is open right now."""
+        moment = now or datetime.now(timezone.utc)
+        if self.live_date and _as_utc(self.live_date) > moment:
+            return False
+        if self.expire_date and _as_utc(self.expire_date) < moment:
+            return False
+        return True
+
+    def discount_on(self, fare_inr: float) -> float:
+        """What this coupon actually takes off `fare_inr` — 0 when it does not apply.
+
+        Capped at the fare so a Rs 500 coupon on a Rs 300 ride never produces a
+        negative price, which is what the app would otherwise render.
+        """
+        if fare_inr < self.minimum_value_inr:
+            return 0.0
+        return round(min(self.coupon_value_inr, fare_inr), 2)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Firestore and Spring both hand back naive datetimes; treat those as UTC."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 class FareQuote(BaseModel):

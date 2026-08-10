@@ -18,12 +18,18 @@ Distance is then computed rather than looked up:
 Curated pair distances still win where they exist (`himcab/distances.py`) — they are
 measured, not derived. The estimate covers everything else, and is reported as
 approximate so the reply can say so.
+
+It also answers the question the chat API asks before anything else: GIVEN A GPS FIX,
+is this rider a Himachal local or a visitor travelling in? See `locate()` — the fix is
+tested against `HIMACHAL_OUTLINE` and matched to the nearest town we know, which is
+what turns a pair of coordinates into an origin the fare endpoint can be called with.
 """
 
 from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from typing import Optional
 
 # ── City coordinates (lat, lon) ───────────────────────────────────────────────
@@ -255,6 +261,190 @@ def is_in_himachal(name: str) -> Optional[bool]:
     return found[0] in HIMACHAL_COORDS
 
 
+# ── Where the state actually is ───────────────────────────────────────────────
+# A coarse outline of Himachal Pradesh, walked clockwise from the Una corner in the
+# southwest. This is what decides "local or visitor" from a GPS fix, so it is checked
+# against every town in the tables above plus the gateway cities riders travel from:
+# 70 of 71 classify correctly (see tests/unit/test_geo_coordinates.py).
+#
+# The one it cannot get right is Kalka, which is in Haryana about 2 km from Parwanoo in
+# Himachal — no outline this coarse separates them, and pretending otherwise would be
+# worse than saying so. Fixes within a few km of the border are therefore a judgement
+# call, which is why `locate()` reports `near_border` and the chat API lets a rider's
+# own words override the classification.
+HIMACHAL_OUTLINE: tuple[tuple[float, float], ...] = (
+    (31.28, 76.27),   # Una district, south tip
+    (30.92, 76.74),   # Nalagarh / Baddi, on the Haryana line
+    (30.80, 76.92),   # Parwanoo, above Kalka
+    (30.72, 77.10),   # Kasauli foothills
+    (30.52, 77.28),   # Nahan, southern Sirmaur
+    (30.40, 77.62),   # Paonta Sahib, on the Yamuna
+    (30.78, 77.88),   # up the Yamuna, Uttarakhand line
+    (31.05, 78.05),
+    (31.26, 78.58),   # Baspa valley / Chitkul, Uttarakhand-Tibet corner
+    (31.80, 78.78),   # Shipki La
+    (32.05, 78.85),   # Kinnaur, Tibet line
+    (32.35, 78.72),   # eastern Spiti
+    (32.62, 78.30),   # northern Spiti
+    (32.78, 77.80),   # Lahaul
+    (32.98, 77.20),   # Baralacha, the Ladakh line
+    (32.90, 76.75),
+    (33.25, 76.50),   # Pangi, the northern tip
+    (33.02, 76.08),
+    (32.72, 75.85),   # western Chamba
+    (32.33, 75.72),   # Nurpur, the northwest corner
+    (32.02, 75.95),   # Indora / western Kangra
+    (31.72, 76.02),
+    (31.48, 75.98),   # western Una
+)
+
+#: A fix this far from the outline is close enough that the classification could go
+#: either way. Reported, never used to flip the answer — see `LocationFix.near_border`.
+_BORDER_TOLERANCE_KM = 8.0
+
+#: Beyond this from the nearest town we know, the resolved place name is a region
+#: rather than a location, and any distance built on it is labelled approximate.
+_NEAREST_CITY_MAX_KM = 60.0
+
+#: Within this of a town, the fix IS that town — close enough to call it the rider's
+#: pickup city out loud. Further out the coordinates still measure the distance, but
+#: the name is only the nearest thing we can point at, so the agent asks instead of
+#: announcing "your trip from Mandi" to somebody who has never been there.
+PRECISE_FIX_KM = 15.0
+
+
+def point_in_himachal(lat: float, lon: float) -> bool:
+    """True when the fix falls inside `HIMACHAL_OUTLINE`.
+
+    Ray casting in (lon, lat) space. Accurate to the outline, which is coarse near the
+    border by construction — read the note on `HIMACHAL_OUTLINE` before trusting a
+    result within a few kilometres of it.
+    """
+    inside = False
+    n = len(HIMACHAL_OUTLINE)
+    for i in range(n):
+        lat1, lon1 = HIMACHAL_OUTLINE[i]
+        lat2, lon2 = HIMACHAL_OUTLINE[(i + 1) % n]
+        if (lat1 > lat) != (lat2 > lat):
+            crossing_lon = lon1 + (lat - lat1) * (lon2 - lon1) / (lat2 - lat1)
+            if lon < crossing_lon:
+                inside = not inside
+    return inside
+
+
+def _distance_to_outline_km(lat: float, lon: float) -> float:
+    """Shortest great-circle distance from a fix to the state boundary."""
+    # Degrees are projected onto kilometres locally: one degree of latitude is ~111 km
+    # everywhere, one of longitude shrinks with the cosine of the latitude. Over the
+    # few tens of kilometres this is used for, that is well inside the error of the
+    # outline itself.
+    km_per_deg_lat = 111.32
+    km_per_deg_lon = 111.32 * math.cos(math.radians(lat))
+    px, py = lon * km_per_deg_lon, lat * km_per_deg_lat
+
+    best = float("inf")
+    n = len(HIMACHAL_OUTLINE)
+    for i in range(n):
+        lat1, lon1 = HIMACHAL_OUTLINE[i]
+        lat2, lon2 = HIMACHAL_OUTLINE[(i + 1) % n]
+        ax, ay = lon1 * km_per_deg_lon, lat1 * km_per_deg_lat
+        bx, by = lon2 * km_per_deg_lon, lat2 * km_per_deg_lat
+        dx, dy = bx - ax, by - ay
+        span = dx * dx + dy * dy
+        # Project the point onto the segment, clamped to its ends.
+        t = 0.0 if span == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / span))
+        best = min(best, math.hypot(px - (ax + dx * t), py - (ay + dy * t)))
+    return best
+
+
+def nearest_city(
+    lat: float, lon: float, *, within_km: float = _NEAREST_CITY_MAX_KM
+) -> Optional[tuple[str, float]]:
+    """The closest place we know to a fix, as (canonical key, straight-line km).
+
+    None when nothing is within `within_km`: naming a town 200 km away as the rider's
+    location would put a wrong origin into the fare request, and a wrong price is worse
+    than no price.
+    """
+    best_name, best_km = None, float("inf")
+    for name, coords in CITY_COORDS.items():
+        km = haversine_km((lat, lon), coords)
+        if km < best_km:
+            best_name, best_km = name, km
+    if best_name is None or best_km > within_km:
+        return None
+    return best_name, round(best_km, 1)
+
+
+@dataclass(frozen=True)
+class LocationFix:
+    """What a GPS fix tells us about the rider.
+
+    `in_himachal` is the whole point: it is what routes the chat to the local or the
+    outstation assistant, and what makes a rider's pickup city known without asking.
+    """
+
+    lat: float
+    lon: float
+    in_himachal: bool
+    #: Closest town in the geography tables, or None when the fix is far from all of
+    #: them. Used as the origin for the route and the fare.
+    nearest_city: Optional[str] = None
+    #: How far that town is. Small means the name IS the rider's location; large means
+    #: it is only the nearest thing we can name.
+    nearest_city_km: Optional[float] = None
+    #: True when the fix is close enough to the state line that the classification
+    #: could reasonably go either way. The reply never contradicts a rider who says
+    #: otherwise — see `chat_session.resolve_persona`.
+    near_border: bool = False
+
+    @property
+    def place_name(self) -> Optional[str]:
+        """The town to show the rider and send to the fare service, title-cased."""
+        return self.nearest_city.title() if self.nearest_city else None
+
+    @property
+    def is_precise(self) -> bool:
+        """True when the fix sits on a town we know rather than merely near one."""
+        return self.nearest_city_km is not None and self.nearest_city_km <= PRECISE_FIX_KM
+
+    @property
+    def visitor_type(self) -> str:
+        """"local" | "outstation" — the persona this fix implies."""
+        return "local" if self.in_himachal else "outstation"
+
+
+def valid_coordinates(lat: Optional[float], lon: Optional[float]) -> bool:
+    """True for a usable Earth coordinate pair.
+
+    (0, 0) is rejected on purpose: it is in the Atlantic, and it is what a phone sends
+    when it has no fix yet. Treating that as a real location would classify a Shimla
+    rider as an outstation visitor 6,000 km away.
+    """
+    if lat is None or lon is None:
+        return False
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return False
+    return not (abs(lat) < 0.01 and abs(lon) < 0.01)
+
+
+def locate(lat: float, lon: float) -> Optional[LocationFix]:
+    """Turn a GPS fix into everything the agent needs from it, or None if unusable."""
+    if not valid_coordinates(lat, lon):
+        return None
+
+    inside = point_in_himachal(lat, lon)
+    found = nearest_city(lat, lon)
+    return LocationFix(
+        lat=lat,
+        lon=lon,
+        in_himachal=inside,
+        nearest_city=found[0] if found else None,
+        nearest_city_km=found[1] if found else None,
+        near_border=_distance_to_outline_km(lat, lon) <= _BORDER_TOLERANCE_KM,
+    )
+
+
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     """Great-circle distance in kilometres between two (lat, lon) points."""
     earth_radius_km = 6371.0088
@@ -263,6 +453,24 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     dlat, dlon = lat2 - lat1, lon2 - lon1
     h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 2 * earth_radius_km * math.asin(math.sqrt(h))
+
+
+def _road_km(
+    a: tuple[float, float],
+    a_in_himachal: bool,
+    b: tuple[float, float],
+    b_in_himachal: bool,
+) -> float:
+    """Great-circle distance between two points, wound up to a road distance."""
+    straight_line = haversine_km(a, b)
+    in_hp = (a_in_himachal, b_in_himachal)
+    if all(in_hp):
+        bands = _FACTORS_HILLS
+    elif any(in_hp):
+        bands = _FACTORS_MIXED
+    else:
+        bands = _FACTORS_PLAINS
+    return round(straight_line * _winding_factor(bands, straight_line), 1)
 
 
 def estimate_road_distance_km(origin: str, destination: str) -> Optional[float]:
@@ -274,17 +482,24 @@ def estimate_road_distance_km(origin: str, destination: str) -> Optional[float]:
     a, b = find_city(origin), find_city(destination)
     if a is None or b is None:
         return None
+    return _road_km(a[1], a[0] in HIMACHAL_COORDS, b[1], b[0] in HIMACHAL_COORDS)
 
-    straight_line = haversine_km(a[1], b[1])
-    in_hp = (a[0] in HIMACHAL_COORDS, b[0] in HIMACHAL_COORDS)
-    if all(in_hp):
-        bands = _FACTORS_HILLS
-    elif any(in_hp):
-        bands = _FACTORS_MIXED
-    else:
-        bands = _FACTORS_PLAINS
 
-    return round(straight_line * _winding_factor(bands, straight_line), 1)
+def road_distance_from_point(
+    lat: float, lon: float, destination: str, *, in_himachal: Optional[bool] = None
+) -> Optional[float]:
+    """Approximate road distance from a GPS fix to a named place, or None if unknown.
+
+    Measured from where the rider actually is rather than from the centroid of the
+    nearest town, which is the difference between pricing their trip and pricing
+    somebody else's: a fix in Solang Valley is 14 km from Manali, and quoting the
+    Manali → Shimla fare for it silently drops that leg.
+    """
+    target = find_city(destination)
+    if target is None or not valid_coordinates(lat, lon):
+        return None
+    origin_in_hp = point_in_himachal(lat, lon) if in_himachal is None else in_himachal
+    return _road_km((lat, lon), origin_in_hp, target[1], target[0] in HIMACHAL_COORDS)
 
 
 # ── Drive times ───────────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.itinerary import Itinerary
+from app.models.location import RiderLocation
 from app.models.session import ExtractedEntities, Language
 from app.models.user import UserProfile
 
@@ -65,6 +66,15 @@ class AgentState(BaseModel):
     # exclude=True: never serialized by model_dump() (SSE/Firestore safe).
     # repr=False: kept out of reprs/logs.
     rider_jwt: Optional[str] = Field(default=None, exclude=True, repr=False)
+    #: The rider's numeric Spring id, when their JWT carries one. Personalises the
+    #: offer lookup; None falls back to the unpersonalised catalogue.
+    rider_id: Optional[int] = None
+
+    # ── Where the rider is (from the app's GPS fix) ───────────────────────────
+    # Set by the chat API when the app sends coordinates, and carried on the session
+    # afterwards. Three things read it: the persona (local vs outstation), the origin
+    # the route is measured FROM, and the pickup pin in the booking handoff.
+    rider_location: Optional[RiderLocation] = None
 
     # ── Live token streaming ──────────────────────────────────────────────────
     # An asyncio.Queue set by the SSE endpoint; the Writer pushes real LLM tokens
@@ -76,6 +86,10 @@ class AgentState(BaseModel):
     weather_data: Optional[dict] = None
     snowfall_data: Optional[dict] = None
     cab_fare: Optional[dict] = None          # Real fare quote (base + cab details) or None
+    #: Live Him Cab coupons that apply to THIS trip, best saving first, already
+    #: filtered to the trip type, the date window and the quoted fare. Empty when the
+    #: backend has none — the reply may name only what is in here.
+    offers: list[dict] = Field(default_factory=list)
     # The journey itself: both endpoints with coordinates, road distance and drive
     # time. Feeds the drive time quoted to a local rider AND the booking handoff the
     # app uses to drop pins on its map, so both come from one resolution of the route.

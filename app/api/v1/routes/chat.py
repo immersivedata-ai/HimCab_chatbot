@@ -12,26 +12,42 @@ The chat API consumed by the mobile app.
 ║  There is no persona or rider id to pass. The backend owns the conversation and   ║
 ║  resolves it from the token, so multi-turn context works with no client state.    ║
 ║                                                                                  ║
-║  Pick the pair that matches your app:                                            ║
-║      local app  →  /v1/chat/local/*                                              ║
-║      outstation →  /v1/chat/outstation/*                                         ║
+║  Pick the pair that matches your rider:                                          ║
+║      Himachal local →  /v1/chat/local/*                                          ║
+║      visiting       →  /v1/chat/outstation/*                                     ║
+║                                                                                  ║
+║  0. Which pair? Ask, with the device's GPS fix:                                  ║
+║       POST /v1/chat/route   body: {"lat": 31.10, "lon": 77.17}                   ║
+║       → {"persona": "local", "base_path": "/v1/chat/local", "location": {...}}   ║
+║       A fix inside Himachal is a local; anywhere else is a visitor. Skip this    ║
+║       and the screen the chat was opened from decides, as it used to.            ║
 ║                                                                                  ║
 ║  1. User opens the chat dialog:                                                  ║
-║       POST /v1/chat/{local|outstation}/start                                     ║
-║       → {"session_id", "message", "language", "persona"}                         ║
+║       POST /v1/chat/{local|outstation}/start?lat=&lon=                           ║
+║       → {"session_id", "message", "language", "persona", "location"}             ║
 ║       Render `message` as the first assistant bubble (the welcome greeting).     ║
+║       Send lat/lon here too and the reply's `persona` is authoritative — it may  ║
+║       differ from the path you called, and if it does, use it from then on.      ║
 ║                                                                                  ║
 ║  2. User sends a message (streaming — preferred):                                ║
-║       GET /v1/chat/{local|outstation}/stream?message=<text>                      ║
+║       GET /v1/chat/{local|outstation}/stream?message=<text>&lat=&lon=            ║
 ║       → text/event-stream: token | structured | done | error                     ║
 ║                                                                                  ║
 ║     …or non-streaming, if SSE is inconvenient:                                   ║
-║       POST /v1/chat/{local|outstation}/message   body: {"message": "<text>"}     ║
+║       POST /v1/chat/{local|outstation}/message                                   ║
+║         body: {"message": "<text>", "lat": 31.10, "lon": 77.17}                  ║
 ║       → full JSON reply                                                          ║
 ║                                                                                  ║
-║  That's the whole integration. Step 2 works even if step 1 was skipped — the     ║
-║  backend creates the conversation on demand, so these endpoints never 404 with   ║
-║  a "session expired" the app has to recover from.                                ║
+║  That's the whole integration. Step 2 works even if steps 0-1 were skipped —     ║
+║  the backend creates the conversation on demand, so these endpoints never 404    ║
+║  with a "session expired" the app has to recover from.                           ║
+║                                                                                  ║
+║  COORDINATES — optional everywhere, worth sending everywhere:                    ║
+║    lat/lon are what let the assistant skip two questions it otherwise has to     ║
+║    ask ("local or visiting?", "which city are you starting from?") and price the ║
+║    trip from where the rider actually is rather than a city centroid. Resend     ║
+║    them on every turn; the newest fix wins, because riders move between turns.   ║
+║    Send nothing and everything still works — the assistant just asks.            ║
 ║                                                                                  ║
 ║  OPTIONAL — pinning a conversation:                                              ║
 ║    Both /stream and /message accept a `session_id` (query param and body field    ║
@@ -44,9 +60,10 @@ The chat API consumed by the mobile app.
 SSE events emitted by /stream:
   1. `token`      → raw AI text chunks (for chat bubble animation)
   2. `structured` → a renderable card. Types: itinerary | weather_alert |
-                    snowfall_alert | cab_fare. See `StructuredEvent` in
-                    app/models/session.py for each payload shape. Ignore unknown types.
-  3. `done`       → completion
+                    snowfall_alert | cab_fare | offers | booking_handoff. See
+                    `StructuredEvent` in app/models/session.py for each payload shape.
+                    Ignore unknown types.
+  3. `done`       → completion; carries the `persona` this turn was served as
   4. `error`      → failure
 
 Rate limit: 30 requests/minute per rider. Over that, both endpoints return HTTP 429
@@ -69,16 +86,26 @@ from app.api.middleware.rider_auth import RiderIdentity, get_rider
 from app.core.config import settings
 from app.core.exceptions import RateLimitExceededError
 from app.core.logging import get_logger
+from app.models.location import RiderLocation
 from app.models.session import (
     ChatHistoryMessage,
     ChatHistoryResponse,
     ChatMessageRequest,
     ChatResponse,
     MessageRole,
+    PersonaRouteResponse,
+    ResolvedLocation,
+    RiderCoordinates,
     StartChatResponse,
     TripSession,
 )
-from app.services.chat_session import LOCAL, OUTSTATION, resolve_chat, start_chat
+from app.services.chat_session import (
+    LOCAL,
+    OUTSTATION,
+    resolve_chat,
+    resolve_persona,
+    start_chat,
+)
 from app.services.firestore import get_session_service
 from app.services.local_cache import RateLimiter
 
@@ -95,6 +122,50 @@ _SESSION_ID_DESCRIPTION = (
     "only when one account is signed in on several devices. Unknown or unowned ids "
     "are ignored, not rejected."
 )
+
+_LAT_DESCRIPTION = (
+    "Optional device latitude. Sent with `lon`, it becomes the pickup point: the fare "
+    "is priced from here, and a fix inside Himachal serves the LOCAL assistant "
+    "whichever path you called. Resend it every turn — the newest fix wins."
+)
+_LON_DESCRIPTION = "Optional device longitude. See `lat`."
+
+
+def _resolved_location_dto(location: RiderLocation | None) -> ResolvedLocation | None:
+    """The client-facing view of a fix: what we made of it, and how sure we are."""
+    if location is None:
+        return None
+    return ResolvedLocation(
+        lat=location.lat,
+        lon=location.lon,
+        in_himachal=location.in_himachal,
+        place_name=location.place_name,
+        place_distance_km=location.place_distance_km,
+        near_border=location.near_border,
+    )
+
+
+def _effective_persona(
+    requested: str, location: RiderLocation | None, user_id: str
+) -> str:
+    """The persona to actually serve, given what the device says about where they are.
+
+    Coordinates outrank the route the app called, because the route is chosen by which
+    screen the chat bubble was tapped on and the coordinates are chosen by physics. A
+    visitor browsing the home screen would otherwise be greeted in Hindi and handed a
+    resident's cab-first reply about a state they have never driven in.
+    """
+    persona, reason = resolve_persona(requested, location)
+    if persona != requested:
+        log.info(
+            "chat_persona_overridden",
+            requested=requested,
+            served=persona,
+            reason=reason,
+            near_border=bool(location and location.near_border),
+            user_id=user_id,
+        )
+    return persona
 
 
 def _build_history_messages(messages: list, limit: int = 20) -> list:
@@ -135,6 +206,10 @@ def _build_state(
         # turn and can skip it if the answer was unparseable (prevents re-asking).
         last_asked_field=session.entities.last_asked_field,
         rider_jwt=rider.jwt,
+        rider_id=rider.rider_id,
+        # Where they are, if the app has told us — used for the route, the fare and
+        # the pickup pin. Already merged with any fix sent on THIS request.
+        rider_location=session.rider_location,
         token_stream=token_queue,
     )
 
@@ -238,6 +313,9 @@ async def _stream_agent_response(
             "event": "done",
             "data": json.dumps({
                 "session_id": session_id,
+                # The persona this turn actually ran as. Differs from the path only
+                # when coordinates said otherwise — switch the client to it if so.
+                "persona": persona,
                 "node_trace": final_state.get("node_trace", []),
             }),
         }
@@ -275,25 +353,48 @@ async def _stream_agent_response(
 
 # ── Shared handlers (persona-agnostic; the routes below just pin the persona) ─
 
-async def _handle_start(rider: RiderIdentity, persona: str) -> StartChatResponse:
-    session = await start_chat(rider.user_id, persona)
+async def _handle_start(
+    rider: RiderIdentity,
+    persona: str,
+    lat: float | None = None,
+    lon: float | None = None,
+    accuracy_m: float | None = None,
+) -> StartChatResponse:
+    location = RiderLocation.resolve(lat, lon, accuracy_m)
+    served = _effective_persona(persona, location, rider.user_id)
+    session = await start_chat(rider.user_id, served, location)
     # The greeting is already stored on the session by start_chat().
     greeting = session.messages[-1].content if session.messages else ""
     return StartChatResponse(
         session_id=session.session_id,
         message=greeting,
         language=str(session.language),
-        persona=persona,
+        persona=served,
+        location=_resolved_location_dto(session.rider_location),
     )
 
 
 async def _handle_stream(
-    rider: RiderIdentity, persona: str, message: str, session_id: str | None = None
+    rider: RiderIdentity,
+    persona: str,
+    message: str,
+    session_id: str | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+    accuracy_m: float | None = None,
 ) -> EventSourceResponse:
     _enforce_rate_limit(rider.user_id)
-    session = await resolve_chat(rider.user_id, persona, session_id=session_id)
+    location = RiderLocation.resolve(lat, lon, accuracy_m)
+    served = _effective_persona(persona, location, rider.user_id)
+    session = await resolve_chat(
+        rider.user_id,
+        served,
+        session_id=session_id,
+        location=location,
+        adopt_from=persona,
+    )
     return EventSourceResponse(
-        _stream_agent_response(session, rider, message, persona),
+        _stream_agent_response(session, rider, message, served),
         media_type="text/event-stream",
     )
 
@@ -315,10 +416,18 @@ async def _handle_message(
     rider: RiderIdentity, persona: str, body: ChatMessageRequest
 ) -> ChatResponse:
     _enforce_rate_limit(rider.user_id)
-    session = await resolve_chat(rider.user_id, persona, session_id=body.session_id)
+    location = RiderLocation.resolve(body.lat, body.lon, body.accuracy_m)
+    served = _effective_persona(persona, location, rider.user_id)
+    session = await resolve_chat(
+        rider.user_id,
+        served,
+        session_id=body.session_id,
+        location=location,
+        adopt_from=persona,
+    )
 
     # Snapshot-then-persist, for the same reason as the streaming path above.
-    initial_state = _build_state(session, rider, body.message, persona)
+    initial_state = _build_state(session, rider, body.message, served)
     await get_session_service().append_message(
         session_id=session.session_id,
         role=MessageRole.USER,
@@ -330,6 +439,7 @@ async def _handle_message(
     return ChatResponse(
         session_id=session.session_id,
         response=final_state.get("final_response_text", ""),
+        persona=served,
         structured_events=final_state.get("structured_events", []),
         itinerary=_itinerary_payload(final_state),
         node_trace=final_state.get("node_trace", []),
@@ -363,23 +473,81 @@ async def _handle_history(
     )
 
 
+# ── Persona routing (call this first) ─────────────────────────────────────────
+
+@router.post("/route", response_model=PersonaRouteResponse)
+async def route_by_location(
+    coordinates: RiderCoordinates,
+    rider: RiderIdentity = Depends(get_rider),
+):
+    """Which assistant does this rider belong to? Ask before opening the chat.
+
+    Send the device's GPS fix and use the `persona` that comes back for every
+    /v1/chat/{persona}/* call afterwards:
+
+      • inside Himachal Pradesh → **local** — Hindi, cab-first. They know the place;
+        what they want is a ride, a price and a drive time.
+      • anywhere else          → **outstation** — English, itinerary-first. They are
+        planning several days in a state they do not know.
+
+    Nothing is created here: no session, no message, no state. It is a pure lookup, so
+    it is safe to call on app start, on a location change, or not at all — the chat
+    endpoints accept the same coordinates directly and will route themselves.
+
+    `location.near_border` is true within a few kilometres of the state line, where the
+    call could go either way. The rider's own words still win over both: someone who
+    says "I'm coming from Delhi" is treated as a visitor whatever their phone reports.
+    """
+    location = RiderLocation.resolve(
+        coordinates.lat, coordinates.lon, coordinates.accuracy_m
+    )
+    persona, reason = resolve_persona(OUTSTATION, location)
+    log.info(
+        "chat_persona_routed",
+        persona=persona,
+        reason=reason,
+        in_himachal=bool(location and location.in_himachal),
+        near_border=bool(location and location.near_border),
+        user_id=rider.user_id,
+    )
+    return PersonaRouteResponse(
+        persona=persona,
+        base_path=f"/v1/chat/{persona}",
+        reason=reason,
+        location=_resolved_location_dto(location),
+    )
+
+
 # ── LOCAL routes (Him Cab in-state riders) ────────────────────────────────────
 
 @router.post("/local/start", response_model=StartChatResponse)
-async def start_chat_local(rider: RiderIdentity = Depends(get_rider)):
+async def start_chat_local(
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    rider: RiderIdentity = Depends(get_rider),
+):
     """Open the LOCAL chat dialog. Starts a fresh conversation and returns the
-    welcome greeting to render as the first assistant bubble."""
-    return await _handle_start(rider, LOCAL)
+    welcome greeting to render as the first assistant bubble.
+
+    Send lat/lon and the response's `persona` is authoritative: a fix outside Himachal
+    is served as **outstation** even on this path, because the rider's location is a
+    better answer than the screen they tapped from.
+    """
+    return await _handle_start(rider, LOCAL, lat, lon, accuracy_m)
 
 
 @router.get("/local/stream")
 async def stream_chat_local(
     message: str = Query(..., min_length=1, max_length=2000, description="User's message text"),
     session_id: str | None = Query(default=None, description=_SESSION_ID_DESCRIPTION),
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
     rider: RiderIdentity = Depends(get_rider),
 ):
     """Send a message on the LOCAL chat and stream the reply back as SSE."""
-    return await _handle_stream(rider, LOCAL, message, session_id)
+    return await _handle_stream(rider, LOCAL, message, session_id, lat, lon, accuracy_m)
 
 
 @router.post("/local/message", response_model=ChatResponse)
@@ -408,20 +576,35 @@ async def history_local(
 # ── OUTSTATION routes (visitors travelling into Himachal) ─────────────────────
 
 @router.post("/outstation/start", response_model=StartChatResponse)
-async def start_chat_outstation(rider: RiderIdentity = Depends(get_rider)):
+async def start_chat_outstation(
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    rider: RiderIdentity = Depends(get_rider),
+):
     """Open the OUTSTATION chat dialog. Starts a fresh conversation and returns the
-    welcome greeting to render as the first assistant bubble."""
-    return await _handle_start(rider, OUTSTATION)
+    welcome greeting to render as the first assistant bubble.
+
+    Send lat/lon and the response's `persona` is authoritative: a fix inside Himachal
+    is served as **local** even on this path — a Shimla resident does not need an
+    itinerary for Shimla.
+    """
+    return await _handle_start(rider, OUTSTATION, lat, lon, accuracy_m)
 
 
 @router.get("/outstation/stream")
 async def stream_chat_outstation(
     message: str = Query(..., min_length=1, max_length=2000, description="User's message text"),
     session_id: str | None = Query(default=None, description=_SESSION_ID_DESCRIPTION),
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
     rider: RiderIdentity = Depends(get_rider),
 ):
     """Send a message on the OUTSTATION chat and stream the reply back as SSE."""
-    return await _handle_stream(rider, OUTSTATION, message, session_id)
+    return await _handle_stream(
+        rider, OUTSTATION, message, session_id, lat, lon, accuracy_m
+    )
 
 
 @router.post("/outstation/message", response_model=ChatResponse)

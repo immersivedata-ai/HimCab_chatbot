@@ -1,22 +1,27 @@
 """
-scripts/check_fare.py — diagnose the Him Cab fare path.
+scripts/check_fare.py — diagnose the Him Cab fare and offer path.
 
-The agent quotes a fare only when every step below succeeds, so when a price is
-missing from an itinerary this script tells you WHICH step failed, without needing to
-reproduce it through the chat:
+The agent quotes a price only when every step below succeeds, so when one is missing
+from a reply this script tells you WHICH step failed, without needing to reproduce it
+through the chat:
 
     place recognised → distance resolved → backend reachable → categories parsed
+                                                             → coupons filtered
 
-Two modes:
+Modes:
 
   # 1. End-to-end against the real backend (needs a rider JWT)
   python scripts/check_fare.py --jwt "<RIDER_JWT>" --origin Gurgaon --destination Manali
   python scripts/check_fare.py --jwt "<JWT>" --distance-km 300 --group-size 8 --budget luxury
 
-  # 2. Offline: no JWT, no network — just show what distance we would price on
+  # 2. From a GPS fix, the way the app sends it — shows the persona it routes to and
+  #    the distance measured from that exact point
+  python scripts/check_fare.py --dry-run --lat 32.32 --lon 77.17 --destination Kasol
+
+  # 3. Offline: no JWT, no network — just show what distance we would price on
   python scripts/check_fare.py --dry-run --origin Solan --destination Kasol
 
-  # 3. Re-derive the road-winding factors in app/services/geo.py from the surveyed
+  # 4. Re-derive the road-winding factors in app/services/geo.py from the surveyed
   #    routes in app/services/himcab/distances.py, and report the estimator's error
   python scripts/check_fare.py --calibrate
 
@@ -100,13 +105,71 @@ def calibrate() -> None:
               "routes\n  that are NOT in the table, and those fares are labelled approximate.")
 
 
+async def report_offers(quote, args, jwt: str) -> None:
+    """Fetch the rider's coupons and show which survive the filter, and why.
+
+    "The chat never mentions my offer" has four possible causes — the flag, the trip
+    type, the date window and the minimum spend — and they are indistinguishable from
+    the reply, which simply says nothing. So each is printed per coupon.
+    """
+    from app.core.config import settings
+    from app.services.himcab.offers_service import get_offers_service, usable_offers
+
+    if not settings.enable_offers:
+        print("  ENABLE_OFFERS=false — the agent will never mention a coupon.")
+        return
+
+    service = get_offers_service()
+    try:
+        offers = await service.get_offers(
+            rider_jwt=jwt, trip_type=quote.trip_type, rider_id=args.rider_id
+        )
+    except Exception as e:
+        print(f"  FAILED: {type(e).__name__}: {e}")
+        print("  The agent degrades silently here — the reply just omits discounts.")
+        return
+    finally:
+        await service.close()
+
+    if args.rider_id is None:
+        print("  (no --rider-id: used the unpersonalised catalogue, filtered locally)")
+    if not offers:
+        print("  The backend returned no usable coupons.")
+        return
+
+    fare = quote.base_fare_inr
+    keep = {o.coupon_code for o in usable_offers(offers, quote.trip_type, fare)}
+    for offer in offers:
+        if offer.coupon_code in keep:
+            after = fare - offer.discount_on(fare)
+            print(f"  KEPT    {offer.coupon_code:<16} -Rs {offer.coupon_value_inr:,.0f}"
+                  f"  -> Rs {after:,.0f}")
+            continue
+        if not offer.applies_to(quote.trip_type):
+            why = f"trip type {offer.trip_types} != {quote.trip_type}"
+        elif not offer.is_live():
+            why = f"outside its window ({offer.live_date} .. {offer.expire_date})"
+        else:
+            why = f"needs a fare over Rs {offer.minimum_value_inr:,.0f}"
+        print(f"  dropped {offer.coupon_code:<16} {why}")
+
+    shown = min(len(keep), settings.max_offers_in_reply)
+    print(f"  -> {shown} of {len(keep)} eligible coupon(s) reach the reply "
+          f"(MAX_OFFERS_IN_REPLY={settings.max_offers_in_reply})")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Diagnose the Him Cab fare estimate path")
+    ap = argparse.ArgumentParser(description="Diagnose the Him Cab fare and offer path")
     ap.add_argument("--jwt", default=os.getenv("HIMCAB_RIDER_JWT", ""), help="rider Spring JWT")
     ap.add_argument("--base-url", default=os.getenv("JAVA_BACKEND_URL"),
                     help="fare host, e.g. http://34.131.37.50:9002")
     ap.add_argument("--origin", default="Delhi")
     ap.add_argument("--destination", default="Manali")
+    ap.add_argument("--lat", type=float, default=None,
+                    help="device latitude — prices from this point instead of --origin")
+    ap.add_argument("--lon", type=float, default=None, help="device longitude (with --lat)")
+    ap.add_argument("--rider-id", type=int, default=None,
+                    help="numeric Spring rider id, to personalise the offer lookup")
     ap.add_argument("--distance-km", type=float, default=None,
                     help="override the resolved distance")
     ap.add_argument("--trip", default=None, choices=["OUTSTATION", "LOCAL", "RENTAL"],
@@ -131,15 +194,36 @@ def main() -> None:
 
     from app.core.config import settings
     from app.models.session import ExtractedEntities
+    from app.services import geo
     from app.services.geo import find_city
-    from app.services.himcab.distances import resolve_route
+    from app.services.himcab.distances import resolve_route, resolve_route_from_fix
     from app.services.himcab.fare_service import get_fare_service
     from app.services.himcab.quote_builder import build_fare_quote_input
+
+    fix = geo.locate(args.lat, args.lon) if args.lat is not None and args.lon is not None else None
+
+    # ── Step 0: the GPS fix, when one was given ───────────────────────────────
+    if args.lat is not None or args.lon is not None:
+        print("=== 0. GPS FIX ===")
+        if fix is None:
+            print(f"  ({args.lat}, {args.lon}) -> UNUSABLE — the agent would ignore it "
+                  f"and ask which city they are travelling from")
+        else:
+            print(f"  ({fix.lat}, {fix.lon}) -> {fix.place_name or 'no town within 60 km'}"
+                  f" ({fix.nearest_city_km} km away)")
+            print(f"  in Himachal : {fix.in_himachal}  -> persona '{fix.visitor_type}'"
+                  f"{'  (NEAR THE BORDER — could go either way)' if fix.near_border else ''}")
+            print(f"  precise     : {fix.is_precise}"
+                  f"{'' if fix.is_precise else '  -> too vague to name as their pickup city'}")
+        print()
 
     # ── Step 1: are both places recognised? ───────────────────────────────────
     print("=== 1. PLACES ===")
     ok = True
-    for label, name in (("origin", args.origin), ("destination", args.destination)):
+    places = (("destination", args.destination),) if fix else (
+        ("origin", args.origin), ("destination", args.destination)
+    )
+    for label, name in places:
         found = find_city(name)
         if found:
             print(f"  {label:<12} {name!r} -> {found[0]!r} {found[1]}")
@@ -150,22 +234,31 @@ def main() -> None:
 
     # ── Step 2: distance ──────────────────────────────────────────────────────
     print("\n=== 2. DISTANCE ===")
-    resolved = resolve_route(args.origin, args.destination)
+    resolved = (
+        resolve_route_from_fix(fix, args.destination, fallback_origin=args.origin)
+        if fix else resolve_route(args.origin, args.destination)
+    )
     if resolved:
-        kind = "ESTIMATED from coordinates" if resolved.is_approximate else "SURVEYED"
+        kind = {
+            "surveyed": "SURVEYED (measured)",
+            "gps": "COMPUTED from the rider's own fix",
+            "city": "COMPUTED between city centres",
+        }.get(resolved.source, resolved.source)
         print(f"  {resolved.km} km, {resolved.duration_text} drive  ({kind})")
     else:
         print("  none — no fare can be quoted for this route")
 
     entities = ExtractedEntities(
-        origin=args.origin,
+        # A precise fix names the pickup city; a vague one prices from the coordinates
+        # but leaves the name to the rider, exactly as the agent does.
+        origin=(fix.place_name if fix and fix.is_precise else (None if fix else args.origin)),
         destination=args.destination,
         group_size=args.group_size,
         budget_range=args.budget,
     )
     quote_input = build_fare_quote_input(
         entities, trip_type=args.trip, booking_time=args.booking_time,
-        rent_hours=args.rent_hours,
+        rent_hours=args.rent_hours, route=resolved,
     )
     if args.distance_km is not None:
         quote_input.distance_km = args.distance_km
@@ -207,7 +300,10 @@ def main() -> None:
             print(f"  {(option.category_name or '?'):<22} id={option.category_id} "
                   f"fare={option.total_fare_inr} seats={option.seat_capacity}")
 
-        print("\n=== 6. WHAT THE RIDER SEES ===")
+        print("\n=== 6. OFFERS ===")
+        await report_offers(quote, args, jwt)
+
+        print("\n=== 7. WHAT THE RIDER SEES ===")
         print(f"  headline: {quote.category_name} = Rs {quote.base_fare_inr:,.0f}")
         print(f"  presented as: {'APPROXIMATE' if quote.distance_is_approximate else 'exact'}")
 
