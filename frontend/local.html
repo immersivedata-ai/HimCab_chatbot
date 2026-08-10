@@ -582,10 +582,15 @@
 
   <script>
     // ── Config ────────────────────────────────────────────────────────
-    // Reference implementation of the chat contract. The ONLY thing this page sends
-    // is the rider's JWT — no session id, no persona, no rider id.
+    // Reference implementation of the chat contract. Two things go to the server: the
+    // rider's JWT, and — when the device will give us one — its GPS fix. No session
+    // id, no persona, no rider id: the backend derives all three.
     const API_BASE = window.location.origin;
-    const CHAT_API = `${API_BASE}/v1/chat/local`;
+
+    // Resolved by POST /v1/chat/route from the fix below. Defaults to local so the
+    // page works unchanged if geolocation is refused or unavailable.
+    let PERSONA  = "local";
+    let CHAT_API = `${API_BASE}/v1/chat/local`;
 
     // The rider's Him Cab JWT. This page does NOT log in to Him Cab itself — the
     // native app already holds this token from its own cab-booking login and hands it
@@ -602,6 +607,64 @@
 
     // ── State ─────────────────────────────────────────────────────────
     let isStreaming = false;
+    //: The device's GPS fix, once we have one. Sent with every chat call so the
+    //: assistant knows where the rider is picking up from.
+    let riderFix = null;
+
+    // ── Where is the rider? ───────────────────────────────────────────
+    // Browser geolocation, with a `?lat=&lon=` override so the two personas can be
+    // exercised from a desk (`?lat=31.1048&lon=77.1734` is Shimla, `?lat=28.6139&lon=77.2090`
+    // is Delhi). Never blocks the chat: a refused or unavailable fix just means the
+    // assistant asks which city they are travelling from, as it always did.
+    function coordsFromQuery() {
+      const params = new URLSearchParams(window.location.search);
+      const lat = parseFloat(params.get("lat"));
+      const lon = parseFloat(params.get("lon"));
+      return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
+    }
+
+    function browserFix(timeoutMs = 5000) {
+      return new Promise(resolve => {
+        if (!navigator.geolocation) return resolve(null);
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            accuracy_m: pos.coords.accuracy,
+          }),
+          () => resolve(null),                       // refused or unavailable — carry on
+          { timeout: timeoutMs, maximumAge: 60000 }
+        );
+      });
+    }
+
+    // POST /v1/chat/route — ask which assistant this rider belongs to, then use that
+    // persona for every call afterwards.
+    async function resolvePersona() {
+      riderFix = coordsFromQuery() || await browserFix();
+      if (!riderFix) return;
+
+      try {
+        const res = await fetch(`${API_BASE}/v1/chat/route`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify(riderFix),
+        });
+        if (!res.ok) return;                         // keep the default persona
+        const data = await res.json();
+        PERSONA  = data.persona;
+        CHAT_API = `${API_BASE}${data.base_path}`;
+        const place = data.location?.place_name;
+        if (place) $sessionInfo.textContent = `${place} · ${PERSONA}`;
+      } catch (_) { /* routing is an optimisation, never a blocker */ }
+    }
+
+    //: lat/lon/accuracy as query params, for /start and /stream.
+    const fixParams = () => (riderFix ? {
+      lat: riderFix.lat,
+      lon: riderFix.lon,
+      ...(riderFix.accuracy_m ? { accuracy_m: riderFix.accuracy_m } : {}),
+    } : {});
 
     // ── DOM ───────────────────────────────────────────────────────────
     const $messages      = document.getElementById("messages");
@@ -661,14 +724,24 @@
     // back the greeting to show as the first assistant bubble.
     async function startChat() {
       try {
-        const res = await fetch(`${CHAT_API}/start`, {
+        const query = new URLSearchParams(fixParams()).toString();
+        const res = await fetch(`${CHAT_API}/start${query ? "?" + query : ""}`, {
           method: "POST",
           headers: authHeaders(),
         });
         if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
         const data = await res.json();
 
-        $sessionInfo.textContent = `#${data.session_id.slice(0, 8)}`;
+        // The response's persona is authoritative — coordinates can override the path
+        // we called, and if they did, every later call must follow.
+        if (data.persona && data.persona !== PERSONA) {
+          PERSONA  = data.persona;
+          CHAT_API = `${API_BASE}/v1/chat/${PERSONA}`;
+        }
+        const place = data.location?.place_name;
+        $sessionInfo.textContent = place
+          ? `${place} · ${PERSONA}`
+          : `#${data.session_id.slice(0, 8)}`;
         setStatus(true);
         addMessage("assistant", data.message);
         return true;
@@ -812,7 +885,34 @@
         `;
         col.appendChild(card);
 
-      } else if (type !== "offers" && type !== "") {
+      } else if (type === "offers") {
+        // Real coupons from the Him Cab backend, already filtered to this trip and
+        // sorted best-saving first. This card used to be suppressed, because the only
+        // "offers" the assistant could produce were ones it had made up.
+        const offers = payload.offers || [];
+        if (!offers.length) return;
+        const card = document.createElement("div");
+        card.className = "event-card card-fare";
+        card.innerHTML = `
+          <div class="event-card-header">
+            <span class="event-card-icon">🏷️</span>
+            <span class="event-card-title">Offers on this trip</span>
+            ${offers[0].fare_after_offer_inr
+              ? `<span class="event-card-badge">₹${offers[0].fare_after_offer_inr.toLocaleString("en-IN")}</span>`
+              : ""}
+          </div>
+          <div class="event-card-body">
+            ${offers.map(o => `
+              <div class="fare-row">
+                <span class="fare-label">${o.coupon_code}${o.coupon_name ? " — " + o.coupon_name : ""}</span>
+                <span class="fare-value highlight">−₹${Math.round(o.coupon_value_inr).toLocaleString("en-IN")}</span>
+              </div>
+            `).join("")}
+          </div>
+        `;
+        col.appendChild(card);
+
+      } else if (type !== "") {
         // Generic fallback card
         const card = document.createElement("div");
         card.className = "event-card";
@@ -827,7 +927,6 @@
         `;
         col.appendChild(card);
       }
-      // "offers" type is intentionally suppressed in cab UI
     }
 
     // ── Send message ──────────────────────────────────────────────────
@@ -842,8 +941,12 @@
       updateSendBtn();
       showTyping();
 
-      // Just the message text — the backend resolves the conversation from the JWT.
-      const url = `${CHAT_API}/stream?` + new URLSearchParams({ message: userText });
+      // The message text plus the current fix — the backend resolves the conversation
+      // from the JWT, and prices the trip from wherever the rider is right now.
+      const url = `${CHAT_API}/stream?` + new URLSearchParams({
+        message: userText,
+        ...fixParams(),
+      });
 
       let fullText = "";
       let bubble   = null;
@@ -941,9 +1044,13 @@
     checkHealth();
     setInterval(checkHealth, 30000);
 
-    // Opening the dialog greets the user straight away.
-    startChat();
-    $input.focus();
+    // Locate first, then greet: the persona (and the greeting's language) depends on
+    // which side of the state line the rider is on.
+    (async () => {
+      await resolvePersona();
+      await startChat();
+      $input.focus();
+    })();
   </script>
 </body>
 </html>

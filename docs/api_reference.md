@@ -133,30 +133,83 @@ This is the whole mobile integration. Every call carries one header —
 from that token, so the app doesn't need to create, store, or send a session id (it
 may optionally pin one — see [Pinning a conversation](#pinning-a-conversation)).
 
-Pick the route group that matches the app:
+Pick the route group that matches the rider:
 
-| App | Route prefix | Default language |
-|-----|--------------|------------------|
-| Local / in-state riders | `/v1/chat/local` | Hindi |
-| Outstation visitors | `/v1/chat/outstation` | English |
+| Rider | Route prefix | Default language | Reply shape |
+|-------|--------------|------------------|-------------|
+| Inside Himachal | `/v1/chat/local` | Hindi | Cab, fare, drive time |
+| Travelling in | `/v1/chat/outstation` | English | Day-by-day itinerary |
+
+Don't guess which — [ask](#0-which-assistant-route-by-location), or just send the
+device's coordinates and let the backend route itself.
+
+#### 0. Which assistant? Route by location
+```
+POST /v1/chat/route
+```
+
+Send the device's GPS fix; use the `persona` that comes back for every
+`/v1/chat/{persona}/*` call afterwards. A fix inside Himachal Pradesh is a **local**
+rider; anywhere else is **outstation**.
+
+**Request Body**: `RiderCoordinates`
+```json
+{ "lat": 31.1048, "lon": 77.1734, "accuracy_m": 25 }
+```
+
+**Response**: `PersonaRouteResponse`
+```json
+{
+  "persona": "local",
+  "base_path": "/v1/chat/local",
+  "reason": "coordinates",
+  "location": {
+    "lat": 31.1048, "lon": 77.1734,
+    "in_himachal": true,
+    "place_name": "Shimla",
+    "place_distance_km": 0.0,
+    "near_border": false
+  }
+}
+```
+
+Nothing is created here — no session, no message, no state. It is a pure lookup, safe
+to call on app start or on a location change. `reason` is `"coordinates"` when the fix
+decided it and `"default"` when no usable fix was sent.
+
+`near_border` is true within a few km of the state line, where the call could go either
+way; treat the persona as a default the rider may correct. The rider's own words always
+win over their coordinates — someone who says *"I'm coming from Delhi"* is served as a
+visitor whatever their phone reports.
+
+Skipping this endpoint is fine: `/start`, `/stream` and `/message` all accept the same
+coordinates and route themselves, returning the persona they actually used.
 
 #### 1. Open the chat dialog
 ```
-POST /v1/chat/{local|outstation}/start
+POST /v1/chat/{local|outstation}/start?lat=31.1048&lon=77.1734
 ```
 
 Call this when the chat UI opens. Starts a **fresh** conversation and returns the
 welcome greeting — render `message` as the first assistant bubble.
 
+Query params (all optional): `lat`, `lon`, `accuracy_m`.
+
 **Response**: `StartChatResponse`
 ```json
 {
   "session_id": "uuid",
-  "message": "Welcome to Him Cab! 🙏 I can help you plan your trip to Himachal Pradesh. Where would you like to go?",
-  "language": "en",
-  "persona": "outstation"
+  "message": "नमस्ते! Him Cab में आपका स्वागत है 🙏 …",
+  "language": "hi",
+  "persona": "local",
+  "location": { "lat": 31.1048, "lon": 77.1734, "in_himachal": true, "place_name": "Shimla", "place_distance_km": 0.0, "near_border": false }
 }
 ```
+
+**`persona` is authoritative.** It matches the path you called *unless* you sent
+coordinates that say otherwise — a fix outside Himachal on `/local/start` is served as
+`outstation`, and this field tells you so. Use it for the rest of the conversation.
+`location` is `null` when you sent no usable coordinates.
 
 Keep `session_id` if you want to pin this conversation explicitly (see
 [Pinning a conversation](#pinning-a-conversation)); otherwise the backend tracks it
@@ -164,7 +217,7 @@ for you and the app never needs to send it back.
 
 #### 2a. Send a message — streaming (preferred)
 ```
-GET /v1/chat/{local|outstation}/stream?message=<text>
+GET /v1/chat/{local|outstation}/stream?message=<text>&lat=31.1048&lon=77.1734
 ```
 
 Server-Sent Events stream. Note this needs `fetch` (or any client that can set
@@ -177,11 +230,12 @@ headers), not the browser's native `EventSource`, which cannot send an
 |-------|------|-------------|
 | `token` | `{"token": "..."}` | Raw text chunk for chat animation |
 | `structured` | `{"type": "<see below>", "payload": {...}}` | A renderable card |
-| `done` | `{"session_id": "...", "node_trace": [...]}` | Stream complete |
+| `done` | `{"session_id": "...", "persona": "local", "node_trace": [...]}` | Stream complete |
 | `error` | `{"code": "...", "message": "..."}` | Error occurred |
 
-Query params: `message` (required) and the optional `session_id` described under
-[Pinning a conversation](#pinning-a-conversation).
+Query params: `message` (required), the optional `session_id` described under
+[Pinning a conversation](#pinning-a-conversation), and the optional `lat` / `lon` /
+`accuracy_m` described under [Sending coordinates](#sending-coordinates).
 
 #### 2b. Send a message — non-streaming (fallback)
 ```
@@ -190,14 +244,18 @@ POST /v1/chat/{local|outstation}/message
 
 **Request Body**: `ChatMessageRequest`
 ```json
-{ "message": "Plan a 3-day trip to Manali" }
+{ "message": "Plan a 3-day trip to Manali", "lat": 28.6139, "lon": 77.2090 }
 ```
+
+`lat`, `lon` and `accuracy_m` are optional — see
+[Sending coordinates](#sending-coordinates).
 
 **Response**: `ChatResponse`
 ```json
 {
   "session_id": "uuid",
   "response": "Here's a 3-day plan for Manali…",
+  "persona": "outstation",
   "structured_events": [
     { "type": "itinerary", "payload": { "destination": "Manali", "...": "..." } }
   ],
@@ -253,8 +311,23 @@ without breaking older app builds.
 | `itinerary` | Full `Itinerary` — `destination`, `duration_days`, `group_type`, `budget_range`, `days[]`, `cab_package`, `hotels[]`, `weather`, `travel_info`, `cost_breakdown`, `hidden_gems[]`, `generated_at`, `language`. `weather` and `cab_package` are filled from the live services, not from the model. | A trip plan was generated |
 | `weather_alert` | One alert — `event`, `severity`, `description` | Destination has an active weather alert |
 | `snowfall_alert` | `risk` (`high`\|`critical`), `message` | Snowfall risk at the destination |
-| `cab_fare` | `{options[], category_name, fare_inr, vehicle_label, seat_capacity, trip_type, distance_km, is_approximate, source}`. When `is_approximate` is true the route distance was computed rather than surveyed — render the price as "approx". | A fare was quoted for the route |
-| `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, options[]}`. Open the booking screen with both pins already dropped on the map and the recommended cab preselected. Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A LOCAL rider's route was resolved |
+| `cab_fare` | `{options[], category_name, fare_inr, vehicle_label, seat_capacity, trip_type, distance_km, duration_text, distance_source, is_approximate, source, best_offer, fare_after_offer_inr}`. When `is_approximate` is true the route distance was computed rather than surveyed — render the price as "approx". `distance_source` is `surveyed` \| `gps` \| `city`. `best_offer` / `fare_after_offer_inr` are present only when a live coupon applies. | A fare was quoted for the route |
+| `offers` | `{trip_type, fare_inr, offers: [{offer_id, coupon_code, coupon_name, coupon_value_inr, minimum_value_inr, fare_after_offer_inr, applies_to_this_fare, terms_and_conditions, image, expire_date}], best_offer}`. Real coupons from `/api/rider/offer/*`, already filtered to this trip type, today's date and the quoted fare, **best saving first**. | The rider has at least one coupon that applies to this trip |
+| `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, distance_source, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, offer_id, coupon_code, fare_after_offer_inr, options[]}`. Open the booking screen with both pins already dropped on the map, the recommended cab preselected and the coupon prefilled (`offer_id` is exactly what `POST /api/rider/trip/book-ride` takes). Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A LOCAL rider's route was resolved |
+
+The `offers` event is **absent**, never empty, when nothing applies. The reply text and
+this event agree by construction: the assistant may name only the coupons listed here,
+and when the list is empty it is forbidden to mention discounts at all.
+
+Two fields carry the honesty guarantees, and the app should respect both:
+
+- **`applies_to_this_fare`** — false when no fare came back for the route, so the
+  minimum-spend check could not run. The coupon is live on the rider's account, but
+  eligibility for *this* trip is unconfirmed; the reply says so, and `booking_handoff`
+  does **not** prefill it.
+- **`fare_after_offer_inr`** — null whenever a total cannot be stated honestly: no fare
+  to subtract from, or a coupon worth at least the whole fare (which would render as
+  "₹0", a free ride the booking flow will not honour). Show the saving, not a total.
 
 Enum vocabularies inside an `itinerary` payload:
 
@@ -280,6 +353,35 @@ The "which conversation is this rider in" pointer is stored in Firestore as a di
 document read requiring no index, so multi-turn memory does not depend on any cache
 or on a composite index being present.
 
+#### Sending coordinates
+
+Optional on every chat endpoint, and worth sending on all of them. `lat` / `lon` /
+`accuracy_m` are query params on `/start` and `/stream`, body fields on `/message`, and
+the whole body of `/route`.
+
+What they buy:
+
+| Without coordinates | With coordinates |
+|---|---|
+| The screen the chat was opened from picks the persona | The rider's actual position picks it |
+| The assistant asks "which city are you travelling from?" | The pickup city is already known |
+| No fare until they type that city out | Fare quoted on the first message |
+| Distance measured between two city centroids | Distance measured from where they are |
+
+Resend them on every turn — riders move between messages, and the newest fix wins. The
+resolved fix is stored on the conversation, so a client that sends them once still gets
+the benefit on later turns; it will just be pricing from a stale pickup point.
+
+Rules the backend applies:
+
+- **`(0, 0)` is rejected.** It is what a phone reports before it has a fix, and it is in
+  the Atlantic. A rider in Shimla must not be classified as a visitor 6,000 km away.
+- **A vague fix is not turned into a place name.** The pickup city is filled in only
+  when the fix sits within ~15 km of a town we know; further out, the coordinates still
+  measure the distance but the assistant asks which city they mean.
+- **Their words beat their phone.** Once the rider names a starting city, that is the
+  origin — booking a Delhi pickup from a Shimla sofa is a real thing people do.
+
 #### Pinning a conversation
 
 Both `/stream` (query param) and `/message` (body field) accept an optional
@@ -300,10 +402,18 @@ client can't wedge the UI, and a guessed id can't reach someone else's chat.
 ```bash
 TOKEN="<rider jwt>"
 
-curl -X POST http://localhost:8000/v1/chat/local/start \
+# 0. Which assistant does this rider belong to?
+curl -X POST http://localhost:8000/v1/chat/route \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"lat": 31.1048, "lon": 77.1734}'
+# → {"persona":"local","base_path":"/v1/chat/local", ...}
+
+# 1. Open the dialog on that persona, with the same fix.
+curl -X POST "http://localhost:8000/v1/chat/local/start?lat=31.1048&lon=77.1734" \
      -H "Authorization: Bearer $TOKEN"
 
-curl -N "http://localhost:8000/v1/chat/local/stream?message=Manali%20jaana%20hai" \
+# 2. Send a message. The fare, distance and any coupon come back with the reply.
+curl -N "http://localhost:8000/v1/chat/local/stream?message=Manali%20jaana%20hai&lat=31.1048&lon=77.1734" \
      -H "Authorization: Bearer $TOKEN"
 ```
 

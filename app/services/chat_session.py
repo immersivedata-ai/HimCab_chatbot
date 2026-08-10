@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.logging import get_logger
+from app.models.location import RiderLocation
 from app.models.session import Language, MessageRole, TripSession
 from app.services.firestore import get_session_service
 
@@ -77,6 +78,36 @@ def welcome_message(persona: str) -> str:
     return WELCOME_MESSAGES.get(persona, WELCOME_MESSAGES[OUTSTATION])
 
 
+# ── Which assistant is this rider talking to ──────────────────────────────────
+
+def resolve_persona(
+    requested: str, location: Optional[RiderLocation]
+) -> tuple[str, str]:
+    """Pick the persona to serve, returning (persona, why).
+
+    The route the app called is a REQUEST, not the answer. It is chosen by which screen
+    the chat bubble was tapped on — a Delhi visitor browsing the home screen lands on
+    /local and gets greeted in Hindi about a state they have never been to, and a Shimla
+    resident opening the outstation screen gets an itinerary for the town they live in.
+
+    A GPS fix answers the question directly, so when there is one it wins:
+
+        inside Himachal  → local       (Hindi, cab-first: they know the place)
+        outside          → outstation  (English, itinerary-first: they are visiting)
+
+    With no usable fix the requested persona stands, which is exactly the old behaviour
+    — this never makes a client that sends no coordinates worse off.
+
+    Note what this does NOT do: override the planner. Once the rider names a starting
+    city, `planner.classify_visitor_type` reclassifies from their own words, and a
+    person who says "I'm coming from Delhi" is a visitor whatever their phone says. The
+    fix is the opening assumption; the conversation is the correction.
+    """
+    if location is None:
+        return (requested if requested in VALID_PERSONAS else OUTSTATION), "default"
+    return location.visitor_type, "coordinates"
+
+
 async def _remember_active(persona: str, user_id: str, session_id: str) -> None:
     """Point this caller at `session_id` as their current conversation."""
     await get_session_service().set_active_session(user_id, persona, session_id)
@@ -113,7 +144,49 @@ async def _load_owned_session(session_id: str, user_id: str) -> Optional[TripSes
     return session
 
 
-async def _create_session(persona: str, user_id: str) -> TripSession:
+def apply_location(session: TripSession, location: Optional[RiderLocation]) -> bool:
+    """Attach a fresh GPS fix to a conversation. True when anything changed.
+
+    Beyond storing the fix, this fills in the pickup city — but ONLY when the fix
+    actually sits on a town we know (`is_precise`). A fix 40 km from the nearest named
+    place is perfectly good for measuring a distance and useless as a place name: it
+    would have the reply announce "your trip from Mandi" to somebody who has never been
+    there. In that case the coordinates are still used for the route, and the assistant
+    asks which city they are starting from, as it always did.
+
+    A rider who has already NAMED their starting city keeps it. Their words outrank
+    their phone: someone booking a Delhi pickup from their Shimla sofa means Delhi.
+    """
+    if location is None:
+        return False
+
+    # A rider sitting still resends the same fix every turn. Reporting that as a change
+    # would mean a Firestore write per message for nothing.
+    previous = session.rider_location
+    changed = previous is None or (previous.lat, previous.lon) != (location.lat, location.lon)
+
+    session.rider_location = location
+
+    if location.place_name and location.is_precise and not session.entities.origin:
+        session.entities.origin = location.place_name
+        if location.in_himachal:
+            session.entities.home_city = location.place_name
+        # The origin question is answered, so it must not be the question in flight —
+        # otherwise the next reply gets read as an answer to a question nobody asked.
+        if session.entities.last_asked_field == "origin":
+            session.entities.last_asked_field = None
+        changed = True
+
+    if session.entities.visitor_type != location.visitor_type:
+        session.entities.visitor_type = location.visitor_type
+        changed = True
+
+    return changed
+
+
+async def _create_session(
+    persona: str, user_id: str, location: Optional[RiderLocation] = None
+) -> TripSession:
     """Create + persist a fresh conversation, pre-seeded with the welcome message."""
     language = DEFAULT_LANGUAGE.get(persona, Language.ENGLISH)
     session = TripSession(
@@ -129,6 +202,9 @@ async def _create_session(persona: str, user_id: str) -> TripSession:
     # question in flight. Without it the planner treats the first reply as unprompted
     # and its answer-parsing safety net can't fire on a one-word "manali".
     session.entities.last_asked_field = "destination"
+    # Applied after the seed so a GPS fix wins over the persona for visitor_type, and
+    # so the pickup city is known before the rider's first message.
+    apply_location(session, location)
     session.add_message(
         MessageRole.ASSISTANT,
         welcome_message(persona),
@@ -143,6 +219,64 @@ async def _create_session(persona: str, user_id: str) -> TripSession:
         session_id=session.session_id,
         user_id=user_id,
         persona=persona,
+        located=location is not None,
+        origin=session.entities.origin,
+    )
+    return session
+
+
+async def _adopt_conversation(
+    persona: str, adopt_from: str, user_id: str
+) -> Optional[TripSession]:
+    """Carry a live conversation across when coordinates change which persona serves it.
+
+    Without this, a rider whose fix moves them from outstation to local (because they
+    have ARRIVED in Himachal — the single most likely way for this to happen) is dropped
+    into an empty chat, having already told the assistant where they are going, for how
+    long and with how many people. The persona is a routing decision; it should not cost
+    them the conversation.
+
+    Only ever adopts when the target persona has nothing of its own, so a rider who
+    genuinely uses both screens keeps their two separate conversations.
+    """
+    if adopt_from == persona:
+        return None
+
+    previous_id = await _recall_active(adopt_from, user_id)
+    if not previous_id:
+        return None
+    session = await _load_owned_session(previous_id, user_id)
+    if session is None:
+        return None
+
+    session.persona = persona
+    # The persona's default reply language moves with it. What the agent actually
+    # writes in is decided per turn from the rider's own words (app/agent/language.py),
+    # but this is what /history reports and what a resumed conversation starts from.
+    session.language = DEFAULT_LANGUAGE.get(persona, Language.ENGLISH)
+    await _remember_active(persona, user_id, session.session_id)
+    try:
+        await get_session_service().update_persona(
+            session_id=session.session_id,
+            persona=persona,
+            language=str(getattr(session.language, "value", session.language)),
+        )
+    except Exception as e:
+        # In-memory adoption still serves this turn; the stored document catches up on
+        # the next write. Logged because a document left under the old persona is
+        # unresumable if the pointer is ever lost.
+        log.warning(
+            "chat_session_persona_persist_failed",
+            session_id=session.session_id,
+            error=str(e),
+        )
+    log.info(
+        "chat_session_adopted_across_personas",
+        session_id=session.session_id,
+        user_id=user_id,
+        from_persona=adopt_from,
+        to_persona=persona,
+        messages=len(session.messages),
     )
     return session
 
@@ -171,19 +305,50 @@ async def _find_resumable(persona: str, user_id: str) -> Optional[TripSession]:
     return None
 
 
-async def start_chat(user_id: str, persona: str) -> TripSession:
+async def _refresh_location(
+    session: TripSession, location: Optional[RiderLocation]
+) -> TripSession:
+    """Update an existing conversation with the fix that arrived on this request.
+
+    The rider moves between turns — they open the chat at home and send the next
+    message from the taxi rank — so the newest fix always wins. Persisting it is
+    best-effort: a Firestore hiccup costs the next turn its head start, never this
+    turn's reply.
+    """
+    if not apply_location(session, location):
+        return session
+    try:
+        await get_session_service().update_location(
+            session_id=session.session_id,
+            location=session.rider_location.model_dump(mode="json"),
+            entities=session.entities.model_dump(mode="json"),
+        )
+    except Exception as e:
+        log.warning(
+            "chat_session_location_persist_failed",
+            session_id=session.session_id,
+            error=str(e),
+        )
+    return session
+
+
+async def start_chat(
+    user_id: str, persona: str, location: Optional[RiderLocation] = None
+) -> TripSession:
     """Open the chat dialog: ALWAYS begins a fresh conversation.
 
     Called when the user opens the chat UI, so every open starts from a clean greeting
     rather than dropping them into a half-finished plan from days ago.
     """
-    return await _create_session(persona, user_id)
+    return await _create_session(persona, user_id, location)
 
 
 async def resolve_chat(
     user_id: str,
     persona: str,
     session_id: Optional[str] = None,
+    location: Optional[RiderLocation] = None,
+    adopt_from: Optional[str] = None,
 ) -> TripSession:
     """Return the caller's current conversation, creating one if there isn't a live one.
 
@@ -192,6 +357,11 @@ async def resolve_chat(
             conversation is used and becomes their active one. An unknown id, or one
             owned by someone else, is ignored and resolution falls through to the
             normal tiers — never a 4xx, so a stale id on the client can't wedge the UI.
+        location: the device's current fix, if it sent one. Written onto whichever
+            conversation is resolved, so the pickup point follows the rider.
+        adopt_from: the persona the caller ASKED for, when coordinates chose a different
+            one. A live conversation there is carried over rather than abandoned —
+            see `_adopt_conversation`.
 
     Never raises for a missing session — a front end that sends a message without
     having called /start still gets a working conversation.
@@ -200,7 +370,7 @@ async def resolve_chat(
         pinned = await _load_owned_session(session_id, user_id)
         if pinned is not None:
             await _remember_active(persona, user_id, pinned.session_id)
-            return pinned
+            return await _refresh_location(pinned, location)
         log.info(
             "chat_session_pin_ignored",
             session_id=session_id,
@@ -212,7 +382,7 @@ async def resolve_chat(
     if active_id:
         session = await _load_owned_session(active_id, user_id)
         if session is not None:
-            return session
+            return await _refresh_location(session, location)
 
     resumable = await _find_resumable(persona, user_id)
     if resumable is not None:
@@ -223,6 +393,11 @@ async def resolve_chat(
             user_id=user_id,
             persona=persona,
         )
-        return resumable
+        return await _refresh_location(resumable, location)
 
-    return await _create_session(persona, user_id)
+    if adopt_from:
+        adopted = await _adopt_conversation(persona, adopt_from, user_id)
+        if adopted is not None:
+            return await _refresh_location(adopted, location)
+
+    return await _create_session(persona, user_id, location)

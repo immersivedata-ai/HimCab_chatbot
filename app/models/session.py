@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.itinerary import BudgetRange, GroupType, Itinerary
+from app.models.location import RiderLocation
 
 
 class MessageRole(str, Enum):
@@ -100,6 +101,11 @@ class TripSession(BaseModel):
     persona: Optional[str] = None
     messages: list[Message] = Field(default_factory=list)
     entities: ExtractedEntities = Field(default_factory=ExtractedEntities)
+    #: The rider's last known position, from the app's GPS fix. Stored so later turns
+    #: keep the pickup point without the app resending it, and refreshed whenever it
+    #: does. None for a client that sends no coordinates — everything still works, the
+    #: assistant just has to ask which city they are starting from.
+    rider_location: Optional[RiderLocation] = None
     current_itinerary: Optional[Itinerary] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -133,6 +139,27 @@ class CreateSessionResponse(BaseModel):
     status: str
 
 
+class RiderCoordinates(BaseModel):
+    """The device's GPS fix, sent with a chat request.
+
+    Optional everywhere. Sending it is what lets the assistant skip "are you local or
+    visiting?" and "which city are you travelling from?", and price the trip from where
+    the rider actually is. Omit it and every endpoint still works — the assistant just
+    asks, as it did before.
+    """
+
+    lat: float = Field(..., ge=-90, le=90, description="Latitude in decimal degrees.")
+    lon: float = Field(..., ge=-180, le=180, description="Longitude in decimal degrees.")
+    accuracy_m: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Device-reported accuracy in metres, if you have it. Informational — a "
+            "coarse fix is still used, since it beats having none."
+        ),
+    )
+
+
 class ChatMessageRequest(BaseModel):
     """Body for POST /v1/chat/{persona}/message."""
 
@@ -148,6 +175,22 @@ class ChatMessageRequest(BaseModel):
             "one belonging to another rider, is ignored rather than rejected."
         ),
     )
+    lat: Optional[float] = Field(
+        default=None,
+        ge=-90,
+        le=90,
+        description=(
+            "Optional device latitude. Sent together with `lon`, it sets the pickup "
+            "point: the fare is priced from here, and a fix inside Himachal marks the "
+            "rider as a local. Resent on every turn is fine — the newest fix wins."
+        ),
+    )
+    lon: Optional[float] = Field(
+        default=None, ge=-180, le=180, description="Optional device longitude. See `lat`."
+    )
+    accuracy_m: Optional[float] = Field(
+        default=None, ge=0, description="Optional device-reported accuracy in metres."
+    )
 
 
 class StructuredEventType(str, Enum):
@@ -159,6 +202,7 @@ class StructuredEventType(str, Enum):
     WEATHER_ALERT = "weather_alert"
     SNOWFALL_ALERT = "snowfall_alert"
     CAB_FARE = "cab_fare"
+    OFFERS = "offers"
     BOOKING_HANDOFF = "booking_handoff"
 
 
@@ -173,23 +217,83 @@ class StructuredEvent(BaseModel):
       - `snowfall_alert` → {risk: "high"|"critical", message, ...}
       - `cab_fare`       → Him Cab quote: {options[], category_name, fare_inr,
                            vehicle_label, seat_capacity, trip_type, distance_km,
-                           is_approximate, source}. `options` is already narrowed to
-                           cabs that seat the party. `is_approximate` is true when the
-                           route distance was computed from coordinates rather than
+                           duration_text, distance_source, is_approximate, source,
+                           best_offer, fare_after_offer_inr}. `options` is already
+                           narrowed to cabs that seat the party. `is_approximate` is
+                           true when the route distance was computed rather than
                            surveyed — render the price as "approx" in that case.
+                           `distance_source` says which: "surveyed" | "gps" | "city".
+      - `offers`         → live Him Cab coupons that apply to this trip:
+                           {trip_type, fare_inr, offers: [{offer_id, coupon_code,
+                           coupon_name, coupon_value_inr, minimum_value_inr,
+                           fare_after_offer_inr, terms_and_conditions, image,
+                           expire_date}], best_offer}. Already filtered to the trip
+                           type, the live date window and the quoted fare, best saving
+                           first. Absent when the rider has no applicable coupon —
+                           never a placeholder or an empty card.
       - `booking_handoff`→ open the booking screen on this journey. `origin` and
                            `destination` each carry {name, lat, lon} so the map can
                            drop both pins without geocoding again; plus distance_km,
-                           duration_text, passengers, travel_dates and the
-                           recommended_category_id to preselect. Sent to LOCAL riders
-                           once a route is known. Nothing is reserved — the app owns
-                           the booking, and the reply never asks the rider to confirm.
+                           duration_text, passengers, travel_dates, the
+                           recommended_category_id to preselect and, when one applies,
+                           offer_id / coupon_code to prefill. Sent to LOCAL riders once
+                           a route is known. Nothing is reserved — the app owns the
+                           booking, and the reply never asks the rider to confirm.
 
     Zero or more events accompany any reply; clarification turns carry none.
     """
 
     type: StructuredEventType
     payload: dict = Field(default_factory=dict)
+
+
+class ResolvedLocation(BaseModel):
+    """What the backend made of the coordinates you sent."""
+
+    lat: float
+    lon: float
+    in_himachal: bool = Field(
+        description="True when the fix falls inside Himachal Pradesh."
+    )
+    place_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Nearest town we know, used as the pickup city for distances and fares. "
+            "Null when the fix is far from every place in our geography tables."
+        ),
+    )
+    place_distance_km: Optional[float] = Field(
+        default=None, description="How far that town is from the fix."
+    )
+    near_border: bool = Field(
+        default=False,
+        description=(
+            "True within a few km of the state line, where the classification could "
+            "go either way. Treat the persona as a default the rider may correct."
+        ),
+    )
+
+
+class PersonaRouteResponse(BaseModel):
+    """Response for POST /v1/chat/route — which assistant this rider belongs to.
+
+    Call it once with the device's GPS fix before opening the chat, then use the
+    returned `persona` for every /v1/chat/{persona}/* call. A rider inside Himachal
+    gets the LOCAL assistant (Hindi, cab-first replies); everyone else gets OUTSTATION
+    (English, itinerary-first).
+    """
+
+    persona: str = Field(description='"local" or "outstation" — use this in the path.')
+    base_path: str = Field(
+        description="Prefix for this rider's chat endpoints, e.g. /v1/chat/local."
+    )
+    reason: str = Field(
+        description=(
+            'Why: "coordinates" when the fix decided it, "default" when no usable fix '
+            "was sent and the requested persona was kept."
+        )
+    )
+    location: Optional[ResolvedLocation] = None
 
 
 class StartChatResponse(BaseModel):
@@ -199,7 +303,15 @@ class StartChatResponse(BaseModel):
     session_id: str
     message: str
     language: str
-    persona: str
+    persona: str = Field(
+        description=(
+            "The persona this conversation actually runs as. It matches the path you "
+            "called UNLESS you sent coordinates that say otherwise — a fix outside "
+            "Himachal on /local/start is served as outstation, and this field tells "
+            "you so. Use it for the rest of the conversation."
+        )
+    )
+    location: Optional[ResolvedLocation] = None
 
 
 class ChatResponse(BaseModel):
@@ -207,6 +319,13 @@ class ChatResponse(BaseModel):
 
     session_id: str = Field(description="The conversation this turn belongs to.")
     response: str = Field(description="Assistant reply text — render as a chat bubble.")
+    persona: str = Field(
+        default="",
+        description=(
+            "The persona this turn was served as — see StartChatResponse.persona. "
+            "Differs from the path only when coordinates said otherwise."
+        ),
+    )
     structured_events: list[StructuredEvent] = Field(
         default_factory=list,
         description="Renderable cards for this turn. See StructuredEvent.",

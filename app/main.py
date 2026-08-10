@@ -52,10 +52,11 @@ async def lifespan(app: FastAPI):
 
     # Close HTTP clients used by external services
     from app.services.external.weather import get_weather_service
-    from app.services.himcab import get_fare_service
+    from app.services.himcab import get_fare_service, get_offers_service
     try:
         await get_weather_service().close()
         await get_fare_service().close()
+        await get_offers_service().close()
     except Exception as e:
         log.warning("http_client_close_failed", error=str(e))
 

@@ -125,6 +125,37 @@ class SessionService:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
+    async def update_persona(self, session_id: str, persona: str, language: str) -> None:
+        """Re-file a conversation under a different persona.
+
+        Written because the stored `persona` is not decoration: `list_user_sessions`
+        consumers filter on it, so a document left saying "outstation" after the rider
+        was moved to the local assistant becomes unresumable the moment the active-chat
+        pointer is lost.
+        """
+        await self._col.document(session_id).update({
+            "persona": persona,
+            "language": language,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    async def update_location(
+        self, session_id: str, location: dict, entities: Optional[dict] = None
+    ) -> None:
+        """Store the rider's latest GPS fix on a session.
+
+        `entities` goes in the same write because a fix can fill in the pickup city
+        (see `chat_session.apply_location`), and splitting that across two round trips
+        risks a session whose stored location and stored origin disagree.
+        """
+        payload: dict = {
+            "rider_location": location,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if entities is not None:
+            payload["entities"] = entities
+        await self._col.document(session_id).update(payload)
+
     async def list_user_sessions(
         self,
         user_id: str,

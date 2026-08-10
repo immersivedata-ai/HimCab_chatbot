@@ -162,6 +162,11 @@ class RouteEstimate:
     #: True when derived from coordinates rather than surveyed. A fare built on it
     #: must be presented to the rider as approximate.
     is_approximate: bool
+    #: How the distance was arrived at: "surveyed" (measured, from the table below),
+    #: "gps" (computed from the rider's own fix) or "city" (computed between two town
+    #: centroids). Logged and handed to the app — "why is this number what it is" is
+    #: the first question asked of any fare, and it should not need a code read.
+    source: str = "surveyed"
 
     @property
     def duration_text(self) -> str:
@@ -190,7 +195,9 @@ def resolve_route(origin: str, destination: str) -> Optional[RouteEstimate]:
     surveyed = ROAD_ROUTES.get((o, d)) or ROAD_ROUTES.get((d, o))
     if surveyed:
         km, minutes = surveyed
-        return RouteEstimate(km=km, duration_minutes=minutes, is_approximate=False)
+        return RouteEstimate(
+            km=km, duration_minutes=minutes, is_approximate=False, source="surveyed"
+        )
 
     estimated = geo.estimate_road_distance_km(origin, destination)
     if estimated:
@@ -198,5 +205,52 @@ def resolve_route(origin: str, destination: str) -> Optional[RouteEstimate]:
             km=estimated,
             duration_minutes=geo.estimate_drive_time_minutes(estimated),
             is_approximate=True,
+            source="city",
         )
     return None
+
+
+#: A GPS fix this close to a town we have surveyed routes for is treated AS that town,
+#: so the measured distance wins over one computed from the fix. Below this the two
+#: barely differ and the surveyed figure is the better number; above it the rider is
+#: somewhere the table does not describe, and their own coordinates are.
+_SAME_TOWN_KM = 15.0
+
+
+def resolve_route_from_fix(
+    fix, destination: str, *, fallback_origin: Optional[str] = None
+) -> Optional[RouteEstimate]:
+    """Distance and drive time from the rider's actual position to a destination.
+
+    Prefers, in order:
+      1. a surveyed route, when the fix sits on a town that has one — measured beats
+         computed, and a rider in Shimla asking about Manali should get the 270 km
+         somebody drove, not 268.4 km of trigonometry
+      2. the distance from their own coordinates — right for anyone between towns,
+         which is most riders opening the app from wherever they happen to be
+      3. `fallback_origin`, for a fix that resolves to nothing (mid-Spiti, say)
+
+    `fix` is a `geo.LocationFix`. Returns None when the destination is unrecognised.
+    """
+    if fix is None:
+        return resolve_route(fallback_origin or "", destination)
+    if not destination:
+        return None
+
+    if fix.nearest_city and (fix.nearest_city_km or 0) <= _SAME_TOWN_KM:
+        surveyed = resolve_route(fix.nearest_city, destination)
+        if surveyed is not None and not surveyed.is_approximate:
+            return surveyed
+
+    km = geo.road_distance_from_point(
+        fix.lat, fix.lon, destination, in_himachal=fix.in_himachal
+    )
+    if km:
+        return RouteEstimate(
+            km=km,
+            duration_minutes=geo.estimate_drive_time_minutes(km),
+            is_approximate=True,
+            source="gps",
+        )
+
+    return resolve_route(fix.nearest_city or fallback_origin or "", destination)

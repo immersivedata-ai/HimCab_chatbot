@@ -36,6 +36,8 @@ graph TB
         FS["Firestore<br/>(Sessions + Users)"]
         WS["Weather Service<br/>(OpenWeatherMap)"]
         FARE["Him Cab Fare Service<br/>(Java Backend)"]
+        OFF["Him Cab Offers<br/>(Java Backend)"]
+        GEO["Geography<br/>(coords → local/visitor, distance)"]
     end
 
     APP --> GW
@@ -47,7 +49,10 @@ graph TB
     P -->|needs_clarification| CL --> PS
     P -->|ready| TE --> W --> PS
     TE --> WS
+    TE --> GEO
     TE --> FARE
+    TE --> OFF
+    GW --> GEO
     R --> VAI
     P --> VAI
     W --> VAI
@@ -82,7 +87,8 @@ sequenceDiagram
         Agent-->>API: Clarification question
         API-->>App: SSE: token events
     else Ready to Plan
-        Agent->>Tools: Parallel: weather + Him Cab fare quote
+        Agent->>Tools: Parallel: weather + Him Cab fare (priced on the rider's GPS fix)
+        Agent->>Tools: Him Cab offers, filtered to that fare
         Agent->>LLM: Writer: generate response + JSON
         Agent->>DB: Persist: save message + itinerary
         Agent-->>API: Final response + structured events
@@ -113,8 +119,10 @@ sequenceDiagram
 
 5. **The conversation policy lives in code, not in a prompt**: `app/agent/slots.py` decides what to ask and when; the LLM only extracts what the user said. Letting the model own the flow produced questions in the wrong language, for details already given, and for details the request never needed.
 
-6. **Live data overrides generated data**: the real fare and the real weather report are stamped onto the itinerary after validation, so a price or forecast can never be something the model invented — or something it forgot to include.
+6. **Live data overrides generated data**: the real fare, the real weather report and the measured journey are stamped onto the itinerary after validation, so a price, a forecast or a distance can never be something the model invented — or something it forgot to include. Coupons are the same rule stated the other way: the reply may quote only the codes the backend returned, and when there are none it is forbidden to mention discounts at all.
 
-7. **SSE streaming**: Token-by-token streaming for chat UX, with structured JSON events for mobile card rendering.
+7. **Coordinates decide the persona, the conversation corrects it**: a GPS fix inside Himachal serves the local assistant and one outside serves the outstation assistant (`app/services/geo.py`, `POST /v1/chat/route`) — a better answer than which screen the chat bubble was tapped from. The fix also supplies the pickup point, so the fare is priced from where the rider actually is instead of a city centroid, and a rider who never types their city out still gets a price. Whatever they say about their origin still outranks it.
 
-8. **Prompt templates in YAML**: Prompts are the most iterated component — extracting them into versioned YAML templates enables prompt engineering without code changes.
+8. **SSE streaming**: Token-by-token streaming for chat UX, with structured JSON events for mobile card rendering.
+
+9. **Prompt templates in YAML**: Prompts are the most iterated component — extracting them into versioned YAML templates enables prompt engineering without code changes.

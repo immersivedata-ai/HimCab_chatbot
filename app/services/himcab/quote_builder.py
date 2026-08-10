@@ -10,14 +10,29 @@ to what seats the group (`vehicles.select_cabs_for_group`) and this module only 
 which of those to feature as the headline, by budget.
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.logging import get_logger
 from app.models.session import ExtractedEntities
-from app.services.himcab.distances import resolve_route
+from app.services.himcab.distances import RouteEstimate, resolve_route
 from app.services.himcab.models import FareCategoryFare, FareQuoteInput
 
 log = get_logger(__name__)
+
+#: Him Cab operates in India; the backend prices the night-charge window off the
+#: `bookingTime` we send, so it has to be the rider's clock, not the server's.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def current_booking_time() -> str:
+    """Now, as HH:mm in IST — what the fare endpoint reads for night charges.
+
+    This used to be the constant "12:00", which meant a rider quoting a 2 a.m. airport
+    run was priced as a midday one and then charged the night rate at booking. The
+    quote has to be built on the same clock the booking will be.
+    """
+    return datetime.now(_IST).strftime("%H:%M")
 
 # Category-name preferences for the headline pick (real names from /fare/get-all).
 _PREF_BY_BUDGET = {
@@ -47,10 +62,16 @@ def classify_trip_type(distance_km: Optional[float]) -> str:
 def build_fare_quote_input(
     entities: ExtractedEntities,
     trip_type: Optional[str] = None,
-    booking_time: str = "12:00",
+    booking_time: Optional[str] = None,
     rent_hours: int = 0,
+    route: Optional[RouteEstimate] = None,
 ) -> FareQuoteInput:
     """Build the estimate input for the main origin→destination journey.
+
+    Pass `route` when the caller has already resolved the journey — the tool executor
+    has, from the rider's GPS fix, and re-deriving it here from city names would price
+    a different trip than the one the reply describes. Without it the route is resolved
+    from the entity names, which is the older, coarser path.
 
     Distance is surveyed where known and computed from coordinates otherwise (see
     `distances.resolve_route`); it is None only when a place is unrecognised, in
@@ -62,7 +83,7 @@ def build_fare_quote_input(
     # lookup and the request body still get a usable origin city.
     origin = entities.origin or entities.home_city or ""
     destination = entities.destination or ""
-    resolved = resolve_route(origin, destination)
+    resolved = route if route is not None else resolve_route(origin, destination)
 
     return FareQuoteInput(
         origin=origin,
@@ -70,7 +91,7 @@ def build_fare_quote_input(
         distance_km=resolved.km if resolved else None,
         distance_is_approximate=resolved.is_approximate if resolved else False,
         trip_type=trip_type or classify_trip_type(resolved.km if resolved else None),
-        booking_time=booking_time,
+        booking_time=booking_time or current_booking_time(),
         rent_hours=rent_hours,
         group_size=entities.group_size,
         budget_range=entities.budget_range.value if entities.budget_range else None,

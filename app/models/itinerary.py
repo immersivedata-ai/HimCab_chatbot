@@ -181,7 +181,11 @@ class CabPackage(BaseModel):
     contact_number: Optional[str] = None
     # Real fare fields (populated from the Him Cab backend when available; else None)
     base_fare_inr: Optional[float] = None
+    #: What the rider pays once their best live coupon is applied. None when no coupon
+    #: applies — never a copy of base_fare_inr, so "is there a discount" is one check.
     discounted_fare_inr: Optional[float] = None
+    #: The coupon behind `discounted_fare_inr`, for the booking screen to prefill.
+    coupon_code: Optional[str] = None
     seat_capacity: Optional[int] = None
     fare_source: Optional[str] = None  # "himcab_api" when from a real quote, else None/approximate
 
