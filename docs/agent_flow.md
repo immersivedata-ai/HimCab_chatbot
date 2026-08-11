@@ -78,9 +78,13 @@ same request means different things to the two personas:
 
 | Mode | Who | Reply |
 |---|---|---|
-| `itinerary` | OUTSTATION visitor, travel intent | Day-by-day plan + structured itinerary JSON |
+| `itinerary` | OUTSTATION visitor, travel intent | Day-by-day plan + structured itinerary JSON, then a `booking_handoff` for the arrival transfer |
 | `ride` | LOCAL resident, travel intent | Cab recommendation, fare, drive time, weather, then a `booking_handoff` — no itinerary at all |
 | `answer` | either, question about a place | Short direct answer. No trip, no cab, no JSON |
+
+Both travelling modes end on the same hand-off: the plan is of no use to a visitor
+until somebody drives them to it. Only `answer` gets none — a question about a place
+is not a journey.
 
 `ride` exists because a Kullu resident asking to go to Manali is booking a ride, not
 planning a holiday somewhere unfamiliar. Telling them what to see on Mall Road is the
@@ -109,7 +113,10 @@ everything they have already told the assistant.
 
 The reply ends by announcing the booking screen rather than asking whether to book:
 the app owns that flow, and `booking_handoff` carries both endpoints **with
-coordinates** so its map can drop pins without geocoding the names again.
+coordinates** so its map can drop pins without geocoding the names again. Its
+`trip_type` — the rate card the fare was quoted on, decided by the journey's length
+rather than by the persona — is how the app keeps a short hop off its outstation
+booking screen, which refuses anything inside one state and under 200 km.
 
 ## Node Descriptions
 

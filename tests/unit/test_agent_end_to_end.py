@@ -537,8 +537,56 @@ class TestOutstationIsUnaffected:
         assert final.get("structured_itinerary") is not None
         assert "Give a day-by-day itinerary" in agent.writer_prompt
         assert "ITINERARY JSON" in agent.writer_prompt
-        # No handoff: the visitor is choosing a holiday, not hailing a cab.
+
+    @pytest.mark.asyncio
+    async def test_a_visitor_is_handed_to_the_outstation_booking_screen(self, agent):
+        """The plan is worth nothing until somebody drives them to it, so the arrival
+        transfer gets the same Book Now card a resident's cab does — routed by the
+        journey's length to the screen that prices an intercity transfer."""
+        final = await agent.turn(
+            "Delhi to Manali, 4 of us, 3 days, next week",
+            intent="plan_trip",
+            persona="outstation",
+            rider_jwt="rider-token",
+            fare_response=LOCAL_FARE_RESPONSE,
+            extraction=dict(
+                destination="Manali", origin="Delhi", group_size=4, duration_days=3,
+                travel_dates="next week", origin_in_himachal=False,
+            ),
+        )
+
+        handoff = next(e for e in final["structured_events"] if e["type"] == "booking_handoff")
+        payload = handoff["payload"]
+
+        assert payload["origin"]["name"] == "Delhi"
+        assert payload["destination"]["name"] == "Manali"
+        for end in ("origin", "destination"):
+            assert payload[end]["lat"] and payload[end]["lon"], f"{end} has no map pin"
+        # 500+ km — the app must open its outstation screen, not the local one.
+        assert payload["trip_type"] == "OUTSTATION"
+        assert payload["passengers"] == 4
+        # …and the reply says so rather than asking them to type it all again.
+        assert "pickup and drop are already filled in" in agent.writer_prompt
+
+    @pytest.mark.asyncio
+    async def test_a_visitor_with_no_starting_city_gets_no_card(self, agent):
+        """Half a journey is not a booking screen: with no pickup there is nothing to
+        open on, so the itinerary ships without the card rather than with a blank one."""
+        final = await agent.turn(
+            "3 days in Manali for 4 of us next week",
+            intent="plan_trip",
+            persona="outstation",
+            rider_jwt="rider-token",
+            fare_response=LOCAL_FARE_RESPONSE,
+            extraction=dict(
+                destination="Manali", group_size=4, duration_days=3,
+                travel_dates="next week", origin_in_himachal=False,
+                user_wants_to_proceed_now=True,
+            ),
+        )
+
         assert "booking_handoff" not in _event_types(final)
+        assert "pickup and drop are already filled in" not in agent.writer_prompt
 
     @pytest.mark.asyncio
     async def test_a_visitor_is_also_spared_the_oversized_cab(self, agent):
