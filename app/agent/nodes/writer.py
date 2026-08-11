@@ -371,6 +371,17 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
     names again — re-resolving "Kasol" in the app could easily land somewhere other
     than the point this fare was priced on.
 
+    `trip_type` is the rate card the fare was quoted on, decided by the journey's
+    length rather than by the persona that was talking (see
+    `quote_builder.classify_trip_type`). The app reads it to keep a short hop out of
+    its outstation booking screen, which refuses anything inside one state and under
+    200 km — so a visitor asking about two Manali suburbs is not sent to a "Confirm
+    Route" button that cannot be pressed.
+
+    None whenever the journey is unknown: with no route there is no pickup, no drop
+    and nothing for the booking screen to open on. That is the whole gate — an
+    outstation visitor who never named a starting city simply gets no card.
+
     This is a handoff, not a booking: nothing here reserves a cab or takes payment.
     The app owns that flow, which is why the reply is told to announce the screen
     rather than ask the rider to confirm anything.
@@ -481,12 +492,22 @@ def _build_followup_instruction(state: AgentState, reply_language: str) -> str:
         if not state.entities.return_journey_preference
         else ""
     )
+    # A known route means a booking_handoff ships with this reply (see
+    # `_build_booking_handoff`), so the app is drawing a Book Now button underneath it
+    # with both ends already filled in. Saying so is the difference between a button
+    # the rider trusts and one they wonder what it will ask them for.
+    handoff_note = (
+        " In the same line, tell them their pickup and drop are already filled in on "
+        "the booking screen, and do not ask them to enter either again."
+        if state.route_estimate is not None
+        else ""
+    )
     return (
         f"End with ONE short, warm question that moves toward a booking — which cab "
         f"category they prefer, or whether to book their Him Cab to {destination} now."
-        f"{extra} Do NOT ask for trip details (dates, number of days, group size, "
-        f"starting city) here: you already have them, or you have stated your "
-        f"assumption at the top. Write it in {reply_language}."
+        f"{extra}{handoff_note} Do NOT ask for trip details (dates, number of days, "
+        f"group size, starting city) here: you already have them, or you have stated "
+        f"your assumption at the top. Write it in {reply_language}."
     )
 
 
@@ -1097,11 +1118,16 @@ async def writer_node(state: AgentState) -> dict:
                 },
             })
 
-        # Hand a local rider straight to the booking screen, with both endpoints and
-        # their coordinates so the map opens on the journey we just priced. This is a
-        # handoff, not a booking — nothing is reserved here, which is why the reply
-        # announces the screen rather than asking them to confirm.
-        if mode == slots.RIDE_MODE:
+        # Hand the rider straight to the booking screen, with both endpoints and their
+        # coordinates so the map opens on the journey we just priced. Both travelling
+        # personas get it: a local is hailing the cab now, and a visitor's itinerary is
+        # of no use to them until somebody drives them to it — the arrival transfer is
+        # the one thing every outstation plan needs booked. A question about a place
+        # (ANSWER_MODE) is not a journey, so it gets nothing.
+        #
+        # This is a handoff, not a booking — nothing is reserved here, which is why the
+        # reply announces the screen rather than asking them to confirm.
+        if mode in (slots.RIDE_MODE, slots.ITINERARY_MODE):
             handoff = _build_booking_handoff(state)
             if handoff:
                 structured_events.append({

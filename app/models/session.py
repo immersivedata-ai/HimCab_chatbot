@@ -236,9 +236,15 @@ class StructuredEvent(BaseModel):
                            drop both pins without geocoding again; plus distance_km,
                            duration_text, passengers, travel_dates, the
                            recommended_category_id to preselect and, when one applies,
-                           offer_id / coupon_code to prefill. Sent to LOCAL riders once
-                           a route is known. Nothing is reserved — the app owns the
-                           booking, and the reply never asks the rider to confirm.
+                           offer_id / coupon_code to prefill. `trip_type` is the rate
+                           card it was priced on — "OUTSTATION" for an intercity
+                           transfer, "LOCAL" for a short run — decided by the
+                           journey's length, never by the persona; use it to pick the
+                           booking screen the journey will actually be accepted on.
+                           Sent to both LOCAL and OUTSTATION riders once a route is
+                           known; absent when the pickup was never established.
+                           Nothing is reserved — the app owns the booking, and the
+                           reply never asks the rider to confirm.
 
     Zero or more events accompany any reply; clarification turns carry none.
     """
