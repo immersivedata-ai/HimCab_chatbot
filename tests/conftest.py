@@ -126,7 +126,23 @@ def no_network(monkeypatch):
         "app.agent.nodes.tool_executor.get_offers_service", lambda: offers, raising=False
     )
 
-    yield {"geocoder": geocoder, "router": router, "offers": offers}
+    # The rental rate card lives on the same backend. A fresh instance per test, so the
+    # package cache cannot leak a rate card from one test into the next.
+    from app.services.himcab import rental_service as rental_module
+
+    rental = rental_module.RentalService()
+    rental._get = AsyncMock(return_value={"data": []})
+    monkeypatch.setattr(rental_module, "get_rental_service", lambda: rental)
+    monkeypatch.setattr(
+        "app.agent.nodes.tool_executor.get_rental_service", lambda: rental, raising=False
+    )
+
+    yield {
+        "geocoder": geocoder,
+        "router": router,
+        "offers": offers,
+        "rental": rental,
+    }
 
 
 # ── Agent State Fixtures ──────────────────────────────────────────────────────

@@ -6,13 +6,10 @@ Configures middleware, mounts routers, sets up lifespan events.
 """
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -68,6 +65,51 @@ async def lifespan(app: FastAPI):
     log.info("app_shutdown_complete")
 
 
+# ── OpenAPI tag metadata ──────────────────────────────────────────────────────
+# Each tag is a section in Swagger UI, and its `name` is the anchor an integrator can
+# be sent straight to: /docs#/Rental. Keep the names stable — a renamed tag silently
+# breaks every deep link already shared with another team.
+_RENTAL_TAG_DESCRIPTION = """**Car and driver by the hour.**
+
+The rider picks a pickup point and one of the hourly packages configured in the rate
+card (`GET /api/rider/fare/get-all`), and the assistant quotes it from
+`POST /fare/estimate`. No price is ever computed in this service.
+
+Send `Authorization: Bearer <Him Cab rider JWT>` on every call. There is no rider id
+or session to pass — the token resolves the conversation, so multi-turn context works
+with no client state. `/start` is optional: `/stream` and `/message` create the
+conversation on demand, so they never 404 with a session the client has to recover
+from.
+
+Unlike `/local` and `/outstation`, a rental is a service the RIDER chose. A GPS fix
+here sets the pickup point and the reply language; it never reroutes the persona.
+
+`/stream` is Server-Sent Events — `token`, `structured`, `done`, `error`. The
+`structured` types a rental turn can emit are `rental_packages`, `cab_fare`, `offers`,
+`booking_handoff`, `weather_alert` and `request_cancelled`. Ignore any type you do not
+recognise. `request_cancelled` is the one to ACT on: dismiss the booking sheet and
+clear the fare cards, because what they describe no longer exists.
+
+Rate limit: 30 requests/minute per rider, then HTTP 429 with a `Retry-After` header.
+"""
+
+OPENAPI_TAGS = [
+    {"name": "Rental", "description": _RENTAL_TAG_DESCRIPTION},
+    {
+        "name": "Chat",
+        "description": (
+            "The Himachal-local and visiting-tourist assistants, plus "
+            "`POST /v1/chat/route`, which reads a GPS fix and says which of the two "
+            "to use."
+        ),
+    },
+    {"name": "Session", "description": "Trip session records behind a conversation."},
+    {"name": "Alerts", "description": "Weather and snowfall advisories."},
+    {"name": "User", "description": "Rider profile and preferences."},
+    {"name": "Health", "description": "Readiness/liveness probe for Cloud Run."},
+]
+
+
 # ── App Factory ───────────────────────────────────────────────────────────────
 
 def create_app() -> FastAPI:
@@ -80,6 +122,7 @@ def create_app() -> FastAPI:
             "Plan Himachal Pradesh trips, get itineraries, weather alerts, and cab packages via AI."
         ),
         version="1.0.0",
+        openapi_tags=OPENAPI_TAGS,
         docs_url="/docs" if not settings.is_production else None,
         redoc_url="/redoc" if not settings.is_production else None,
         lifespan=lifespan,
@@ -115,19 +158,21 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(api_router)
 
-    # ── Frontend (test UI) ────────────────────────────────────────────────────
-    frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
-    if frontend_dir.is_dir():
-        app.mount("/frontend", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
-
-        @app.get("/", include_in_schema=False)
-        async def root_redirect():
-            return FileResponse(str(frontend_dir / "index.html"))
-
-        @app.get("/local", include_in_schema=False)
-        async def local_ui():
-            """Local HP resident travel assistant UI."""
-            return FileResponse(str(frontend_dir / "local.html"))
+    # ── Root ──────────────────────────────────────────────────────────────────
+    # This service is an API and nothing else. It used to also serve the browser test
+    # clients (/, /local, /rental) out of frontend/; those are gone from the image so
+    # that the deployed URL is exactly the contract an integrator reads — no page that
+    # looks like the product, no second copy of the flow to keep in step with it.
+    # Test locally against the API itself, or against /docs.
+    @app.get("/", include_in_schema=False)
+    async def root():
+        """Signpost, so the base URL is not a bare 404 for whoever opens it."""
+        return {
+            "service": "Him Cab — AI Tourist Travel Assistant",
+            "version": "1.0.0",
+            "docs": "/docs" if not settings.is_production else None,
+            "health": "/v1/health",
+        }
 
     return app
 

@@ -215,6 +215,37 @@ class Journey:
         }
 
 
+async def resolve_pickup(
+    *,
+    origin_name: Optional[str] = None,
+    origin_fix: Optional[LocationFix] = None,
+) -> Optional[dict]:
+    """Just the pickup point — `{name, lat, lon}` — for a hire that has no drop.
+
+    A car rented by the hour has no destination, so `resolve_journey` has nothing to
+    measure; the booking screen still needs somewhere to open its map. Same precedence
+    as a journey's origin, for the same reason: the device's fix is where the cab
+    actually goes, and the named city is the fallback.
+
+    None when neither can be placed. The handoff then carries the pickup by name alone
+    and the app geocodes it — worse than a pin, better than no handoff.
+    """
+    if origin_fix is not None:
+        return {
+            "name": origin_fix.place_name or origin_name or "Your location",
+            "lat": origin_fix.lat,
+            "lon": origin_fix.lon,
+        }
+    if not origin_name:
+        return None
+
+    place = await get_geocoding_service().geocode(origin_name)
+    if place is None:
+        log.info("pickup_unresolved", origin=origin_name)
+        return None
+    return {"name": place.name, "lat": place.lat, "lon": place.lon}
+
+
 async def resolve_journey(
     destination: str,
     *,

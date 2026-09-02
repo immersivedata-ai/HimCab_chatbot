@@ -14,8 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.logging import get_logger
+from app.core.enums import TripType
 from app.models.session import ExtractedEntities
 from app.services.geo import Journey
+from app.services.himcab.rental_service import RentalPackage
 from app.services.himcab.models import FareCategoryFare, FareQuoteInput
 
 log = get_logger(__name__)
@@ -46,7 +48,7 @@ _DEFAULT_PREF = ["standard", "economy"]
 _LOCAL_TRIP_MAX_KM = 40.0
 
 
-def classify_trip_type(distance_km: Optional[float]) -> str:
+def classify_trip_type(distance_km: Optional[float]) -> TripType:
     """LOCAL or OUTSTATION, decided by the JOURNEY — not by who is travelling.
 
     This used to be `"LOCAL" if visitor_type == "local"`, which is a different
@@ -55,8 +57,10 @@ def classify_trip_type(distance_km: Optional[float]) -> str:
     nothing to do with the trip they asked about.
     """
     if distance_km is None:
-        return "OUTSTATION"
-    return "LOCAL" if distance_km <= _LOCAL_TRIP_MAX_KM else "OUTSTATION"
+        return TripType.OUTSTATION
+    return (
+        TripType.LOCAL if distance_km <= _LOCAL_TRIP_MAX_KM else TripType.OUTSTATION
+    )
 
 
 def build_fare_quote_input(
@@ -87,6 +91,57 @@ def build_fare_quote_input(
         group_size=entities.group_size,
         budget_range=entities.budget_range.value if entities.budget_range else None,
     )
+
+
+def build_rental_quote_input(
+    entities: ExtractedEntities,
+    package: Optional[RentalPackage] = None,
+    booking_time: Optional[str] = None,
+) -> Optional[FareQuoteInput]:
+    """Build the estimate input for a car hired by the hour, or None if we cannot.
+
+    A rental has no destination — that is the point of hiring by the hour — so there is
+    no route to measure. What the endpoint still needs is a distance, and the honest one
+    is the package's INCLUDED kilometres, straight off the rate card: that is the
+    distance the package is sold on, and the backend prices anything beyond it at
+    booking against the odometer (`TripService.calculateTotalFareForRental`).
+
+    Returns None without a duration, because `rentHours` is matched exactly against a
+    rental chart and a quote without one is not a rental quote at all.
+    """
+    hours = entities.rental_hours
+    if not hours:
+        return None
+
+    return FareQuoteInput(
+        # The pickup is where the car comes to them; a rental has no drop.
+        origin=entities.origin or entities.home_city or "",
+        destination="",
+        distance_km=package.included_km if package else None,
+        trip_type=TripType.RENTAL,
+        rent_hours=hours,
+        # The hour the CAR ARRIVES, not the hour the rider is typing. The backend reads
+        # this as `bookingTime` and applies the night rate from it (`isNightTime`), so a
+        # 6 a.m. pickup arranged at 10 p.m. was being priced as a night run — and then
+        # charged the day rate at booking. Falls back to now only when they never said.
+        booking_time=booking_time or entities.pickup_time or current_booking_time(),
+        group_size=entities.group_size,
+        budget_range=entities.budget_range.value if entities.budget_range else None,
+    )
+
+
+def matching_package(
+    packages: list[RentalPackage], hours: Optional[int]
+) -> Optional[RentalPackage]:
+    """The package for these hours, or None when the rate card has no such block.
+
+    Exact, because the backend is exact: `findMatchingRentalChart` compares
+    `rentHours == chart.getMaxHour()`. Returning the nearest package instead would
+    quote a rider for four hours when they asked for five.
+    """
+    if not hours:
+        return None
+    return next((p for p in packages if p.hours == hours), None)
 
 
 def select_headline_category(

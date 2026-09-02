@@ -57,6 +57,20 @@ class ExtractedEntities(BaseModel):
     visitor_type: Optional[str] = None  # "outstation" | "local" | None
     return_journey_preference: Optional[str] = None  # "same_cab_return" | "own_arrangement" | None — outstation only
     home_city: Optional[str] = None  # For local visitors — their base city within HP
+    #: Hours the rider wants the car for (rental flow only). Matched EXACTLY against a
+    #: package on the rate card — see app/services/himcab/rental_service.py.
+    rental_hours: Optional[int] = None
+    #: What time the cab should arrive, normalised to "HH:mm" (24-hour). NOT the same
+    #: question as `travel_dates`, which is only the day: the backend reads a clock time
+    #: as `bookingTime` and applies the night rate from it, so a 6 a.m. pickup asked for
+    #: at 10 p.m. was being priced on the hour the rider happened to be typing.
+    pickup_time: Optional[str] = None
+    #: Which cab the rider chose, as a lower-case tier word ("luxury", "mini bus") —
+    #: the chat equivalent of the app's "Select Rental Cab" radio group. Matched against
+    #: the categories the fare endpoint actually priced (tool_executor), never trusted
+    #: on its own: a tier we cannot find in the quote is told to the rider rather than
+    #: booked.
+    cab_category: Optional[str] = None
 
     # ── Conversation control (not trip facts) ────────────────────────────────
     # Persisted alongside the entities because the planner's decision on the next
@@ -204,6 +218,8 @@ class StructuredEventType(str, Enum):
     CAB_FARE = "cab_fare"
     OFFERS = "offers"
     BOOKING_HANDOFF = "booking_handoff"
+    RENTAL_PACKAGES = "rental_packages"
+    REQUEST_CANCELLED = "request_cancelled"
 
 
 class StructuredEvent(BaseModel):
@@ -217,11 +233,16 @@ class StructuredEvent(BaseModel):
       - `snowfall_alert` → {risk: "high"|"critical", message, ...}
       - `cab_fare`       → Him Cab quote: {options[], category_name, fare_inr,
                            vehicle_label, seat_capacity, trip_type, distance_km,
-                           duration_text, source,
+                           duration_text, source, selected_by_rider,
                            best_offer, fare_after_offer_inr}. `options` is already
                            narrowed to cabs that seat the party. `is_approximate` is
                            true when the route distance was computed rather than
                            surveyed — render the price as "approx" in that case.
+                           On a RENTAL, `options` is the "Select Rental Cab" list:
+                           render it as a radio group and send the rider's pick back as
+                           its `category_name`. `selected_by_rider` is true once they
+                           have picked one, and `fare_inr` / `category_name` are then
+                           THEIR cab rather than our recommendation.
 
       - `offers`         → live Him Cab coupons that apply to this trip:
                            {trip_type, fare_inr, offers: [{offer_id, coupon_code,
@@ -231,6 +252,30 @@ class StructuredEvent(BaseModel):
                            type, the live date window and the quoted fare, best saving
                            first. Absent when the rider has no applicable coupon —
                            never a placeholder or an empty card.
+      - `rental_packages`→ the hourly blocks the rider may choose from, RENTAL chats
+                           only: {packages: [{hours, included_km, label,
+                           from_rate_card}]}, shortest first. Render them as taps: the
+                           backend matches a rental duration exactly, so a typed answer
+                           that is not one of these cannot be priced. The list is the
+                           rate card narrowed to the durations the product sells (min 3,
+                           max 8 hours); when the rate card cannot be read at all it is
+                           the configured durations instead, flagged
+                           `from_rate_card: false` — still choosable and still priceable,
+                           but with `included_km: null`, so show no distance allowance
+                           for one. Sent both when the duration is ASKED for and when it
+                           is quoted, so the list is never stale on screen.
+      - `request_cancelled`→ the rider called it off: {scope, dismiss_booking_screen,
+                           cleared_fields[], open_screen}. ACT ON IT: dismiss any
+                           booking sheet a previous `booking_handoff` opened, and clear
+                           the fare/package cards for this conversation — the request
+                           they describe no longer exists. `scope` is "request" (this
+                           chat's request, now dropped), "booked_trip" (they mean a cab
+                           already booked in the app) or "unclear" (either — the reply
+                           covers both). `open_screen` is "trips" when they need the
+                           app's own cancellation flow, else null. Nothing is cancelled
+                           on the backend by this event: a confirmed booking is
+                           cancelled only from the Trips screen, which is what notifies
+                           the driver.
       - `booking_handoff`→ open the booking screen on this journey. `origin` and
                            `destination` each carry {name, lat, lon} so the map can
                            drop both pins without geocoding again; plus distance_km,
@@ -322,6 +367,17 @@ class StartChatResponse(BaseModel):
         )
     )
     location: Optional[ResolvedLocation] = None
+    structured_events: list[StructuredEvent] = Field(
+        default_factory=list,
+        description=(
+            "Cards to render alongside the greeting, same shapes as on a normal turn. "
+            "Only `/rental/start` sends any today: a `rental_packages` event, because "
+            "the greeting asks for a duration and the backend matches durations "
+            "exactly — the rider should be able to tap one rather than guess. Empty "
+            "everywhere else; handle it with the same code that handles a turn's "
+            "events."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):

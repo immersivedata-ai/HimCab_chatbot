@@ -18,7 +18,9 @@ graphify-out/
 .benchmarks/
 .agents/
 
-# ── Frontend (test UI — served locally only, not part of the API deployment) ──
+# The browser test clients are NOT deployed. The service is an API only; the pages are
+# kept in the repo for local poking (open the file, point it at http://localhost:8000)
+# and are excluded from the image so the deployed URL is nothing but the contract.
 frontend/
 
 # ── IDE ───────────────────────────────────────────────────────────────────────

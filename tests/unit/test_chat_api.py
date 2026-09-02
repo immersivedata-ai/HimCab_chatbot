@@ -230,6 +230,66 @@ class TestStart:
         session_id = client.post("/v1/chat/outstation/start", headers=AUTH).json()["session_id"]
         assert sessions.sessions[session_id].entities.visitor_type == "outstation"
 
+    def test_rental_start_offers_the_rate_cards_packages(self, api, no_network):
+        """The rental greeting asks for a duration, and the backend matches durations
+        exactly — so /start ships the bookable ones with it, for the app to render as
+        taps rather than have the rider guess a number."""
+        no_network["rental"]._get.return_value = {"data": [
+            {"categoryId": 1, "name": "Economy", "rentalChartList": [
+                {"maxHour": 4, "maxKilometer": 40},
+                {"maxHour": 8, "maxKilometer": 80},
+            ]},
+        ]}
+        client, _, _, _ = api
+        # A real rider token: the rate card is rider-authenticated, and the dev token
+        # deliberately carries no JWT so dev mode never reaches the Him Cab backend.
+        rider = {"Authorization": f"Bearer {_fake_jwt({'riderId': 4242})}"}
+        body = client.post("/v1/chat/rental/start", headers=rider).json()
+
+        assert body["persona"] == "rental"
+        assert "8 hrs / 80 km" in body["message"]
+        assert [e["type"] for e in body["structured_events"]] == ["rental_packages"]
+        packages = body["structured_events"][0]["payload"]["packages"]
+        assert [p["hours"] for p in packages] == [4, 8]
+
+    def test_an_unreachable_rate_card_still_offers_the_configured_durations(self, api):
+        """The rate card is the Him Cab backend. If it is down the rider is still offered
+        the durations the product sells (3/5/8 hrs) rather than an open question they can
+        only answer wrongly — the price is what is lost, not the choice."""
+        client, _, _, _ = api
+        rider = {"Authorization": f"Bearer {_fake_jwt({'riderId': 4242})}"}
+        body = client.post("/v1/chat/rental/start", headers=rider).json()
+
+        assert "3 hrs" in body["message"] and "8 hrs" in body["message"]
+        packages = body["structured_events"][0]["payload"]["packages"]
+        assert [p["hours"] for p in packages] == [3, 5, 8]
+        # Flagged, so the app never draws a price next to one of these.
+        assert not any(p["from_rate_card"] for p in packages)
+
+    def test_the_dev_token_gets_no_packages_and_therefore_no_prices(self, api, no_network):
+        """The commonest reason a test page shows no rental price. `dev-test-token`
+        resolves to jwt=None by design, and both the rate card and the fare endpoint are
+        rider-authenticated — so there is nothing to quote. The rider is still offered
+        the configured durations, unpriced, and the backend is never called without a
+        credential."""
+        no_network["rental"]._get.return_value = {"data": [
+            {"categoryId": 1, "name": "Economy",
+             "rentalChartList": [{"maxHour": 8, "maxKilometer": 80}]},
+        ]}
+        client, _, _, _ = api
+        body = client.post("/v1/chat/rental/start", headers=AUTH).json()
+
+        packages = body["structured_events"][0]["payload"]["packages"]
+        assert [p["hours"] for p in packages] == [3, 5, 8]
+        assert not any(p["from_rate_card"] or p["included_km"] for p in packages)
+        no_network["rental"]._get.assert_not_awaited()
+
+    def test_the_other_personas_ship_no_events_with_their_greeting(self, api):
+        client, _, _, _ = api
+        for persona in ("local", "outstation"):
+            body = client.post(f"/v1/chat/{persona}/start", headers=AUTH).json()
+            assert body["structured_events"] == []
+
     def test_reopening_the_dialog_starts_a_fresh_conversation(self, api):
         client, sessions, _, _ = api
         first = client.post("/v1/chat/local/start", headers=AUTH).json()["session_id"]
@@ -711,7 +771,7 @@ class TestResponsePayload:
 
         assert {t.value for t in StructuredEventType} == {
             "itinerary", "weather_alert", "snowfall_alert", "cab_fare", "offers",
-            "booking_handoff",
+            "booking_handoff", "rental_packages", "request_cancelled",
         }
 
     def test_rate_limit_returns_429_with_retry_after(self, api):

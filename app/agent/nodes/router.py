@@ -24,8 +24,10 @@ import asyncio
 import json
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agent.cancellation import looks_like_cancellation
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.enums import Intent
 from app.core.logging import get_logger
 from app.prompts.builder import build_router_prompt
 from app.services.vertex_ai import get_vertex_ai_service
@@ -63,6 +65,27 @@ async def router_node(state: AgentState) -> dict:
             "node_trace": ["router"],
         }
 
+    # ── Calling it off, decided in code ───────────────────────────────────────
+    # Before the model, and not overridable by it. A rider who says "cancel" has said
+    # the one thing this system must never get creatively wrong, and everything
+    # downstream keys off this intent: the graph skips straight to `cancel_node`, so
+    # the extraction LLM never runs, the slot parsers never read "cancel" as an answer
+    # to the question in flight, and no tool is called for a request that is over.
+    # The classifier still gets its say for phrasings this list does not cover — see
+    # the CANCEL rules in the router prompt.
+    if looks_like_cancellation(latest_message):
+        log.info(
+            "cancellation_detected",
+            source="phrases",
+            asked_about=state.entities.last_asked_field,
+            session_id=state.session_id,
+        )
+        return {
+            "intent": Intent.CANCEL_REQUEST,
+            "language": state.language,
+            "node_trace": ["router"],
+        }
+
     try:
         llm = get_vertex_ai_service().get_flash_model(streaming=False)
         response = await asyncio.wait_for(
@@ -83,6 +106,17 @@ async def router_node(state: AgentState) -> dict:
         intent = result.get("intent", "general_query")
         detected_language = result.get("language", "en")
         confidence = result.get("confidence", 0.5)
+
+        # A cancellation the phrase list missed. Logged separately from the code path
+        # so the two detectors can be compared: a rise here is a phrase worth adding,
+        # and a rise there is the classifier drifting.
+        if intent == Intent.CANCEL_REQUEST:
+            log.info(
+                "cancellation_detected",
+                source="classifier",
+                asked_about=state.entities.last_asked_field,
+                session_id=state.session_id,
+            )
 
         # A bare reply to our own question ("delhi", "5") carries no signal of its own,
         # so the classifier drops it into general_query — which would answer it as an

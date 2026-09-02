@@ -78,8 +78,27 @@ class Settings(BaseSettings):
     # java_backend_url (or JAVA_BACKEND_URL env) at the fare host / API gateway.
     enable_real_fares: bool = True            # Feature flag; True = fetch real Him Cab fares
     himcab_fare_path: str = "/api/rider/fare/estimate"            # per-category fare estimate
-    himcab_fare_getall_path: str = "/api/rider/fare/get-all"      # rate-card catalog (Phase 2)
+    himcab_fare_getall_path: str = "/api/rider/fare/get-all"      # rate card, incl. rental packages
     himcab_fare_timeout_seconds: float = 10.0
+
+    # ── Him Cab rentals (car by the hour, same Spring backend) ────────────────
+    enable_rentals: bool = True                # Feature flag; False = no rental route
+    #: The rate card changes rarely and every rental turn needs it, so it is held
+    #: briefly rather than re-fetched per message. Packages themselves are NEVER
+    #: stored in this repo — see app/services/himcab/rental_service.py.
+    rental_packages_cache_ttl_seconds: int = 3_600      # 1 h
+    #: The durations the rental PRODUCT sells, as the app's Rent a Car screen states
+    #: them: "you can rent a car for max 8hrs and min 3hrs for the day". The rate card
+    #: is still the source of truth for what can be PRICED — these three only decide
+    #: what the rider is offered, and are what the assistant falls back to when the
+    #: rate card cannot be read (a duration from product config beats an open question
+    #: the rider can only answer wrongly). Env: RENTAL_HOUR_OPTIONS="3,5,8".
+    rental_hour_options: list[int] = Field(default=[3, 5, 8])
+    #: The bookable window. A rental chart outside it is NOT offered even when the rate
+    #: card defines one — a 12-hour chart left in the backend must not reappear as a
+    #: chip on a screen that says the maximum is 8.
+    rental_min_hours: int = 3
+    rental_max_hours: int = 8
 
     # ── Him Cab offers (real coupons, same Spring backend) ────────────────────
     # The assistant quotes ONLY these — see app/services/himcab/offers_service.py for
@@ -125,6 +144,19 @@ class Settings(BaseSettings):
             import json
             return json.loads(v)
         return v
+
+    @field_validator("rental_hour_options", mode="before")
+    @classmethod
+    def parse_rental_hours(cls, v: str | list) -> list[int]:
+        """Accept "3,5,8" as well as a JSON list, and always hand back it sorted.
+
+        The order IS the order the rider sees the options in, so it is normalised here
+        rather than left to whoever set the env var.
+        """
+        if isinstance(v, str):
+            v = [part for part in v.replace("[", "").replace("]", "").split(",")]
+        hours = {int(str(h).strip()) for h in v if str(h).strip()}
+        return sorted(h for h in hours if h > 0)
 
 
 @lru_cache(maxsize=1)

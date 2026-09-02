@@ -16,12 +16,20 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.core.config import settings
+from app.core.enums import TripType
 from app.core.logging import get_logger
 from app.services.himcab.models import FareCategoryFare, FareQuote, FareQuoteInput
 from app.services.himcab.quote_builder import select_headline_category
 from app.services.himcab.vehicles import select_cabs_for_group
 
 log = get_logger(__name__)
+
+#: How many cabs a reply may put in front of the rider. Three is a recommendation; a
+#: rental is a CHOICE — the app's Rent a Car screen lists every cab and will not book
+#: until one is selected, so trimming the list here would hide a cab the rider is
+#: entitled to pick and then tell them it was not available.
+_MAX_OPTIONS = 3
+_MAX_RENTAL_OPTIONS = 6
 
 
 class _RetryableFareError(Exception):
@@ -156,7 +164,13 @@ class FareService:
         # Narrowing here means the app, the prompt and the headline all see the same
         # short list — nothing downstream can reintroduce a minibus for four people.
         priced = self._extract_categories(rows)
-        options = select_cabs_for_group(priced, q.group_size)
+        options = select_cabs_for_group(
+            priced,
+            q.group_size,
+            max_options=(
+                _MAX_RENTAL_OPTIONS if q.trip_type == TripType.RENTAL else _MAX_OPTIONS
+            ),
+        )
         headline = select_headline_category(options, q.group_size, q.budget_range)
 
         if headline is None:

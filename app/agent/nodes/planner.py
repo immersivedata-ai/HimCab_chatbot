@@ -42,12 +42,18 @@ from app.core.logging import get_logger
 from app.models.itinerary import BudgetRange, GroupType
 from app.models.session import ExtractedEntities
 from app.services import geo
+from app.services.himcab import available_packages, offered_hours
 from app.services.vertex_ai import get_vertex_ai_service
 
 log = get_logger(__name__)
 
-LOCAL = "local"
-OUTSTATION = "outstation"
+# Aliases onto app/core/enums.Persona, via slots — one set of objects for the whole
+# system, so a persona compare here cannot disagree with one in chat_session.
+LOCAL = slots.LOCAL
+OUTSTATION = slots.OUTSTATION
+#: Hiring a car by the hour. Not a kind of person, so `classify_visitor_type` never
+#: reclassifies it — see the note there.
+RENTAL = slots.RENTAL
 
 # Bare greetings, recognised so "hi" costs no LLM call. Matched on the whole
 # message after punctuation is stripped — never on a substring, so "hi, plan
@@ -73,26 +79,60 @@ _PROCEED_PHRASES = (
 async def classify_visitor_type(
     origin: Optional[str],
     origin_in_himachal: Optional[bool] = None,
+    *,
+    home_city: Optional[str] = None,
+    current: Optional[str] = None,
 ) -> Optional[str]:
-    """Classify the traveller from their starting city.
+    """Decide whether this rider is a Himachal resident or a visitor.
 
-    `origin_in_himachal` is the extraction model's geography call and wins when it is
-    available, because it costs nothing — it came back with the extraction. Otherwise
-    the city is geocoded and the provider's administrative state decides, which is the
-    same source that prices the route, so a town is never known to one and unknown to
-    the other.
+    The evidence is asymmetric, and treating it symmetrically was a bug:
 
-    Returns None when there is no origin, or when neither source can place it, so the
-    caller keeps whatever classification it already had rather than guessing.
+      • an origin OUTSIDE Himachal is strong evidence of a visitor. Nobody drives in
+        from Delhi and needs to be told about their own state.
+      • an origin INSIDE Himachal proves nothing on its own. It fits a resident, and
+        it equally fits a tourist who is already here — someone in Manali asking to
+        go on to Kasol. Reading it as residence flipped English-speaking visitors to
+        the local persona the moment they named their starting city, which switched
+        them to Hindi and replaced their itinerary with a cab quote.
+
+    So residence has to be stated, not inferred: `home_city` is where they LIVE (the
+    extractor only fills it for a Himachal town), while `origin` is merely where this
+    journey starts. An in-state origin leaves `current` untouched.
+
+    Returns None when there is no evidence either way, so the caller keeps whatever
+    classification it already had rather than guessing.
     """
+    # A rental is a SERVICE the rider chose, not a guess about who they are, so no
+    # amount of geography cancels it. Rentals are picked up from anywhere — Delhi,
+    # Chandigarh, Ambala — and reading that pickup as "a visitor" turned the hire into
+    # a holiday: the rider was asked where they wanted to go and for how many days,
+    # and got an itinerary instead of a car. They leave this flow by opening a
+    # different tab, never by naming a city.
+    if current == RENTAL:
+        return RENTAL
+
+    # Residence beats everything, including an origin somewhere else — a Shimla
+    # resident flying out of Delhi is still a local.
+    if home_city and await geo.place_in_himachal(home_city):
+        return LOCAL
+
     if not origin:
         return None
-    if origin_in_himachal is not None:
-        return LOCAL if origin_in_himachal else OUTSTATION
-    in_himachal = await geo.place_in_himachal(origin)
+
+    in_himachal = (
+        origin_in_himachal
+        if origin_in_himachal is not None
+        else await geo.place_in_himachal(origin)
+    )
     if in_himachal is None:
         return None
-    return LOCAL if in_himachal else OUTSTATION
+    if not in_himachal:
+        return OUTSTATION
+
+    # In-state origin: consistent with a resident AND with a visitor already here.
+    # Not enough on its own — keep what we had (the GPS fix or the front end they
+    # opened), and let them say "I live in Manali" if they want to be treated as one.
+    return current
 
 
 class PlannerExtraction(BaseModel):
@@ -114,6 +154,24 @@ class PlannerExtraction(BaseModel):
     special_requirements: list[str] = Field(default_factory=list)
     return_journey_preference: Optional[str] = None
     home_city: Optional[str] = None
+    rental_hours: Optional[int] = Field(
+        default=None,
+        description="Hours the rider wants to hire a car for, if they said (rental flow).",
+    )
+    pickup_time: Optional[str] = Field(
+        default=None,
+        description=(
+            'The clock time the cab should arrive, as "HH:mm" on the 24-hour clock. '
+            'Only from an actual time the user gave. Null for a vague "morning".'
+        ),
+    )
+    cab_category: Optional[str] = Field(
+        default=None,
+        description=(
+            "The cab tier the rider chose, lower-cased and nothing else "
+            '("luxury", "economy", "mini bus"). Only when they picked one.'
+        ),
+    )
     origin_in_himachal: Optional[bool] = Field(
         default=None,
         description="True if `origin` is a town inside Himachal Pradesh, False if outside, null if unknown.",
@@ -135,7 +193,7 @@ Extract these fields (null when the user has not stated them):
 - origin: the city they are starting from
 - origin_in_himachal: true if `origin` is a town/city inside Himachal Pradesh, false if
   it is outside (Delhi, Chandigarh, Mumbai, Amritsar, Dehradun...), null if no origin yet.
-  Use your own geography knowledge — this drives whether they are treated as a resident.
+  Use your own geography knowledge. This says where the JOURNEY starts, not who they are.
 - duration_days: integer, ONLY if the user gave a number of days (or a length like "a week")
 - travel_dates: their rough travel time, verbatim ("next week", "kal", "15 Jan")
 - group_type: one of [solo, couple, family, friends, corporate]
@@ -144,7 +202,22 @@ Extract these fields (null when the user has not stated them):
 - interests: things they said they want to do or see
 - special_requirements: constraints they stated (accessibility, dietary, pets...)
 - return_journey_preference: "booked" | "not_booked" | "own_arrangement" | null
-- home_city: their home city, if it is inside Himachal Pradesh
+- rental_hours: integer — hours they want to HIRE a car for, only in a rental
+  conversation and only if they gave a number ("8 hours", "aadha din" = 4, "full day"
+  = 8). This is a duration, never a distance and never a trip length in days.
+- cab_category: the cab tier they picked from a list you offered them ("standard",
+  "economy", "luxury", "mini bus", "premium"), lower-cased. Null unless they chose one.
+- pickup_time: the clock time the cab should ARRIVE, as "HH:mm" on the 24-hour clock.
+  "6 am" -> "06:00", "shaam 5 baje" -> "17:00", "18:30" -> "18:30", "subah 6" -> "06:00".
+  A DAY is not a time: "kal" and "tomorrow" are travel_dates, not this. Neither is a
+  vague part of the day — "morning", "subah" and "evening" with no hour are null here,
+  because the fare is calculated from this figure and a guessed hour changes the price.
+  A phrase can fill both: "kal subah 6 baje" is travel_dates="kal" and pickup_time="06:00".
+- home_city: where they LIVE, if that is inside Himachal Pradesh, and ONLY when they
+  have actually said so ("I'm from Kullu", "main Shimla mein rehta hoon", "we live in
+  Mandi"). This is the one field that marks somebody as a resident rather than a
+  visitor, so do NOT fill it from where their trip happens to start: a tourist saying
+  "I'm in Manali right now" is origin=Manali with home_city=null.
 - user_wants_to_proceed_now: true when the user asks you to stop asking and just produce
   the plan, says the choice is up to you, or says they do not know / it does not matter.
   Recognise this in ANY language or phrasing ("just make it", "bas bana do", "kuch bhi",
@@ -157,6 +230,17 @@ MERGING (the conversation is multi-turn):
   "Which city are you travelling from?" + "delhi" means origin = "Delhi".
 - Previously extracted values are given to you. Repeat them in your output. Never replace
   a known value with null, and never overwrite one unless the user has just changed it.
+
+A RENTAL CONVERSATION (the request says so above) IS NOT A TRIP:
+- The rider is hiring a car and a driver BY THE HOUR. They have no destination, no trip
+  length in days and no itinerary, and they are not expected to have one.
+- destination and duration_days are ALWAYS null here, however the message is phrased.
+  "A car for 8 hours around Manali" is rental_hours=8 with destination null — Manali is
+  where the car will be driven about, not a trip they asked you to plan.
+- A place they name is the PICKUP (`origin`) only when they said so: "from Shimla",
+  "pick me up in Kullu", "Mandi se". A place mentioned any other way fills nothing.
+- What matters is exactly what their booking screen asks for: the duration, the pickup
+  address, the date, the clock time and which cab. Nothing else.
 
 NEVER INVENT:
 - Every field the user has not stated is null. Not a plausible guess, not a common
@@ -194,6 +278,58 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
     )
 
 
+#: Trip-shaped fields that CANNOT exist in a rental conversation. The extraction model
+#: still reports them — "a car for 8 hours around Manali" reliably comes back with
+#: destination="Manali" — and every one of them then leaks somewhere it does not belong:
+#: into the writer's TRIP block, into the itinerary shortcut in `route_after_router`,
+#: into the profile's past-trip list in `persist`. Hiring a car by the hour means the
+#: rider has not chosen a destination and need not, so these are dropped at the door
+#: rather than guarded against one consumer at a time.
+_NOT_IN_A_RENTAL = ("destination", "duration_days", "return_journey_preference")
+
+
+def _strip_trip_fields(merged: dict, session_id: str) -> None:
+    """Remove trip-only facts from a rental conversation's entities (mutates)."""
+    dropped = [f for f in _NOT_IN_A_RENTAL if merged.get(f) is not None]
+    for field in dropped:
+        merged.pop(field, None)
+    if dropped:
+        log.info("rental_trip_fields_dropped", fields=dropped, session_id=session_id)
+
+
+async def _reject_unsold_duration(
+    merged: dict, rider_jwt: Optional[str], session_id: str
+) -> Optional[int]:
+    """Clear a rental duration Him Cab does not sell, returning what it was.
+
+    Asked and answered in the SAME turn, which is the whole point. The duration used to
+    be validated only where the fare is requested — after the pickup, the date, the time
+    and the headcount had all been collected — so a rider who opened with "6 hours" was
+    put through four more questions before being told the first answer had never been
+    usable. Clearing it here puts the duration question back in flight immediately, and
+    `clarify_node` names the packages in the same breath.
+
+    The offered list is TTL-cached in the rental service, so this costs a network call
+    once an hour rather than once a turn. An empty list means we cannot tell, and
+    nothing is rejected on a guess — the fare gate is still there as the backstop.
+    """
+    hours = merged.get("rental_hours")
+    if not hours:
+        return None
+    offered = await available_packages(rider_jwt)
+    if not offered or hours in offered_hours(offered):
+        return None
+
+    merged["rental_hours"] = None
+    log.info(
+        "rental_duration_rejected_early",
+        requested_hours=hours,
+        offered_hours=offered_hours(offered),
+        session_id=session_id,
+    )
+    return hours
+
+
 def _build_entities(merged: dict) -> ExtractedEntities:
     """Rebuild the entity bag from the merged dict, preserving conversation control.
 
@@ -214,6 +350,9 @@ def _build_entities(merged: dict) -> ExtractedEntities:
         visitor_type=merged.get("visitor_type"),
         return_journey_preference=merged.get("return_journey_preference"),
         home_city=merged.get("home_city"),
+        rental_hours=merged.get("rental_hours"),
+        pickup_time=merged.get("pickup_time"),
+        cab_category=merged.get("cab_category"),
         asked_counts=dict(merged.get("asked_counts") or {}),
         proceed_requested=bool(merged.get("proceed_requested")),
         no_progress_turns=int(merged.get("no_progress_turns") or 0),
@@ -230,11 +369,16 @@ def _resolve(
     entities: ExtractedEntities,
     visitor_type: Optional[str],
     lang_key: str,
+    unbookable_hours: Optional[int] = None,
 ) -> dict:
     """Apply the slot policy and package the node's return value.
 
     Shared by the LLM path and the LLM-failure path so a Vertex outage changes what
     the agent KNOWS, never how it BEHAVES.
+
+    `unbookable_hours` is a duration the rider asked for that Him Cab does not sell. It
+    travels on state so the question that goes back to them can NAME it — see
+    `graph.clarify_node`.
     """
     decision = slots.decide(
         entities,
@@ -258,6 +402,7 @@ def _resolve(
         "visitor_type": visitor_type,
         "last_asked_field": decision.ask_field,
         "assumed_fields": list(decision.assumed),
+        "unbookable_rental_hours": unbookable_hours,
         "node_trace": ["planner"],
     }
 
@@ -268,6 +413,11 @@ async def planner_node(state: AgentState) -> dict:
 
     lang_key, reply_language = detect_reply_language(state)
     latest_text = _latest_user_text(state)
+    # Hiring a car by the hour, decided by the SERVICE the rider opened rather than by
+    # this turn's intent — the router re-reads every message and calls half of a rental
+    # chat `plan_trip`. Two things hang off it: the trip-shaped fields are dropped, and
+    # the message is read for rental details in code as well as by the model.
+    is_rental = RENTAL in (state.visitor_type, state.entities.visitor_type)
     # The single detail our last question asked about. The reply is only ever read
     # as an answer to THIS field.
     previously_asked = state.entities.last_asked_field
@@ -292,14 +442,24 @@ async def planner_node(state: AgentState) -> dict:
     )
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     asked_context = (
-        f"\nThe assistant's last question asked about: {', '.join(previously_asked)}. The "
-        f"user's latest message is most likely the answer to it."
+        f"\nThe assistant's last question asked about: {previously_asked}. The "
+        f"user's latest message is most likely the answer to it (it may be a short "
+        f"reply or contain a typo)."
         if previously_asked else ""
+    )
+
+    # Named in the prompt rather than left to be inferred from the transcript: the
+    # extractor's rules for a rental are different, and "rental" in the persona line was
+    # being read as just another kind of traveller.
+    service_line = (
+        "\nRequest type: RENTAL — a car and driver BY THE HOUR. There is no destination "
+        "and no trip length. Read the RENTAL CONVERSATION rules below."
+        if is_rental else ""
     )
 
     prompt = f"""Today's date: {today}
 Conversation language: {reply_language}
-Visitor classification so far: {state.visitor_type or 'unknown'}{asked_context}
+Visitor classification so far: {state.visitor_type or 'unknown'}{service_line}{asked_context}
 
 Conversation so far:
 {conversation_text}
@@ -348,14 +508,37 @@ Report what the user has stated. Use null for anything they have not."""
         if key not in control_keys and val not in (None, []):
             merged[key] = val
 
-    # ── Visitor classification (code, from the origin city) ───────────────────
+    if is_rental:
+        _strip_trip_fields(merged, state.session_id)
+
+    # ── Visitor classification (code, from what they told us) ─────────────────
+    # `current` is passed so an in-state ORIGIN cannot promote a visitor to resident;
+    # only a stated home city does that. See `classify_visitor_type`.
+    # A rental never uses this: `classify_visitor_type` returns RENTAL before it reads
+    # `origin_in_himachal` (the pickup says nothing about who the rider is), and the
+    # `home_city` promotion below is LOCAL-only. Geocoding the pickup here would be a
+    # wasted Nominatim round-trip on the planner's critical path.
+    origin_in_hp = result_dict.get("origin_in_himachal")
+    if origin_in_hp is None and merged.get("origin") and not is_rental:
+        origin_in_hp = await geo.place_in_himachal(merged["origin"])
+
     visitor_type = (
-        await classify_visitor_type(merged.get("origin"), result_dict.get("origin_in_himachal"))
+        await classify_visitor_type(
+            merged.get("origin"),
+            origin_in_hp,
+            home_city=merged.get("home_city"),
+            current=state.visitor_type,
+        )
         or state.visitor_type
     )
     if visitor_type:
         merged["visitor_type"] = visitor_type
-        if visitor_type == LOCAL and not merged.get("home_city"):
+        # The local flow asks "which city in Himachal are you based in?", so when a rider
+        # we ALREADY treat as a resident names an in-state origin, that answer is their
+        # home city — recorded so the classification survives later turns. Deliberately
+        # not done for a visitor: their in-state origin is where the trip starts, not
+        # where they live, and writing it here is what used to turn them into a local.
+        if visitor_type == LOCAL and origin_in_hp and not merged.get("home_city"):
             merged["home_city"] = merged.get("origin")
 
     # ── Read the reply as an answer to the question we asked ──────────────────
@@ -364,13 +547,48 @@ Report what the user has stated. Use null for anything they have not."""
     recovered = slots.read_answer(previously_asked, latest_text, merged, visitor_type) if latest_text else None
     if recovered:
         log.info("short_answer_recovered", field=recovered, session_id=state.session_id)
-        if recovered == "origin":
-            # An origin recovered in code still decides the persona.
-            visitor_type = await classify_visitor_type(merged.get("origin")) or visitor_type
+        # Skipped for a rental for the same reason as the classification above: the
+        # pickup does not decide the persona (`classify_visitor_type` returns RENTAL),
+        # so geocoding it and re-classifying would change nothing but the latency.
+        if recovered == "origin" and not is_rental:
+            # An origin recovered in code carries the same weight as an extracted one.
+            recovered_in_hp = await geo.place_in_himachal(merged["origin"])
+            visitor_type = await classify_visitor_type(
+                merged.get("origin"),
+                recovered_in_hp,
+                home_city=merged.get("home_city"),
+                current=visitor_type,
+            ) or visitor_type
             if visitor_type:
                 merged["visitor_type"] = visitor_type
-                if visitor_type == LOCAL and not merged.get("home_city"):
+                if visitor_type == LOCAL and recovered_in_hp and not merged.get("home_city"):
                     merged["home_city"] = merged.get("origin")
+
+    # ── Read the whole sentence for rental details, in code ───────────────────
+    # `read_answer` above handles a bare reply to the question in flight. This handles
+    # the other thing riders actually type — "I need a car tomorrow at 9 am from Shimla
+    # for 8 hours, 4 of us" — which used to depend entirely on the extraction model. A
+    # miss there was silent: the detail vanished, and the assistant asked for something
+    # it had just been told or answered around it, which is what a rider experiences as
+    # an irrelevant reply.
+    #
+    # Only fills fields still EMPTY after the model's turn, so the model stays the
+    # primary reader and this can never overwrite something the rider corrected. Every
+    # value is anchored on an unmistakable marker — see `slots.read_rental_details`.
+    if is_rental and latest_text:
+        from_sentence = {
+            field: value
+            for field, value in slots.read_rental_details(latest_text).items()
+            if merged.get(field) in (None, "", [], {})
+        }
+        if from_sentence:
+            merged.update(from_sentence)
+            log.info(
+                "rental_sentence_read_in_code",
+                fields=sorted(from_sentence),
+                llm_ok=llm_ok,
+                session_id=state.session_id,
+            )
 
     # ── "Stop asking and just do it" ──────────────────────────────────────────
     if result_dict.get("user_wants_to_proceed_now") or (
@@ -378,6 +596,18 @@ Report what the user has stated. Use null for anything they have not."""
     ):
         merged["proceed_requested"] = True
         log.info("proceed_requested", session_id=state.session_id)
+
+    # The booking screen wants a DATE in its date field, not the sentence the rider
+    # happened to answer with. Rentals only: a trip's "sometime after Diwali" is worth
+    # keeping word for word, and nothing renders it into a form.
+    if is_rental and merged.get("travel_dates"):
+        merged["travel_dates"] = slots.tidy_when(merged["travel_dates"])
+
+    # ── A duration we do not sell, refused on the turn it arrives ─────────────
+    unbookable_hours = (
+        await _reject_unsold_duration(merged, state.rider_jwt, state.session_id)
+        if is_rental else None
+    )
 
     entities = _build_entities(merged)
 
@@ -395,7 +625,7 @@ Report what the user has stated. Use null for anything they have not."""
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1
 
-    result = _resolve(state, entities, visitor_type, lang_key)
+    result = _resolve(state, entities, visitor_type, lang_key, unbookable_hours)
 
     log.info(
         "entities_extracted",
@@ -404,6 +634,9 @@ Report what the user has stated. Use null for anything they have not."""
         duration=entities.duration_days,
         group_size=entities.group_size,
         travel_dates=entities.travel_dates,
+        rental_hours=entities.rental_hours,
+        pickup_time=entities.pickup_time,
+        cab_category=entities.cab_category,
         visitor_type=visitor_type,
         intent=state.intent,
         needs_clarification=result["needs_clarification"],

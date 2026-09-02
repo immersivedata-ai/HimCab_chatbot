@@ -19,7 +19,7 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source (endpoints only — frontend/ is served locally, not deployed)
+# Copy application source
 COPY app/ ./app/
 
 # Set ownership

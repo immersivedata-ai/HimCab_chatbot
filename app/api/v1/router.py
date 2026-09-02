@@ -13,6 +13,9 @@ from app.api.v1.routes import alerts, chat, session, user
 api_router = APIRouter(prefix="/v1")
 
 api_router.include_router(chat.router)
+# Same paths (/v1/chat/rental/*), separate router so the rental endpoints get their own
+# Swagger section — see the note beside `rental_router` in routes/chat.py.
+api_router.include_router(chat.rental_router)
 api_router.include_router(session.router)
 api_router.include_router(alerts.router)
 api_router.include_router(user.router)

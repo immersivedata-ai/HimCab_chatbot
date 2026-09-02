@@ -373,7 +373,10 @@ class TestOffersPrompt:
             ))
 
         silent = prompt_for([])
-        assert "NEVER mention or invent any coupon" in silent
+        assert "Write NOTHING about coupons" in silent
+        # Silence means writing nothing, NOT announcing a nothing. Naming the situation
+        # ("no offer applies to this trip") got written down verbatim as a bullet.
+        assert "not a line saying none applies" in silent
         assert "HIM CAB OFFERS (real" not in silent
 
         speaking = prompt_for([{
@@ -381,7 +384,7 @@ class TestOffersPrompt:
             "coupon_value_inr": 200, "minimum_value_inr": 500,
             "fare_after_offer_inr": 4000,
         }])
-        assert "NEVER mention or invent any coupon" not in speaking
+        assert "Write NOTHING about coupons" not in speaking
         assert "HIMCAB200" in speaking
 
 

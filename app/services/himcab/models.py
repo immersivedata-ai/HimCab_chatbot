@@ -12,6 +12,7 @@ backend contract touches only those two fenced methods, never these models or th
 from datetime import datetime, timezone
 from typing import Optional
 
+from app.core.enums import TripType
 from pydantic import BaseModel, Field
 
 
@@ -29,9 +30,13 @@ class FareQuoteInput(BaseModel):
     #: the caller resolves the journey before building this, and skips the quote
     #: entirely when it cannot.
     distance_km: Optional[float] = None
-    trip_type: str = "OUTSTATION"                        # OUTSTATION | LOCAL | RENTAL
+    #: The rate card this is priced on. See app/core/enums.TripType — the value
+    #: goes on the wire as `tripType`, so it is a backend contract, not a label.
+    trip_type: TripType = TripType.OUTSTATION
     booking_time: str = "12:00"                          # HH:mm — drives night-charge calc
-    rent_hours: int = 0                                  # >0 only for RENTAL trips
+    #: >0 only for RENTAL. The backend matches this EXACTLY against a rental chart's
+    #: maxHour, so it must be a package the rate card defines — see rental_service.py.
+    rent_hours: int = 0
     group_size: Optional[int] = None                     # headline category selection (display-side)
     budget_range: Optional[str] = None                   # budget | moderate | luxury (display-side)
 
@@ -115,7 +120,7 @@ class FareQuote(BaseModel):
     vehicle_label: Optional[str] = None                  # category name doubles as vehicle label
     seat_capacity: Optional[int] = None                  # from response (often null per-category)
     per_km_inr: Optional[float] = None
-    trip_type: str = "OUTSTATION"
+    trip_type: TripType = TripType.OUTSTATION
     distance_km: Optional[float] = None                  # what the fare was priced on
     offer_applied_server_side: bool = False              # estimate takes no offerId → always False
     alternatives: list[FareCategoryFare] = Field(default_factory=list)  # all categories returned

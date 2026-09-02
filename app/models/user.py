@@ -33,7 +33,12 @@ class TravelPreferences(BaseModel):
 
 class PastTrip(BaseModel):
     destination: str
-    duration_days: int
+    #: Optional because plenty of real trips have no day count: a local ride and an
+    #: hourly rental never collect one, and `persist_node` records whatever the
+    #: conversation actually established. Requiring it here made ONE such row poison
+    #: the whole profile — the rider's entire history failed to load, and every
+    #: endpoint that reads a profile 500'd, because a field nothing depends on was null.
+    duration_days: Optional[int] = None
     travel_date: str
     rating: Optional[float] = None
     session_id: Optional[str] = None

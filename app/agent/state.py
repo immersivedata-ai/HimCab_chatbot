@@ -94,6 +94,30 @@ class AgentState(BaseModel):
     # time. Feeds the drive time quoted to a local rider AND the booking handoff the
     # app uses to drop pins on its map, so both come from one resolution of the route.
     route_estimate: Optional[dict] = None
+    #: A rental duration the rider asked for that the rate card does not sell. Set by
+    #: the tool executor, which ALSO clears `entities.rental_hours` — so the reply can
+    #: still say "5 hours isn't one of our packages" while the slot is empty again and
+    #: their next answer is read as a fresh duration rather than ignored as a repeat.
+    unbookable_rental_hours: Optional[int] = None
+    #: A cab tier the rider asked for that this package does not have. Set by the tool
+    #: executor alongside a cleared `entities.cab_category`, exactly like
+    #: `unbookable_rental_hours` — so the reply can say "we don't run a Premium on this
+    #: package" and list the ones that were priced, rather than silently booking another.
+    unavailable_cab_category: Optional[str] = None
+    #: True while the reply's job is to ask WHICH CAB. Set by the tool executor once a
+    #: fare has come back with options and the rider has not picked one (and cleared once
+    #: they have, or once the question has been asked its allotted times). The writer's
+    #: prompt and `_build_booking_handoff` both read it, so a reply can never announce a
+    #: booking screen while still asking which cab to open it on.
+    awaiting_cab_choice: bool = False
+    #: Where the cab collects them, as {name, lat, lon} — rental flow only. A hire by
+    #: the hour has no destination, so there is no `route_estimate` to carry the pin,
+    #: and the booking screen still has to open its map somewhere.
+    pickup: Optional[dict] = None
+    #: Rental blocks from the rate card ({hours, included_km, label}), rental flow only.
+    #: The reply offers exactly these, because the backend matches a duration against
+    #: them exactly — see app/services/himcab/rental_service.py.
+    rental_packages: list[dict] = Field(default_factory=list)
 
     # ── Generated output (from Writer node) ───────────────────────────────────
     final_response_text: str = ""

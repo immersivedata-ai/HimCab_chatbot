@@ -12,9 +12,13 @@ The chat API consumed by the mobile app.
 ║  There is no persona or rider id to pass. The backend owns the conversation and   ║
 ║  resolves it from the token, so multi-turn context works with no client state.    ║
 ║                                                                                  ║
-║  Pick the pair that matches your rider:                                          ║
-║      Himachal local →  /v1/chat/local/*                                          ║
-║      visiting       →  /v1/chat/outstation/*                                     ║
+║  Pick the set that matches what the rider wants:                                 ║
+║      Himachal local →  /v1/chat/local/*        cab-first replies, Hindi default  ║
+║      visiting       →  /v1/chat/outstation/*   day-by-day itineraries, English   ║
+║      car by the hour → /v1/chat/rental/*       hourly packages and a fare        ║
+║                                                                                  ║
+║  /rental is chosen by the RIDER (your Rental tab), never by their location: a    ║
+║  GPS fix reroutes /local and /outstation, but never a rental.                    ║
 ║                                                                                  ║
 ║  0. Which pair? Ask, with the device's GPS fix:                                  ║
 ║       POST /v1/chat/route   body: {"lat": 31.10, "lon": 77.17}                   ║
@@ -60,11 +64,23 @@ The chat API consumed by the mobile app.
 SSE events emitted by /stream:
   1. `token`      → raw AI text chunks (for chat bubble animation)
   2. `structured` → a renderable card. Types: itinerary | weather_alert |
-                    snowfall_alert | cab_fare | offers | booking_handoff. See
-                    `StructuredEvent` in app/models/session.py for each payload shape.
-                    Ignore unknown types.
+                    snowfall_alert | cab_fare | offers | booking_handoff |
+                    rental_packages | request_cancelled. See `StructuredEvent` in
+                    app/models/session.py for each payload shape. Ignore unknown types.
   3. `done`       → completion; carries the `persona` this turn was served as
   4. `error`      → failure
+
+CANCELLATION — the one event you must ACT on, not just render:
+  When the rider backs out ("cancel", "never mind", "rehne do"), the reply carries a
+  `request_cancelled` event. Dismiss any booking sheet a previous `booking_handoff`
+  opened and clear this conversation's fare/package cards: what they describe no longer
+  exists, and a live "Book" button above a cancellation is how somebody books the thing
+  they just cancelled.
+
+  It never cancels anything on the backend. A CONFIRMED booking is cancelled only from
+  your Trips screen (`DELETE /api/rider/trip/cancel-ride/{id}`), which is what notifies
+  the driver — the assistant has no trip id and says so. `payload.open_screen` is
+  "trips" when the rider needs to be sent there.
 
 Rate limit: 30 requests/minute per rider. Over that, both endpoints return HTTP 429
 with `{"error": {"code": "RATE_LIMIT_EXCEEDED", ...}}` and a `Retry-After` header in
@@ -102,15 +118,25 @@ from app.models.session import (
 from app.services.chat_session import (
     LOCAL,
     OUTSTATION,
+    RENTAL,
     resolve_chat,
     resolve_persona,
     start_chat,
 )
 from app.services.firestore import get_session_service
+from app.services.himcab import available_packages
 from app.services.local_cache import RateLimiter
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/chat", tags=["Chat"])
+
+#: The rental endpoints live on their own router purely so Swagger UI gives them their
+#: own section — the handlers are the same three helpers the other two personas use.
+#: The paths are unchanged (/v1/chat/rental/*); only the OpenAPI tag differs, which is
+#: what makes /docs#/Rental a link you can hand to another team. Mounted alongside
+#: `router` in app/api/v1/router.py, NOT inside it — a nested include would stack the
+#: parent's "Chat" tag on top and list every rental route twice.
+rental_router = APIRouter(prefix="/chat/rental", tags=["Rental"])
 
 #: Per-rider request budget. In-process — see app/services/local_cache.py for what
 #: that means on a multi-instance deployment.
@@ -362,7 +388,13 @@ async def _handle_start(
 ) -> StartChatResponse:
     location = await RiderLocation.resolve(lat, lon, accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
-    session = await start_chat(rider.user_id, served, location)
+
+    # The rental greeting asks for a duration, and a duration is matched exactly by the
+    # backend — so it must name what is on the rate card, and the client needs the same
+    # list to render as taps. One fetch feeds both.
+    packages = await available_packages(rider.jwt) if served == RENTAL else []
+
+    session = await start_chat(rider.user_id, served, location, packages)
     # The greeting is already stored on the session by start_chat().
     greeting = session.messages[-1].content if session.messages else ""
     return StartChatResponse(
@@ -371,6 +403,11 @@ async def _handle_start(
         language=str(session.language),
         persona=served,
         location=_resolved_location_dto(session.rider_location),
+        structured_events=(
+            [{"type": "rental_packages", "payload": {"packages": packages}}]
+            if packages
+            else []
+        ),
     )
 
 
@@ -628,3 +665,59 @@ async def history_outstation(
     /start deliberately begins a fresh conversation.
     """
     return await _handle_history(rider, OUTSTATION, limit, session_id)
+
+
+# ── RENTAL routes (a car and driver by the hour) ──────────────────────────────
+# A rental is a SERVICE the rider chose, not an inference about who they are, so —
+# unlike /local and /outstation — coordinates never reroute these. Their fix decides
+# the pickup point and the reply language, not whether they still want a car.
+
+@rental_router.post("/start", response_model=StartChatResponse)
+async def start_chat_rental(
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    rider: RiderIdentity = Depends(get_rider),
+):
+    """Open the RENTAL chat dialog — hiring a car and driver by the hour.
+
+    The assistant asks for the duration, the pickup and when they need it, then quotes
+    the cab options for that package. Every price comes from the Him Cab fare service;
+    nothing is calculated here.
+
+    Unlike the other two paths, the returned `persona` is always **rental**: a fix
+    tells us where to collect them, not that they have stopped wanting a rental.
+    """
+    return await _handle_start(rider, RENTAL, lat, lon, accuracy_m)
+
+
+@rental_router.get("/stream")
+async def stream_chat_rental(
+    message: str = Query(..., min_length=1, max_length=2000, description="User's message text"),
+    session_id: str | None = Query(default=None, description=_SESSION_ID_DESCRIPTION),
+    lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
+    lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
+    accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    rider: RiderIdentity = Depends(get_rider),
+):
+    """Send a message on the RENTAL chat and stream the reply back as SSE."""
+    return await _handle_stream(rider, RENTAL, message, session_id, lat, lon, accuracy_m)
+
+
+@rental_router.post("/message", response_model=ChatResponse)
+async def send_message_rental(
+    body: ChatMessageRequest,
+    rider: RiderIdentity = Depends(get_rider),
+):
+    """Non-streaming version of the RENTAL chat, for clients without SSE support."""
+    return await _handle_message(rider, RENTAL, body)
+
+
+@rental_router.get("/history", response_model=ChatHistoryResponse)
+async def history_rental(
+    limit: int = Query(default=50, ge=1, le=200, description="Most recent N messages"),
+    session_id: str | None = Query(default=None, description=_SESSION_ID_DESCRIPTION),
+    rider: RiderIdentity = Depends(get_rider),
+):
+    """Replay the RENTAL conversation so the app can restore its chat panel."""
+    return await _handle_history(rider, RENTAL, limit, session_id)

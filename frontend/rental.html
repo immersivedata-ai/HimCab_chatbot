@@ -1,0 +1,1117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Him Cab — Rent a Car by the Hour</title>
+  <meta name="description" content="Hire a car and driver by the hour anywhere in Himachal Pradesh." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;0,14..32,800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #ffffff;
+      --bg-chat:      #f7f8fa;
+      --bg-card:      #f0f2f5;
+
+      /* Rentals get their own accent so a tester can tell this page from /local
+         at a glance when both are open side by side. */
+      --accent:       #7c3aed;
+      --accent-hover: #6d28d9;
+      --accent-light: #f5f3ff;
+      --accent-border:rgba(124, 58, 237, 0.18);
+
+      --green:        #16a34a;
+      --green-light:  #f0fdf4;
+      --amber:        #b45309;
+      --amber-light:  #fffbeb;
+
+      --text-primary:   #111827;
+      --text-secondary: #6b7280;
+      --text-muted:     #9ca3af;
+
+      --border:       #e5e7eb;
+
+      --radius:    14px;
+      --radius-sm: 10px;
+      --radius-xs: 8px;
+
+      --shadow-xs: 0 1px 2px rgba(0,0,0,0.05);
+      --shadow-sm: 0 1px 4px rgba(0,0,0,0.07), 0 1px 2px rgba(0,0,0,0.04);
+
+      --transition: 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --mono: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+    }
+
+    html { font-size: 15px; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text-primary);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+
+    /* ── Top bar ──────────────────────────────────────────────────────── */
+    #top-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px;
+      padding: 11px 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .top-brand { display: flex; align-items: center; gap: 10px; }
+    .top-brand-icon {
+      width: 30px; height: 30px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .top-brand-icon svg { width: 15px; height: 15px; }
+    .top-brand-name { font-size: 0.92rem; font-weight: 700; letter-spacing: -0.2px; }
+    .top-brand-sub  { font-size: 0.68rem; color: var(--text-muted); }
+
+    .top-right { display: flex; align-items: center; gap: 8px; }
+    .status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green); box-shadow: 0 0 0 2px var(--green-light);
+    }
+    .status-dot.offline { background: #ef4444; box-shadow: 0 0 0 2px #fef2f2; }
+    .status-label { font-size: 0.72rem; color: var(--text-muted); font-weight: 500; }
+
+    .btn-ghost {
+      height: 30px; padding: 0 11px;
+      border-radius: var(--radius-xs);
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text-secondary);
+      font-family: var(--font); font-size: 0.74rem; font-weight: 600;
+      cursor: pointer; transition: var(--transition);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .btn-ghost:hover { background: var(--bg-card); color: var(--text-primary); }
+    .btn-ghost svg { width: 13px; height: 13px; }
+
+    /* ── Test-rig bar: the token everything is authenticated with ─────── */
+    #rig-bar {
+      display: none;
+      align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 9px 20px;
+      background: var(--accent-light);
+      border-bottom: 1px solid var(--accent-border);
+      flex-shrink: 0;
+    }
+    #rig-bar.show { display: flex; }
+    .rig-label { font-size: 0.7rem; font-weight: 600; color: var(--accent); }
+    .rig-input {
+      flex: 1; min-width: 220px;
+      height: 30px; padding: 0 10px;
+      border: 1px solid var(--accent-border);
+      border-radius: var(--radius-xs);
+      background: var(--bg);
+      font-family: var(--mono); font-size: 0.72rem;
+      color: var(--text-primary);
+    }
+    .rig-input:focus { outline: none; border-color: var(--accent); }
+    .rig-input.narrow { flex: 0 0 110px; min-width: 0; }
+    .rig-btn {
+      height: 30px; padding: 0 12px;
+      border: none; border-radius: var(--radius-xs);
+      background: var(--accent); color: #fff;
+      font-family: var(--font); font-size: 0.73rem; font-weight: 600;
+      cursor: pointer; transition: var(--transition);
+    }
+    .rig-btn:hover { background: var(--accent-hover); }
+    .rig-note { font-size: 0.66rem; color: var(--text-secondary); width: 100%; }
+
+    /* ── Chat ─────────────────────────────────────────────────────────── */
+    #chat-container {
+      flex: 1; overflow-y: auto;
+      background: var(--bg-chat);
+      padding: 26px 20px;
+      display: flex; flex-direction: column; gap: 3px;
+      scroll-behavior: smooth;
+    }
+
+    #welcome-screen {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      flex: 1; padding: 20px 20px 40px; text-align: center; min-height: 320px;
+    }
+    .welcome-title {
+      font-size: 1.6rem; font-weight: 800; letter-spacing: -0.5px;
+      line-height: 1.2; margin-bottom: 10px;
+    }
+    .welcome-title span { color: var(--accent); }
+    .welcome-desc {
+      font-size: 0.88rem; color: var(--text-secondary);
+      line-height: 1.65; max-width: 420px; margin-bottom: 26px;
+    }
+    .quick-chips {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      justify-content: center; max-width: 560px;
+    }
+    .quick-chip {
+      padding: 8px 16px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 100px;
+      font-size: 0.82rem; color: var(--text-secondary); font-weight: 500;
+      cursor: pointer; transition: var(--transition); box-shadow: var(--shadow-xs);
+    }
+    .quick-chip:hover {
+      border-color: var(--accent-border); color: var(--accent);
+      background: var(--accent-light); box-shadow: var(--shadow-sm);
+    }
+
+    /* ── Messages ─────────────────────────────────────────────────────── */
+    .msg-row {
+      display: flex; gap: 9px;
+      max-width: 720px; width: 100%; margin: 0 auto;
+      animation: msg-in 0.2s ease-out;
+    }
+    @keyframes msg-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+    .msg-row.user { justify-content: flex-end; }
+
+    .msg-avatar {
+      width: 28px; height: 28px; border-radius: var(--radius-xs);
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; margin-top: 3px;
+    }
+    .msg-avatar svg { width: 13px; height: 13px; }
+    .msg-row.assistant .msg-avatar { background: var(--accent); }
+    .msg-row.user      .msg-avatar { background: #374151; order: 2; }
+
+    .msg-col { display: flex; flex-direction: column; min-width: 0; }
+    .msg-row.user .msg-col { align-items: flex-end; }
+
+    .msg-bubble {
+      padding: 10px 14px; border-radius: var(--radius-sm);
+      font-size: 0.875rem; line-height: 1.65;
+      max-width: 560px; word-wrap: break-word;
+    }
+    .msg-bubble p  { margin-bottom: 0.65em; }
+    .msg-bubble p:last-child { margin-bottom: 0; }
+    .msg-bubble ul, .msg-bubble ol { margin-left: 1.3em; margin-bottom: 0.65em; }
+    .msg-bubble strong { font-weight: 600; }
+
+    .msg-row.user .msg-bubble {
+      background: var(--accent); color: #fff;
+      border-bottom-right-radius: 3px; white-space: pre-wrap;
+      box-shadow: 0 2px 8px rgba(124, 58, 237, 0.18);
+    }
+    .msg-row.assistant .msg-bubble {
+      background: var(--bg); border: 1px solid var(--border);
+      border-bottom-left-radius: 3px; box-shadow: var(--shadow-xs);
+    }
+    .msg-meta { font-size: 0.63rem; color: var(--text-muted); margin-top: 3px; padding: 0 2px; }
+    .msg-row.user .msg-meta { text-align: right; }
+
+    .typing-indicator { display: flex; gap: 4px; padding: 12px 14px; }
+    .typing-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--text-muted);
+      animation: typing-bounce 1.3s infinite ease-in-out;
+    }
+    .typing-dot:nth-child(2) { animation-delay: 0.14s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.28s; }
+    @keyframes typing-bounce {
+      0%, 80%, 100% { transform: none; opacity: 0.4; }
+      40% { transform: translateY(-5px); opacity: 1; }
+    }
+
+    /* ── Structured event cards ───────────────────────────────────────── */
+    .event-card {
+      margin-top: 8px; max-width: 560px;
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: var(--bg); overflow: hidden;
+      font-size: 0.8rem; box-shadow: var(--shadow-xs);
+    }
+    .event-card-header {
+      display: flex; align-items: center; gap: 7px;
+      padding: 8px 12px;
+      background: var(--bg-card); border-bottom: 1px solid var(--border);
+    }
+    .event-card-title {
+      font-size: 0.68rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.6px;
+      color: var(--text-secondary);
+    }
+    .event-card-badge {
+      margin-left: auto; font-size: 0.62rem; font-weight: 600;
+      padding: 2px 8px; border-radius: 100px;
+      background: var(--accent-light); color: var(--accent);
+    }
+    .event-card-body { padding: 10px 12px; }
+
+    .card-packages .event-card-header { background: var(--accent-light); border-color: var(--accent-border); }
+    .card-packages .event-card-title  { color: var(--accent); }
+    .card-fare     .event-card-header { background: var(--accent-light); border-color: var(--accent-border); }
+    .card-fare     .event-card-title  { color: var(--accent); }
+    .card-offers   .event-card-header { background: var(--green-light); border-color: #bbf7d0; }
+    .card-offers   .event-card-title  { color: var(--green); }
+    .card-offers   .event-card-badge  { background: var(--green-light); color: var(--green); }
+    .card-booking  .event-card-header { background: var(--amber-light); border-color: #fde68a; }
+    .card-booking  .event-card-title  { color: var(--amber); }
+    .card-booking  .event-card-badge  { background: var(--amber-light); color: var(--amber); }
+    .card-cancel   .event-card-header { background: #fef2f2; border-color: #fecaca; }
+    .card-cancel   .event-card-title  { color: #b91c1c; }
+    .card-cancel   .event-card-badge  { background: #fef2f2; color: #b91c1c; }
+
+    /* A card belonging to a request that has been called off. Kept on screen so the
+       conversation still reads back, but visibly spent and no longer tappable. */
+    .event-card.void { opacity: 0.45; }
+    .event-card.void .pkg-btn, .event-card.void .cab-row { pointer-events: none; }
+
+    /* Package chooser — the whole point of the rental flow: the backend matches a
+       duration exactly, so these are taps rather than free text. */
+    .pkg-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+    .pkg-btn {
+      padding: 7px 13px;
+      border: 1px solid var(--accent-border); border-radius: 100px;
+      background: var(--bg); color: var(--accent);
+      font-family: var(--font); font-size: 0.78rem; font-weight: 600;
+      cursor: pointer; transition: var(--transition);
+    }
+    .pkg-btn:hover:not(:disabled) { background: var(--accent); color: #fff; }
+    .pkg-btn.selected { background: var(--accent); color: #fff; }
+    .pkg-btn:disabled { opacity: 0.45; cursor: default; }
+    /* A duration offered from product config because the rate card could not be read:
+       bookable and priceable, but with no known distance allowance. */
+    .pkg-btn.configured { border-style: dashed; }
+
+    /* Cab chooser — the app's "Select Rental Cab" radio group. Same reason as the
+       packages: the reply confirms whichever cab is named back, so a tap beats typing. */
+    .cab-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      width: 100%; padding: 8px 10px; margin-top: 5px;
+      border: 1px solid var(--border); border-radius: var(--radius-xs);
+      background: var(--bg); color: var(--text-primary);
+      font-family: var(--font); font-size: 0.8rem;
+      cursor: pointer; transition: var(--transition); text-align: left;
+    }
+    .cab-row:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-light); }
+    .cab-row.selected { border-color: var(--accent); background: var(--accent-light); }
+    .cab-row:disabled { opacity: 0.5; cursor: default; }
+    .cab-name  { font-weight: 600; }
+    .cab-seats { color: var(--text-muted); font-weight: 400; font-size: 0.72rem; }
+    .cab-fare  { color: var(--accent); font-weight: 700; white-space: nowrap; }
+    .cab-hint  { font-size: 0.7rem; color: var(--text-secondary); margin-top: 7px; }
+
+    .kv-row {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 4px 0; border-bottom: 1px dashed var(--border);
+    }
+    .kv-row:last-child { border-bottom: none; }
+    .kv-label { color: var(--text-secondary); }
+    .kv-value { font-weight: 600; text-align: right; }
+    .kv-value.big { color: var(--accent); font-size: 0.95rem; }
+
+    .card-pre {
+      font-family: var(--mono); font-size: 0.68rem;
+      white-space: pre-wrap; word-break: break-all;
+      color: var(--text-secondary); max-height: 220px; overflow: auto;
+    }
+
+    /* ── Input ────────────────────────────────────────────────────────── */
+    #input-area { padding: 12px 20px 16px; border-top: 1px solid var(--border); flex-shrink: 0; }
+    .input-wrapper {
+      max-width: 720px; margin: 0 auto;
+      display: flex; align-items: flex-end; gap: 8px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 7px 7px 7px 14px;
+      transition: var(--transition);
+    }
+    .input-wrapper:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,58,237,0.08); }
+    #msg-input {
+      flex: 1; border: none; outline: none; resize: none;
+      background: transparent;
+      font-family: var(--font); font-size: 0.875rem; line-height: 1.5;
+      color: var(--text-primary); max-height: 110px; padding: 6px 0;
+    }
+    #send-btn {
+      width: 32px; height: 32px; flex-shrink: 0;
+      border: none; border-radius: var(--radius-xs);
+      background: var(--accent); color: #fff; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: var(--transition);
+    }
+    #send-btn:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.04); }
+    #send-btn:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+    #send-btn svg { width: 15px; height: 15px; }
+
+    .input-footer {
+      max-width: 720px; margin: 7px auto 0;
+      display: flex; justify-content: space-between; gap: 12px;
+    }
+    .input-hint   { font-size: 0.65rem; color: var(--text-muted); }
+    .session-info { font-size: 0.65rem; color: var(--text-muted); font-family: var(--mono); }
+
+    .error-banner {
+      max-width: 720px; margin: 0 auto 8px;
+      padding: 8px 12px;
+      background: #fef2f2; border: 1px solid #fecaca; border-radius: var(--radius-xs);
+      color: #b91c1c; font-size: 0.8rem; display: none;
+    }
+    .error-banner.show { display: block; }
+
+    /* Persistent, unlike the error banner: it states a condition that will keep
+       costing every turn its price until it is dealt with. */
+    #notice {
+      display: none;
+      align-items: flex-start; gap: 9px;
+      padding: 9px 20px;
+      background: var(--amber-light);
+      border-bottom: 1px solid #fde68a;
+      color: #78350f; font-size: 0.76rem; line-height: 1.5;
+      flex-shrink: 0;
+    }
+    #notice.show { display: flex; }
+    #notice b { font-weight: 700; }
+    #notice button {
+      margin-left: auto; flex-shrink: 0;
+      border: 1px solid #fcd34d; border-radius: var(--radius-xs);
+      background: var(--bg); color: var(--amber);
+      font-family: var(--font); font-size: 0.72rem; font-weight: 600;
+      padding: 4px 10px; cursor: pointer;
+    }
+    #notice button:hover { background: #fef3c7; }
+
+    /* A turn that produced no price says so, rather than showing an empty space. */
+    .no-fare {
+      margin-top: 8px; max-width: 560px;
+      padding: 9px 12px;
+      border: 1px dashed #fcd34d; border-radius: var(--radius-sm);
+      background: var(--amber-light);
+      color: #78350f; font-size: 0.76rem; line-height: 1.5;
+    }
+
+    @media (max-width: 600px) {
+      #top-bar        { padding: 10px 14px; }
+      #rig-bar        { padding: 9px 14px; }
+      #chat-container { padding: 16px 12px; }
+      #input-area     { padding: 10px 12px 14px; }
+      .welcome-title  { font-size: 1.3rem; }
+      .msg-bubble     { max-width: 82vw; }
+      .top-brand-sub  { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── Top bar ──────────────────────────────────────────────────────── -->
+  <div id="top-bar">
+    <div class="top-brand">
+      <div class="top-brand-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>
+        </svg>
+      </div>
+      <div>
+        <div class="top-brand-name">Him Cab · Rentals</div>
+        <div class="top-brand-sub">A car and driver, by the hour</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <div class="status-dot" id="status-dot"></div>
+      <span class="status-label" id="status-text">Online</span>
+      <button class="btn-ghost" id="btn-rig" title="Set the rider token used for every call">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 2l-2 2m-7.6 7.6a5 5 0 11-7.1 7.1 5 5 0 017.1-7.1zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/>
+        </svg>
+        Token
+      </button>
+      <button class="btn-ghost" id="btn-new" title="Start a fresh conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5v14M5 12h14"/>
+        </svg>
+        New
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Test rig ─────────────────────────────────────────────────────── -->
+  <!-- Fares, offers and the rate card are all rider-authenticated. Without a real
+       Him Cab JWT the backend cannot price anything, so the tester needs somewhere
+       to paste one. -->
+  <div id="rig-bar">
+    <span class="rig-label">Bearer</span>
+    <input class="rig-input" id="rig-token" placeholder="Him Cab rider JWT" spellcheck="false" />
+    <span class="rig-label">Pickup</span>
+    <input class="rig-input narrow" id="rig-lat" placeholder="lat" spellcheck="false" />
+    <input class="rig-input narrow" id="rig-lon" placeholder="lon" spellcheck="false" />
+    <button class="rig-btn" id="rig-apply">Apply &amp; restart</button>
+    <span class="rig-note">
+      Saved in this browser only. Packages and prices come from the Him Cab fare
+      service — with no valid token the assistant still talks, but quotes nothing.
+    </span>
+  </div>
+
+  <!-- ── Why there is no price ────────────────────────────────────────── -->
+  <div id="notice">
+    <span id="notice-text"></span>
+    <button id="notice-action">Add token</button>
+  </div>
+
+  <!-- ── Chat ─────────────────────────────────────────────────────────── -->
+  <div id="chat-container">
+    <div id="welcome-screen">
+      <h1 class="welcome-title">Hire a car <span>by the hour</span></h1>
+      <p class="welcome-desc">
+        Tell us how long you need it and where to collect you. We'll price the packages
+        Him Cab actually runs — no destination required.
+      </p>
+      <div class="quick-chips">
+        <div class="quick-chip" data-msg="I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us, luxury">Everything in one sentence</div>
+        <div class="quick-chip" data-msg="Rent a car for 3 hours in Manali today at 10 am">3 hrs in Manali</div>
+        <div class="quick-chip" data-msg="Kal subah 6 baje Manali se gaadi chahiye 5 ghante ke liye">Hinglish, one sentence</div>
+        <div class="quick-chip" data-msg="Can I hire a car for 6 hours?">6 hrs (not a package)</div>
+        <div class="quick-chip" data-msg="actually never mind, cancel it">Cancel mid-request</div>
+      </div>
+    </div>
+    <div id="messages"></div>
+  </div>
+
+  <!-- ── Input ────────────────────────────────────────────────────────── -->
+  <div id="input-area">
+    <div class="error-banner" id="error-banner"><span id="error-text"></span></div>
+    <div class="input-wrapper">
+      <textarea id="msg-input" rows="1" placeholder="e.g. 8 hours from Shimla, tomorrow morning, 4 people" autofocus></textarea>
+      <button id="send-btn" title="Send" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+    <div class="input-footer">
+      <span class="input-hint">Enter to send · Shift+Enter for a new line</span>
+      <span class="session-info" id="session-info"></span>
+    </div>
+  </div>
+
+  <script>
+    // ══════════════════════════════════════════════════════════════════════
+    // A test client for /v1/chat/rental/*.
+    //
+    // The rental endpoints are their OWN set — a rental is a service the rider
+    // chose, so unlike /local and /outstation a GPS fix never reroutes it. That is
+    // why this page never calls /v1/chat/route: it always talks to /rental.
+    // ══════════════════════════════════════════════════════════════════════
+    const API_BASE = window.location.origin;
+    const CHAT_API = `${API_BASE}/v1/chat/rental`;
+
+    const TOKEN_KEY = "himcab_rider_token";
+    const FIX_KEY   = "himcab_rider_fix";
+    const params    = new URLSearchParams(window.location.search);
+
+    // Precedence: the URL (how the native app hands the token to a WebView), then
+    // whatever was last typed into the rig, then a dev placeholder so the page is
+    // usable standalone — in which case the backend quotes nothing.
+    let RIDER_TOKEN =
+      params.get("rider_token") || localStorage.getItem(TOKEN_KEY) || "dev-test-token";
+
+    //: Where to collect the rider. Optional everywhere — without it the assistant
+    //: simply asks which city the car should come to.
+    let riderFix = readFix();
+
+    function readFix() {
+      const lat = parseFloat(params.get("lat"));
+      const lon = parseFloat(params.get("lon"));
+      if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon };
+      try {
+        const saved = JSON.parse(localStorage.getItem(FIX_KEY) || "null");
+        return saved && Number.isFinite(saved.lat) ? saved : null;
+      } catch { return null; }
+    }
+
+    const authHeaders = (extra = {}) => ({
+      "Authorization": `Bearer ${RIDER_TOKEN}`,
+      ...extra,
+    });
+
+    const fixParams = () => (riderFix
+      ? { lat: riderFix.lat, lon: riderFix.lon,
+          ...(riderFix.accuracy_m ? { accuracy_m: riderFix.accuracy_m } : {}) }
+      : {});
+
+    function browserFix(timeoutMs = 5000) {
+      return new Promise(resolve => {
+        if (!navigator.geolocation) return resolve(null);
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            accuracy_m: pos.coords.accuracy,
+          }),
+          () => resolve(null),                    // refused — the assistant just asks
+          { timeout: timeoutMs, maximumAge: 60000 }
+        );
+      });
+    }
+
+    // ── State ─────────────────────────────────────────────────────────────
+    let isStreaming = false;
+    //: The packages from the most recent `rental_packages` event. Kept so older
+    //: cards can be greyed out once the rider has picked one.
+    let liveChooser = null;
+    //: Same, for the cab list on the most recent priced turn — tapping a cab on a
+    //: three-turn-old fare card would name a price the conversation has moved past.
+    let liveCabChooser = null;
+
+    // ── DOM ───────────────────────────────────────────────────────────────
+    const $messages    = document.getElementById("messages");
+    const $chat        = document.getElementById("chat-container");
+    const $welcome     = document.getElementById("welcome-screen");
+    const $input       = document.getElementById("msg-input");
+    const $sendBtn     = document.getElementById("send-btn");
+    const $sessionInfo = document.getElementById("session-info");
+    const $errorBanner = document.getElementById("error-banner");
+    const $errorText   = document.getElementById("error-text");
+    const $statusDot   = document.getElementById("status-dot");
+    const $statusText  = document.getElementById("status-text");
+    const $rigBar      = document.getElementById("rig-bar");
+    const $rigToken    = document.getElementById("rig-token");
+    const $rigLat      = document.getElementById("rig-lat");
+    const $rigLon      = document.getElementById("rig-lon");
+    const $notice      = document.getElementById("notice");
+    const $noticeText  = document.getElementById("notice-text");
+
+    //: True while the page is running on the placeholder token. The backend maps it
+    //: to jwt=None on purpose, so the rate card and every fare are unavailable — the
+    //: single most common reason this page shows no prices.
+    const usingDevToken = () => RIDER_TOKEN === "dev-test-token";
+
+    function showNotice(html) {
+      $noticeText.innerHTML = html;
+      $notice.classList.add("show");
+    }
+    const hideNotice = () => $notice.classList.remove("show");
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    const scrollBottom = () => { $chat.scrollTop = $chat.scrollHeight; };
+    const rupees = n => "₹" + Math.round(n).toLocaleString("en-IN");
+    const esc = s => String(s ?? "").replace(/[&<>"']/g,
+      c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    function showError(msg) {
+      $errorText.textContent = msg;
+      $errorBanner.classList.add("show");
+      setTimeout(() => $errorBanner.classList.remove("show"), 6000);
+    }
+
+    function setStatus(online) {
+      $statusDot.className = online ? "status-dot" : "status-dot offline";
+      $statusText.textContent = online ? "Online" : "Offline";
+    }
+
+    const timeStr = () =>
+      new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    const updateSendBtn = () => {
+      $sendBtn.disabled = isStreaming || !$input.value.trim();
+    };
+
+    // ── Message rendering ─────────────────────────────────────────────────
+    function addMessage(role, text) {
+      $welcome.style.display = "none";
+
+      const row = document.createElement("div");
+      row.className = `msg-row ${role}`;
+
+      const avatar = document.createElement("div");
+      avatar.className = "msg-avatar";
+      avatar.innerHTML = role === "user"
+        ? `<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`
+        : `<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>`;
+
+      const col = document.createElement("div");
+      col.className = "msg-col";
+
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble";
+      if (role === "assistant") bubble.innerHTML = text ? marked.parse(text) : "";
+      else bubble.textContent = text;
+
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      meta.textContent = timeStr();
+
+      col.append(bubble, meta);
+      if (role === "user") row.append(col, avatar);
+      else row.append(avatar, col);
+
+      $messages.appendChild(row);
+      scrollBottom();
+      return { row, bubble, col };
+    }
+
+    function showTyping() {
+      const row = document.createElement("div");
+      row.className = "msg-row assistant";
+      row.id = "typing-row";
+      row.innerHTML =
+        `<div class="msg-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></div>` +
+        `<div class="msg-bubble typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>`;
+      $messages.appendChild(row);
+      scrollBottom();
+    }
+
+    const hideTyping = () => document.getElementById("typing-row")?.remove();
+
+    function card(cls, icon, title, badge, bodyHtml) {
+      const el = document.createElement("div");
+      el.className = `event-card ${cls}`;
+      el.innerHTML = `
+        <div class="event-card-header">
+          <span>${icon}</span>
+          <span class="event-card-title">${esc(title)}</span>
+          ${badge ? `<span class="event-card-badge">${esc(badge)}</span>` : ""}
+        </div>
+        <div class="event-card-body">${bodyHtml}</div>`;
+      return el;
+    }
+
+    const kv = rows => rows
+      .filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .map(([k, v, big]) =>
+        `<div class="kv-row"><span class="kv-label">${esc(k)}</span>` +
+        `<span class="kv-value${big ? " big" : ""}">${esc(v)}</span></div>`)
+      .join("");
+
+    // ── Structured events ─────────────────────────────────────────────────
+    // Types are documented in docs/api_reference.md. Unknown ones fall through to a
+    // raw card rather than being dropped, so a new backend event is visible here the
+    // day it ships.
+    function buildEventCard(ev, col) {
+      const type = ev.type || "";
+      const p    = ev.payload || {};
+
+      if (type === "rental_packages") {
+        const packages = p.packages || [];
+        if (!packages.length) return;
+
+        // Only the newest chooser stays live: tapping a package on a card from three
+        // turns ago would send a duration the conversation has moved past.
+        if (liveChooser) {
+          liveChooser.querySelectorAll(".pkg-btn").forEach(b => (b.disabled = true));
+        }
+
+        const configured = packages.some(pkg => pkg.from_rate_card === false);
+        const el = card(
+          "card-packages", "🕒", "Rental packages",
+          p.selected_hours ? `${p.selected_hours} hrs selected` : null,
+          `<div class="pkg-grid">${packages.map(pkg =>
+            `<button class="pkg-btn${pkg.hours === p.selected_hours ? " selected" : ""}` +
+            `${pkg.from_rate_card === false ? " configured" : ""}" data-hours="${pkg.hours}">` +
+            `${esc(pkg.label || pkg.hours + " hrs")}</button>`).join("")}</div>` +
+          // Says which of the two lists this is. Solid chips came from the rate card
+          // and can be priced; dashed ones are the configured durations, offered
+          // because the rate card could not be read.
+          (configured
+            ? `<div class="cab-hint">These are the configured durations — the rate ` +
+              `card could not be read, so the distance each one includes is unknown. ` +
+              `A price can still come back: the backend matches the chart itself.</div>`
+            : "")
+        );
+        el.querySelectorAll(".pkg-btn").forEach(btn => {
+          btn.addEventListener("click", () => {
+            if (btn.disabled) return;
+            // Sent as a bare duration so it parses whatever else is in flight.
+            sendMessage(`${btn.dataset.hours} hours`);
+          });
+        });
+        col.appendChild(el);
+        liveChooser = el;
+
+      } else if (type === "cab_fare") {
+        const opts = p.options || [];
+        // `selected_by_rider` is the difference between "this is the cab you chose" and
+        // "this is the one we recommend" — the app's Rent a Car screen needs the first
+        // one preselected, so the test page shows which it got.
+        const chosen = p.selected_by_rider === true;
+        const body =
+          kv([
+            ["Package",   p.rental_hours ? `${p.rental_hours} hrs${p.included_km ? ` / ${Math.round(p.included_km)} km` : ""}` : null],
+            [chosen ? "Your cab" : "Recommended", p.vehicle_label || p.category_name],
+            ["Seats",     p.seat_capacity],
+            ["Fare",      p.fare_inr != null ? rupees(p.fare_inr) : null, true],
+            ["After offer", p.fare_after_offer_inr != null ? rupees(p.fare_after_offer_inr) : null],
+            ["Trip type", p.trip_type],
+          ]) +
+          // The radio group, as taps. Sent as the bare tier name so it parses whatever
+          // else is in flight — the backend matches it against these same categories.
+          (opts.length
+            ? `<div style="margin-top:8px">${opts.map(o =>
+                `<button class="cab-row${
+                  chosen && o.category_name === p.category_name ? " selected" : ""
+                }" data-cab="${esc(o.category_name || "")}">` +
+                `<span class="cab-name">${esc(o.category_name)}` +
+                `${o.seat_capacity ? ` <span class="cab-seats">· ${o.seat_capacity} seats</span>` : ""}</span>` +
+                `<span class="cab-fare">${o.total_fare_inr != null ? rupees(o.total_fare_inr) : "—"}</span>` +
+                `</button>`
+              ).join("")}` +
+              (chosen ? "" : `<div class="cab-hint">Pick a cab to complete the booking.</div>`) +
+              `</div>`
+            : "");
+        const el = card(
+          "card-fare", "💰", "Fare — from the Him Cab fare service",
+          p.fare_inr != null ? rupees(p.fare_inr) : null, body
+        );
+
+        // Only the newest fare card stays live, for the same reason as the packages.
+        if (liveCabChooser) {
+          liveCabChooser.querySelectorAll(".cab-row").forEach(b => (b.disabled = true));
+        }
+        el.querySelectorAll(".cab-row").forEach(btn => {
+          btn.addEventListener("click", () => {
+            if (btn.disabled || !btn.dataset.cab) return;
+            sendMessage(btn.dataset.cab);
+          });
+        });
+        col.appendChild(el);
+        liveCabChooser = el;
+
+      } else if (type === "offers") {
+        const offers = p.offers || [];
+        if (!offers.length) return;
+        col.appendChild(card(
+          "card-offers", "🏷️", "Offers on this rental",
+          offers[0].fare_after_offer_inr != null ? rupees(offers[0].fare_after_offer_inr) : null,
+          offers.map(o =>
+            `<div class="kv-row"><span class="kv-label">${esc(o.coupon_code)}` +
+            `${o.coupon_name ? " — " + esc(o.coupon_name) : ""}</span>` +
+            `<span class="kv-value">−${rupees(o.coupon_value_inr)}</span></div>`).join("")
+        ));
+
+      } else if (type === "booking_handoff") {
+        // A rental handoff carries a pickup and a duration; `destination` is null by
+        // design — the rider decides where to go once the car is theirs.
+        const o = p.origin || {};
+        col.appendChild(card(
+          "card-booking", "🚕", "Open booking screen", p.trip_type,
+          kv([
+            ["Pickup",     o.name],
+            ["Pin",        o.lat != null ? `${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}` : null],
+            ["Hours",      p.rental_hours],
+            ["Included",   p.included_km ? `${Math.round(p.included_km)} km` : null],
+            ["Passengers", p.passengers],
+            ["When",       p.travel_dates],
+            ["Time",       p.pickup_time],
+            // Preselect this on the Rent a Car screen when the rider picked it — asking
+            // again for a choice they have already made is the thing to avoid.
+            [p.category_selected_by_rider ? "Cab (chosen)" : "Cab (suggested)",
+                           p.recommended_category_name],
+            ["Fare",       p.fare_inr != null ? rupees(p.fare_inr) : null, true],
+            ["Coupon",     p.coupon_code],
+          ])
+        ));
+
+      } else if (type === "request_cancelled") {
+        // The rider called it off. Everything this conversation put on screen belongs
+        // to a request that no longer exists, so the choosers and the booking card are
+        // struck through here — leaving a tappable "Book" button above a cancellation
+        // is how somebody books the thing they just cancelled.
+        document.querySelectorAll(".event-card.card-packages, .event-card.card-fare, " +
+                                 ".event-card.card-booking, .event-card.card-offers")
+          .forEach(el => el.classList.add("void"));
+        document.querySelectorAll(".pkg-btn, .cab-row").forEach(b => (b.disabled = true));
+        liveChooser = null;
+        liveCabChooser = null;
+
+        const dropped = (p.cleared_fields || []).length;
+        col.appendChild(card(
+          "card-cancel", "🚫", "Request cancelled", p.scope,
+          kv([
+            ["Booking screen", p.dismiss_booking_screen ? "dismiss it" : null],
+            ["Details cleared", dropped ? `${dropped} field${dropped > 1 ? "s" : ""}` : "none"],
+            // Only a confirmed booking needs somewhere else to go; this chat never
+            // made one, and the backend is not called by this event.
+            ["Send rider to", p.open_screen],
+          ]) +
+          ((p.cleared_fields || []).length
+            ? `<div class="cab-hint">Cleared: ${esc((p.cleared_fields || []).join(", "))}</div>`
+            : "")
+        ));
+
+      } else if (type === "weather_alert" || type === "snowfall_alert") {
+        col.appendChild(card("card-booking", "⛈️", type.replace(/_/g, " "), null,
+          `<div class="card-pre">${esc(JSON.stringify(p, null, 2))}</div>`));
+
+      } else if (type) {
+        col.appendChild(card("", "📋", type.replace(/_/g, " "), null,
+          `<div class="card-pre">${esc(JSON.stringify(p, null, 2))}</div>`));
+      }
+    }
+
+    // ── Open the chat ─────────────────────────────────────────────────────
+    async function startChat() {
+      try {
+        const query = new URLSearchParams(fixParams()).toString();
+        const res = await fetch(`${CHAT_API}/start${query ? "?" + query : ""}`, {
+          method: "POST",
+          headers: authHeaders(),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.detail || body.error?.message || `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        const place = data.location?.place_name;
+        $sessionInfo.textContent = place
+          ? `${place} · ${data.persona}`
+          : `${data.persona} · #${data.session_id.slice(0, 8)}`;
+        setStatus(true);
+        const { col } = addMessage("assistant", data.message);
+        // /rental/start ships the bookable packages with the greeting, because the
+        // greeting is what asks for a duration. Same shapes as a turn's events, so the
+        // same renderer handles them.
+        const events = data.structured_events || [];
+        events.forEach(ev => buildEventCard(ev, col));
+        scrollBottom();
+
+        // Configured-fallback packages mean the rate card could not be read. The chat
+        // still works — the rider is offered real durations and the backend can still
+        // price them — which is exactly why this notice has to say what is missing: a
+        // silent degradation is indistinguishable from a healthy one.
+        const haveRateCard = events.some(
+          e => e.type === "rental_packages" &&
+               (e.payload?.packages || []).some(pkg => pkg.from_rate_card !== false)
+        );
+        if (!haveRateCard) {
+          showNotice(usingDevToken()
+            ? "<b>No prices yet.</b> This page is using the placeholder " +
+              "<code>dev-test-token</code>, which the backend treats as no rider " +
+              "credential at all — so the rate card and every fare are unavailable. " +
+              "Paste a real Him Cab rider JWT to see prices."
+            : "<b>Rate card unreadable.</b> The Him Cab rate card " +
+              "(<code>/api/rider/fare/get-all</code>) returned nothing this page can " +
+              "read, so the durations offered come from configuration and no distance " +
+              "allowance is known for them. Fares are still requested. Run " +
+              "<code>python scripts/check_rental.py --jwt &lt;token&gt; --raw</code> " +
+              "to see exactly what came back.");
+        } else {
+          hideNotice();
+        }
+      } catch (e) {
+        showError("Could not start chat: " + e.message);
+        setStatus(false);
+      }
+    }
+
+    // ── Send a message ────────────────────────────────────────────────────
+    async function sendMessage(userText) {
+      if (!userText.trim() || isStreaming) return;
+
+      isStreaming = true;
+      addMessage("user", userText);
+      $input.value = "";
+      $input.style.height = "auto";
+      updateSendBtn();
+      showTyping();
+
+      const url = `${CHAT_API}/stream?` + new URLSearchParams({
+        message: userText,
+        ...fixParams(),
+      });
+
+      let fullText = "", bubble = null, col = null, row = null;
+      const turnEvents = [];
+
+      try {
+        // fetch + a reader rather than EventSource: SSE cannot carry an
+        // Authorization header, and every rental call is rider-authenticated.
+        const response = await fetch(url, { headers: authHeaders() });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || body.error?.message || `HTTP ${response.status}`);
+        }
+
+        const refs = addMessage("assistant", "");
+        ({ bubble, col, row } = refs);
+        row.style.display = "none";        // keep the dots until the first token
+        let firstToken = true;
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "", eventType = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) { eventType = line.slice(6).trim(); continue; }
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            let data;
+            try { data = JSON.parse(raw); } catch { continue; }
+
+            if (eventType === "token") {
+              if (firstToken) { firstToken = false; hideTyping(); row.style.display = ""; }
+              fullText += data.token;
+              bubble.innerHTML = marked.parse(fullText);
+              scrollBottom();
+            } else if (eventType === "structured") {
+              if (firstToken) { firstToken = false; hideTyping(); row.style.display = ""; }
+              turnEvents.push(data);
+              buildEventCard(data, col);
+              scrollBottom();
+            } else if (eventType === "error") {
+              showError(data.message || "Agent error");
+            }
+          }
+        }
+        hideTyping();
+        if (row) row.style.display = "";
+
+        // A package was chosen but no fare came back. The assistant is right to stay
+        // silent about a price it never received — but on a test page, silence is the
+        // symptom being investigated, so name the step that failed. "The fare service
+        // returned nothing" used to be printed unconditionally, which was a guess and
+        // usually the wrong one: the commonest cause by far is having no rider token, in
+        // which case the fare service was never called at all.
+        const chose = turnEvents.find(
+          e => e.type === "rental_packages" && e.payload?.selected_hours);
+        if (chose && !turnEvents.some(e => e.type === "cab_fare") && col) {
+          const hours = esc(chose.payload.selected_hours);
+          const configured = (chose.payload.packages || [])
+            .some(pkg => pkg.from_rate_card === false);
+          let why;
+          if (usingDevToken()) {
+            why = "This page is running on the placeholder <code>dev-test-token</code>, " +
+                  "which the backend treats as no rider credential — so the fare " +
+                  "service was never called. Paste a real Him Cab rider JWT in the " +
+                  "Token box above.";
+          } else if (configured) {
+            why = "The rate card could not be read, so these are the configured " +
+                  "durations. The fare was still requested for " + hours + " hours " +
+                  "(the backend matches the chart itself) and nothing usable came " +
+                  "back — most likely there is no rental chart configured for " +
+                  hours + " hours.";
+          } else {
+            why = "The fare service returned nothing usable, so nothing is shown " +
+                  "rather than a made-up number.";
+          }
+          const note = document.createElement("div");
+          note.className = "no-fare";
+          note.innerHTML =
+            `<b>No price came back for ${hours} hours.</b> ` + why +
+            " Run <code>python scripts/check_rental.py --jwt &lt;token&gt; --hours " +
+            hours + " --raw</code> to see exactly which step failed.";
+          col.appendChild(note);
+          scrollBottom();
+        }
+      } catch (e) {
+        hideTyping();
+        showError(e.message);
+        if (!bubble) addMessage("assistant", "Sorry — something went wrong. Please try again.");
+      } finally {
+        isStreaming = false;
+        updateSendBtn();
+        $input.focus();
+      }
+    }
+
+    // ── Bindings ──────────────────────────────────────────────────────────
+    document.querySelectorAll(".quick-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        $input.value = chip.dataset.msg;
+        updateSendBtn();
+        $input.focus();
+      });
+    });
+
+    $input.addEventListener("input", () => {
+      $input.style.height = "auto";
+      $input.style.height = Math.min($input.scrollHeight, 110) + "px";
+      updateSendBtn();
+    });
+
+    $input.addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage($input.value); }
+    });
+
+    $sendBtn.addEventListener("click", () => sendMessage($input.value));
+
+    document.getElementById("btn-new").addEventListener("click", async () => {
+      $messages.innerHTML = "";
+      liveChooser = null;
+      liveCabChooser = null;
+      $welcome.style.display = "flex";
+      $sessionInfo.textContent = "";
+      await startChat();
+      $input.focus();
+    });
+
+    function openRig() {
+      $rigBar.classList.add("show");
+      $rigToken.value = usingDevToken() ? "" : RIDER_TOKEN;
+      $rigLat.value = riderFix?.lat ?? "";
+      $rigLon.value = riderFix?.lon ?? "";
+      $rigToken.focus();
+    }
+
+    document.getElementById("btn-rig").addEventListener("click", () => {
+      if ($rigBar.classList.contains("show")) $rigBar.classList.remove("show");
+      else openRig();
+    });
+
+    document.getElementById("notice-action").addEventListener("click", openRig);
+
+    document.getElementById("rig-apply").addEventListener("click", async () => {
+      const token = $rigToken.value.trim();
+      RIDER_TOKEN = token || "dev-test-token";
+      if (token) localStorage.setItem(TOKEN_KEY, token);
+      else localStorage.removeItem(TOKEN_KEY);
+
+      const lat = parseFloat($rigLat.value), lon = parseFloat($rigLon.value);
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        riderFix = { lat, lon };
+        localStorage.setItem(FIX_KEY, JSON.stringify(riderFix));
+      } else {
+        riderFix = null;
+        localStorage.removeItem(FIX_KEY);
+      }
+
+      // A token change means a different rider, so the old conversation is not ours.
+      $rigBar.classList.remove("show");
+      $messages.innerHTML = "";
+      liveChooser = null;
+      liveCabChooser = null;
+      $welcome.style.display = "flex";
+      await startChat();
+    });
+
+    // ── Health ────────────────────────────────────────────────────────────
+    async function checkHealth() {
+      try { setStatus((await fetch(`${API_BASE}/v1/health`)).ok); }
+      catch { setStatus(false); }
+    }
+    checkHealth();
+    setInterval(checkHealth, 30000);
+
+    // ── Go ────────────────────────────────────────────────────────────────
+    (async () => {
+      // Open the token box before the first call when there is nothing to send: the
+      // rate card is the very first thing /start fetches, and it needs a real JWT.
+      if (usingDevToken()) openRig();
+      if (!riderFix) riderFix = await browserFix();
+      await startChat();
+      if (!usingDevToken()) $input.focus();
+    })();
+  </script>
+</body>
+</html>

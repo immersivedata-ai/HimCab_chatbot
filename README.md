@@ -50,7 +50,7 @@ travel_assistant/
 │   └── cloudrun.yaml
 ├── docs/                       # Architecture docs & reference material
 ├── scripts/                    # Dev setup & data seeding scripts
-├── frontend/                   # Static demo/test HTML clients
+├── frontend/                   # Static test HTML clients (local only — not built into the image)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

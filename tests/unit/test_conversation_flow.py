@@ -74,11 +74,17 @@ class Conversation:
         self.persona = persona
         self.default_intent = intent
         self.visitor_type = persona
+        # A rental chat opens on a different question, so it starts with a different
+        # field in flight — exactly as `_create_session` seeds it.
+        is_rental = persona == slots.RENTAL
         self.entities = ExtractedEntities(
             visitor_type=persona,
-            last_asked_field="destination",
+            last_asked_field="rental_hours" if is_rental else "destination",
         )
-        self.messages = [AIMessage(content="Where would you like to go?")]
+        self.messages = [AIMessage(content=(
+            "How long do you need the car for?" if is_rental
+            else "Where would you like to go?"
+        ))]
         self.turns: list[Turn] = []
 
     async def say(self, text: str, extraction=None, intent: str | None = None) -> Turn:
@@ -187,6 +193,74 @@ class TestQuestionsDoNotHijackAnswers:
 
         assert turn.produced
         assert chat.questions_asked == 0
+
+
+# ── 1b. "When I type a sentence it goes off the rails" ────────────────────────
+#
+# Reported from the Rent a Car screen. A rental sentence carries five details at once,
+# and they used to be understood ONLY by the extraction model — so a field it missed was
+# lost, and the assistant asked for something it had just been told. These conversations
+# are driven with the model reporting NOTHING, which is the worst case and the one that
+# used to produce an irrelevant reply.
+
+class TestARentalSentenceIsUnderstood:
+
+    @pytest.mark.asyncio
+    async def test_one_sentence_is_enough_to_reach_a_quote(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say(
+            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
+        )
+
+        assert turn.produced, "asked a question about details the sentence had given"
+        assert chat.questions_asked == 0
+        assert (chat.entities.rental_hours, chat.entities.origin) == (8, "Shimla")
+        assert chat.entities.pickup_time == "09:00"
+
+    @pytest.mark.asyncio
+    async def test_the_same_sentence_in_hinglish(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say(
+            "Kal subah 6 baje Manali se gaadi chahiye 5 ghante ke liye, hum 4 hain",
+            NOTHING,
+        )
+
+        assert turn.produced
+        assert chat.entities.rental_hours == 5
+        assert chat.entities.pickup_time == "06:00"
+        assert chat.entities.origin == "Manali"
+
+    @pytest.mark.asyncio
+    async def test_a_sentence_is_still_understood_when_vertex_is_down(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say("3 hrs from Kullu tomorrow at 10 am, 2 of us", None)
+
+        assert turn.produced
+        assert chat.entities.rental_hours == 3
+        assert chat.entities.origin == "Kullu"
+
+    @pytest.mark.asyncio
+    async def test_a_rental_is_never_asked_where_it_is_going(self):
+        """The reported reply: asked for a car by the hour and answered with "where would
+        you like to go?" and "how many days?". A rental has neither."""
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        await chat.say("I need a car", NOTHING)
+        await chat.say("8 hours", NOTHING)
+        await chat.say("dunno", NOTHING)
+
+        asked = [t.result["last_asked_field"] for t in chat.turns]
+        assert "destination" not in asked
+        assert "duration_days" not in asked
+
+    @pytest.mark.asyncio
+    async def test_a_partial_sentence_asks_only_for_what_is_missing(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say("a car for 8 hours tomorrow", NOTHING)
+
+        assert turn.asked
+        assert turn.result["last_asked_field"] == "origin"
+        assert chat.entities.rental_hours == 8
+        assert chat.entities.travel_dates.lower() == "tomorrow"
 
 
 # ── 2. "It never generates" ───────────────────────────────────────────────────
@@ -404,6 +478,22 @@ class TestTheAgentAlwaysGetsToAnAnswer:
             "Shimla", "Delhi", 3, 4, "next week"
         )
 
+    @pytest.mark.asyncio
+    async def test_a_misspelled_date_answer_does_not_re_ask_the_same_question(self):
+        """The reported loop: asked "when are you planning to travel?", the user typed
+        "tommorow", and the identical question came straight back. With the extractor
+        down the code parser is the only safety net — it must read the typo as the
+        answer, fill the date, and let the turn move on instead of asking again."""
+        chat = Conversation()
+        for reply in ("shimla", "delhi", "3 days", "4 people"):
+            await chat.say(reply, None)
+        assert chat.turns[-1].result["last_asked_field"] == "travel_dates"
+
+        turn = await chat.say("tommorow", None)
+
+        assert turn.produced, "re-asked for the date after the user had answered it"
+        assert chat.entities.travel_dates == "tommorow"
+
 
 # ── 3. "It assumes things" ────────────────────────────────────────────────────
 
@@ -495,7 +585,13 @@ class TestAnswerParsers:
 
     @pytest.mark.parametrize(
         "text,expected",
-        [("4", 4), ("4 people", 4), ("4 log", 4), ("four", None), ("0", None), ("kal", None)],
+        [("4", 4), ("4 people", 4), ("4 log", 4),
+         # What riders actually type when asked "how many people?"
+         ("4 of us", 4), ("we are 4", 4), ("just 2", 2), ("4 log hain", 4),
+         ("four", None), ("0", None), ("kal", None),
+         # A number about something else must never become a headcount, even though
+         # this parser only runs when the group size is the question in flight.
+         ("4 hours", None), ("4 days", None), ("4 pm", None), ("4 star hotel", None)],
     )
     def test_group_size(self, text, expected):
         assert slots.parse_group_size(text) == expected
@@ -512,6 +608,12 @@ class TestAnswerParsers:
         "text,expected",
         [("kal", "kal"), ("next week", "next week"), ("15 Jan", "15 Jan"),
          ("agle mahine", "agle mahine"), ("this weekend", "this weekend"),
+         # A misspelled day is still a day — a typo must not cost the rider a turn,
+         # the same way "8 hourse" does not in the rental flow. This is the reported
+         # case: "tommorow" was rejected, so the same "when?" question came straight
+         # back. Kept verbatim, exactly as the correctly-spelled reply would be.
+         ("tommorow", "tommorow"), ("tomorow", "tomorow"), ("tomarrow", "tomarrow"),
+         ("tmrw", "tmrw"), ("tonite", "tonite"),
          # travel_dates is the last field a combined question covers, so a reply that
          # answered a different one must not fall through into it.
          ("shimla", None), ("with my family", None),
@@ -519,6 +621,13 @@ class TestAnswerParsers:
     )
     def test_when(self, text, expected):
         assert slots.parse_when(text) == expected
+
+    @pytest.mark.parametrize("typo", ["tommorow", "tomorow", "tomarrow", "tonite"])
+    def test_a_misspelled_date_is_not_mistaken_for_a_place(self, typo):
+        """The boundary the two parsers police must hold for typos too: a misspelled
+        day answered to the destination question fills nothing, rather than becoming a
+        place named "Tommorow"."""
+        assert slots.parse_place(typo) is None
 
     def test_each_field_only_accepts_a_reply_of_its_own_shape(self):
         """The parsers police each other's boundaries, so a reply aimed at one field

@@ -15,7 +15,13 @@ Three response shapes, chosen by `slots.response_mode(intent, visitor_type)`:
   • RIDE      — a cab recommendation for a Himachal resident: vehicle, fare, drive
                 time, weather, then a handoff to the app's booking screen. They know
                 the place; what they are choosing is the ride.
+  • RENTAL    — a car and driver by the hour: the package, the cab options and the
+                price. No route and no destination, because hiring by the hour means
+                the rider has not chosen one.
   • ANSWER    — a short direct answer to a question about somewhere
+  • CANCELLED — the rider called it off. Handled by `cancel_node` before this node is
+                reached; the guard at the top of `writer_node` is what makes sure a
+                cancellation can never be answered with any of the four above.
 
 Live data always beats generated data. Whatever the model writes, the real cab fare,
 the real weather report and the measured journey are stamped onto the validated
@@ -38,6 +44,7 @@ from app.agent import slots
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.enums import TripType
 from app.core.logging import get_logger
 from app.models.itinerary import (
     ActivityType,
@@ -142,6 +149,14 @@ def _build_fare_block(state: AgentState) -> str:
 
     headline = cf.get("category_name")
     distance_km = cf.get("distance_km")
+    # The headline is the rider's own pick once they have made one, so it must not be
+    # labelled as our suggestion — a reply that "recommends" the cab they just chose
+    # reads as not having heard them.
+    chosen = bool(cf.get("selected_by_rider"))
+    headline_flag = (
+        "  (THE CAB THEY CHOSE — confirm this one)" if chosen
+        else "  (recommended for this group/budget)"
+    )
 
     lines = []
     for o in options:
@@ -151,10 +166,17 @@ def _build_fare_block(state: AgentState) -> str:
         name = o.get("category_name") or "Cab"
         seats = o.get("seat_capacity")
         seat_str = f", {seats}-seater" if seats else ""
-        flag = "  (recommended for this group/budget)" if name == headline else ""
+        flag = headline_flag if name == headline else ""
         lines.append(f"  - {name}: Rs {round(fare):,}{seat_str}{flag}")
 
-    route = f" for the {round(distance_km)} km drive" if distance_km else ""
+    # For a rental the distance is the package's INCLUDED kilometres, not a drive
+    # between two towns — calling it a drive would misdescribe what the price covers.
+    if cf.get("rental_hours"):
+        route = f" for the {cf['rental_hours']}-hour package"
+        if distance_km:
+            route += f" ({round(distance_km)} km included)"
+    else:
+        route = f" for the {round(distance_km)} km drive" if distance_km else ""
     header = (
         f"### HIM CAB FARES (live prices — use these EXACT figures)\n"
         f"Him Cab fares{route}, quoted by the backend for the measured road\n"
@@ -330,6 +352,143 @@ def _apply_weather(itinerary: Itinerary, state: AgentState) -> None:
     )
 
 
+def _has_current_weather(state: AgentState) -> bool:
+    """True when there is an actual temperature to quote.
+
+    Deliberately stricter than `bool(state.weather_data)`: a report can arrive with a
+    null temperature, and a truthy-dict check then promises the writer a number that
+    is not there — which is how a reply ends up describing what it does not have.
+    """
+    return (state.weather_data or {}).get("current_temp_c") is not None
+
+
+def _rental_duration_chosen(state: AgentState) -> bool:
+    """True when the rider has settled on a duration this turn can act on.
+
+    The first gate for a rental turn. `tool_executor` clears the slot when the duration
+    is not one of the offered packages, so an unsellable "6 hours" lands here as False.
+    """
+    return bool(state.entities.rental_hours)
+
+
+def _rental_cab_chosen(state: AgentState) -> bool:
+    """True when the price in front of the rider is for the cab THEY picked.
+
+    Set by `tool_executor._select_requested_category`, which only sets it after finding
+    the tier among the categories the backend actually priced — so this is never true on
+    the rider's word alone.
+    """
+    return bool((state.cab_fare or {}).get("selected_by_rider"))
+
+
+def _rental_ready_to_book(state: AgentState) -> bool:
+    """True when this turn may hand the rider to the booking screen.
+
+    THE gate for a rental handoff, and deliberately the same condition the prompt
+    branches on — read by both so the reply can never announce a booking screen while
+    the text above it is still asking which cab to open it on. The app's Rent a Car
+    screen will not book without a cab selected, so neither will we.
+
+    A turn with no priced options is ready as soon as the duration is settled: there is
+    no list to choose from, the reply says the price is confirmed at booking, and the
+    screen is where the rider picks their cab.
+    """
+    if not _rental_duration_chosen(state):
+        return False
+    return not state.awaiting_cab_choice
+
+
+def _build_rental_section(state: AgentState) -> str:
+    """The rental packages and what the rider has chosen, or how to ask.
+
+    The packages come from the rate card, and the reply may offer NO others: the
+    backend matches a duration against a chart exactly (`rentHours == maxHour`), so
+    inventing a "6 hour" option produces a request that returns no fare and a rider who
+    was quoted for something Him Cab does not sell.
+    """
+    packages = state.rental_packages
+    hours = state.entities.rental_hours
+    lines = ["\n### RENTAL"]
+
+    if packages:
+        offered = ", ".join(p["label"] for p in packages)
+        lines.append(f"- Packages Him Cab offers: {offered}")
+        lines.append(
+            "- Offer ONLY these. Never invent a duration, and never imply one can be "
+            "split or combined."
+        )
+    else:
+        lines.append(
+            "- The package list is unavailable right now, so do NOT name any duration "
+            "or included distance."
+        )
+
+    # A duration the rate card does not sell. The slot has already been cleared so the
+    # rider's next answer is read as a fresh choice — but the reply still has to say
+    # what they asked for and that it is not sold, or the re-ask looks like the
+    # assistant simply forgot.
+    rejected = state.unbookable_rental_hours
+    if rejected:
+        lines.append(
+            f"- The rider asked for {rejected} hours, which is NOT one of the packages. "
+            f"Say so plainly, name the ones above, and ask them to pick one. Do NOT "
+            f"quote a price for {rejected} hours."
+        )
+    elif hours:
+        chosen = next((p for p in packages if p["hours"] == hours), None)
+        if chosen:
+            lines.append(f"- The rider chose: {chosen['label']}")
+        elif packages:
+            lines.append(
+                f"- The rider asked for {hours} hours, which is NOT one of the packages. "
+                f"Say so plainly, name the ones above, and ask them to pick one. Do NOT "
+                f"quote a price for {hours} hours."
+            )
+        else:
+            lines.append(f"- The rider asked for {hours} hours.")
+    else:
+        lines.append("- No duration chosen yet.")
+
+    # The pickup clock time, when they gave one. Stated in the reply because it is what
+    # the fare was calculated on — the rider should be able to see the figure their
+    # price depends on, and spot it if we heard them wrong.
+    if state.entities.pickup_time:
+        when = state.entities.travel_dates
+        lines.append(
+            f"- Pickup time: {state.entities.pickup_time}"
+            + (f" on {when}" if when else "")
+            + ". Say it back to them exactly; the fare is calculated from this time."
+        )
+    elif state.entities.travel_dates:
+        lines.append(f"- Pickup day: {state.entities.travel_dates}.")
+
+    # ── Which cab ─────────────────────────────────────────────────────────────
+    # The app's "Select Rental Cab" list, as a conversation. Three situations, and they
+    # are different replies: a cab we could not find, a cab they chose, and no choice
+    # yet. Merging them is how a reply ends up confirming one cab in prose while every
+    # price in it belongs to another.
+    unavailable = state.unavailable_cab_category
+    if unavailable:
+        lines.append(
+            f"- The rider asked for a {unavailable} cab, which is NOT one of the cabs "
+            f"available on this package. Say so plainly, name the cabs listed under HIM "
+            f"CAB FARES, and ask which of THOSE they would like. Do NOT quote a price "
+            f"for a {unavailable}."
+        )
+    elif _rental_cab_chosen(state):
+        chosen_cab = (state.cab_fare or {}).get("category_name") or "the cab they named"
+        lines.append(
+            f"- The rider chose this cab: {chosen_cab}. Confirm THAT cab and its price. "
+            f"Do not re-list the others and do not recommend a different one."
+        )
+    elif state.awaiting_cab_choice:
+        lines.append(
+            "- The rider has NOT chosen a cab yet, and the booking cannot be completed "
+            "until they do. List the priced cabs and ask which one they want."
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _build_journey_section(state: AgentState) -> str:
     """Distance and drive time for the route, or nothing when it isn't known.
 
@@ -374,16 +533,53 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
     rather than ask the rider to confirm anything.
     """
     route = state.route_estimate
-    if not route:
-        return None
-
     fare = state.cab_fare or {}
+    # A rental has no route — the booking screen opens on a pickup and a duration.
+    is_rental = slots.response_mode(state.intent, state.visitor_type) == slots.RENTAL_MODE
+    if not route and not is_rental:
+        return None
+    # Same gate the rental prompt reads, so text and event agree by construction: no
+    # duration and no cab chosen means the reply is still a question, and a question
+    # must not ship a button that opens a screen it has not finished filling in.
+    if is_rental and not _rental_ready_to_book(state):
+        return None
     # Prefill the coupon only when eligibility was actually checked against a fare.
     # Preselecting one we could not verify puts a code on the booking screen that the
     # payment step may then reject — worse than leaving the field empty.
     best_offer = next(
         (o for o in (state.offers or []) if o.get("applies_to_this_fare")), {}
     )
+    if is_rental:
+        pickup_name = state.entities.origin or state.entities.home_city
+        # Coordinates when the pickup could be placed, so the map opens on the point we
+        # priced; the bare name when it could not, so the app can geocode it itself.
+        origin_pin = state.pickup or {"name": pickup_name}
+        return {
+            "trip_type": TripType.RENTAL,
+            "origin": origin_pin,
+            # A rental has no drop — the rider decides where to go once the car is theirs.
+            "destination": None,
+            "rental_hours": state.entities.rental_hours,
+            "included_km": fare.get("included_km"),
+            # True when `recommended_category_*` is the rider's own pick rather than our
+            # recommendation. The app's Rent a Car screen should open with that cab
+            # already selected; anything else re-asks a question they have answered.
+            "category_selected_by_rider": bool(fare.get("selected_by_rider")),
+            "travel_dates": state.entities.travel_dates,
+            # The clock time the quote was priced on, so the booking screen opens on the
+            # same one. Sending the day without the hour would let the rider land on a
+            # default time and be charged a rate they were never shown.
+            "pickup_time": state.entities.pickup_time,
+            "passengers": state.entities.group_size,
+            "recommended_category_id": fare.get("category_id"),
+            "recommended_category_name": fare.get("category_name"),
+            "fare_inr": fare.get("fare_inr"),
+            "offer_id": best_offer.get("offer_id"),
+            "coupon_code": best_offer.get("coupon_code"),
+            "fare_after_offer_inr": best_offer.get("fare_after_offer_inr"),
+            "options": fare.get("options", []),
+        }
+
     return {
         "origin": route["origin"],
         "destination": route["destination"],
@@ -529,11 +725,30 @@ def _build_system_prompt(state: AgentState) -> str:
         f"be in {reply_language}. Do not use emojis."
     )
 
+    # How the pickup point is NAMED comes from the resolved route, which is the one
+    # place that knows how much the fix can be trusted: it says "Shimla" for a fix in
+    # Shimla and "near Mandi" for one 40 km out. Re-deriving the name here from the
+    # raw fix is how the prompt ended up asserting "the traveller starts from Mandi"
+    # to somebody who had never been there.
+    origin_display = (
+        (state.route_estimate or {}).get("origin", {}).get("name")
+        or entities.origin
+        or entities.home_city
+        or "not specified"
+    )
+
     weather_section = ""
     if state.weather_data:
         w = state.weather_data
+        # A rental's weather is fetched for the PICKUP (`_rental_tools`) — there is no
+        # destination to fetch it for. Labelling it with a destination invited the model
+        # to write about somewhere the rider never named, and to attach a real
+        # temperature to it.
+        weather_place = (
+            origin_display if mode == slots.RENTAL_MODE else destination_display
+        )
         weather_section = f"""
-**Current Weather at {destination_display}:**
+**Current Weather at {weather_place}:**
 - Temperature: {w.get('current_temp_c')}°C (feels like {w.get('feels_like_c')}°C)
 - Condition: {w.get('condition')}
 - Humidity: {w.get('humidity_percent')}%
@@ -556,17 +771,6 @@ def _build_system_prompt(state: AgentState) -> str:
     # happened to read.
     route_known = state.route_estimate is not None
     travel_section = ""
-    # How the pickup point is NAMED comes from the resolved route, which is the one
-    # place that knows how much the fix can be trusted: it says "Shimla" for a fix in
-    # Shimla and "near Mandi" for one 40 km out. Re-deriving the name here from the
-    # raw fix is how the prompt ended up asserting "the traveller starts from Mandi"
-    # to somebody who had never been there.
-    origin_display = (
-        (state.route_estimate or {}).get("origin", {}).get("name")
-        or entities.origin
-        or entities.home_city
-        or "not specified"
-    )
     # Itinerary mode ONLY. This block tells the model to open Day 1 with the arrival
     # journey and to allow for travel fatigue — right for a visitor planning days, wrong
     # for a resident booking a cab. In RIDE_MODE it was the instruction that produced
@@ -585,8 +789,13 @@ def _build_system_prompt(state: AgentState) -> str:
             "that journey. Account for travel fatigue — lighter activities on arrival day.\n"
         )
 
+    # Deliberately absent from a rental. The profile summary carries "Has visited:
+    # Manali, Kasol recently", "Frequent destinations: …", "Interests: trekking" and
+    # "eligible for loyalty discounts" — a travel history has no bearing on a car hired
+    # by the hour, and every line of it invites the reply to bring up a place the rider
+    # never mentioned or a discount no coupon backs.
     user_context = ""
-    if state.user_context_summary:
+    if state.user_context_summary and mode != slots.RENTAL_MODE:
         user_context = f"\n**User Profile:** {state.user_context_summary}"
 
     # ── Outstation-specific instructions ──────────────────────────────────────
@@ -676,6 +885,11 @@ def _build_system_prompt(state: AgentState) -> str:
     honesty_step = (
         "Use ONLY the facts given above. Never state a travel time, distance, price, date or "
         "live condition that does not appear here — say you can confirm it on booking instead."
+        "\nAnd never ANNOUNCE that something is missing. A fact you were not given is simply "
+        "not mentioned: no 'there is no information available about the current temperature', "
+        "no 'the weather could not be retrieved', no 'details are unavailable'. Reporting our "
+        "own gaps tells the rider nothing they can act on and reads as a broken assistant — "
+        "leave the line out instead."
     )
     # Weather was being dropped from itineraries even when it had been fetched, so when
     # there is a report it is a required section rather than an optional aside.
@@ -684,8 +898,11 @@ def _build_system_prompt(state: AgentState) -> str:
         "and condition from REAL-TIME DATA, and a packing or safety note if there is an "
         "alert or snowfall risk. Use only the numbers given."
         if state.weather_data
-        else "Weather: no live report was available — do not state any temperature or "
-             "condition, and do not claim the forecast is unavailable unless it is relevant."
+        # No loophole here: "unless it is relevant" used to sit on the end of this line,
+        # and the model took it — replies came back announcing that no temperature was
+        # available, which is our problem, not the rider's.
+        else "Weather: no live report was available. Write NO weather line at all — no "
+             "temperature, no condition, and no statement that any of it is unavailable."
     )
     assumptions_section = _build_assumptions_section(state)
     followup_step = _build_followup_instruction(state, reply_language)
@@ -712,8 +929,12 @@ def _build_system_prompt(state: AgentState) -> str:
         "and exact saving, and that it applies on the booking screen. Never quote a code "
         "that is not listed there, and never invent or adjust a discount."
         if has_offers
-        else "NEVER mention or invent any coupon, promo, or discount code — no offer "
-             "applies to this trip."
+        # "no offer applies to this trip" described the situation, so the model wrote
+        # it down: replies came back with a bullet reading "No coupon is applicable to
+        # this trip." Silence about discounts means writing nothing, not announcing a
+        # nothing — the rider loses a line of their reply to a fact worth zero to them.
+        else "Write NOTHING about coupons, promos, offers or discounts — not a code, "
+             "and not a line saying none applies. The subject does not come up."
     )
 
     if mode == slots.ANSWER_MODE:
@@ -729,6 +950,128 @@ def _build_system_prompt(state: AgentState) -> str:
             coupons_step,
             "End with ONE short line offering to plan the full trip if they'd like.",
         ]
+        json_block = ""
+
+    elif mode == slots.RENTAL_MODE:
+        # A car and a driver for a block of time. The rider is choosing a package and a
+        # vehicle, so the reply is the package, the price and the pickup — no route, no
+        # itinerary, and no destination, because hiring by the hour means they have not
+        # decided one and need not.
+        #
+        # The two situations below are genuinely different replies, and merging them is
+        # what produced the worst bug this flow has had: asked for 5 hours (which Him Cab
+        # does not sell), the assistant described the 4-hour package as though it had
+        # been chosen, and announced a booking screen that — correctly — never opened.
+        # A turn with no bookable duration is a QUESTION; only a chosen one confirms.
+        forbidden_step = (
+            "FORBIDDEN — do not write any of these, in any wording: a day-by-day plan, "
+            "sightseeing or things-to-do suggestions, a destination or drop-off point, "
+            "a route, a distance between two towns, a drive time, hotel or food advice, "
+            "or any JSON. They are hiring a car by the hour and have not said where "
+            "they are going."
+        )
+
+        if not _rental_duration_chosen(state):
+            rejected = state.unbookable_rental_hours
+            steps = [
+                language_step,
+                honesty_step,
+                (
+                    f"Line 1: say plainly that {rejected} hours is not one of the rental "
+                    f"packages Him Cab sells. State it once, without apologising at "
+                    f"length, and never quote or estimate a price for {rejected} hours."
+                    if rejected
+                    else "Line 1: say in one sentence that you can arrange a car and "
+                         "driver by the hour."
+                ),
+                "Line 2: list the packages from RENTAL below, exactly as written there "
+                "and no others.",
+                "Line 3: ask which one they would like. End on that question.",
+                "Write NOTHING else. In particular: no price, no cab list, no weather, "
+                "no coupon, and no mention of a booking screen — nothing has been "
+                "chosen, so nothing is open and nothing is reserved. Do not describe "
+                "any single package as though they had picked it.",
+                forbidden_step,
+                "Hard limit: 3 lines.",
+            ]
+        else:
+            steps = [
+                language_step,
+                honesty_step,
+                "Write to the rider as 'you', and as Him Cab as 'we'. Never refer to "
+                "Him Cab in the third person — 'we'll have the car with you' reads like "
+                "a person, 'Him Cab is ready to provide' reads like a form letter.",
+                "Line 1: confirm what they are getting in one natural sentence — the "
+                "package, the pickup and when. Do not describe WHO is travelling "
+                "('your family', 'your group of 4') unless the party is stated below; "
+                "a headcount nobody gave you is still an invention.",
+                "Then EXACTLY these bullets, in this order, and NOTHING else. Each is "
+                "ONE plain sentence at the SAME level — no bold labels like "
+                "'**Package:**', no headings, and no indented sub-lists.",
+                # The included kilometres are only known when the rate card was
+                # readable. Asking for them regardless is how a reply ends up stating a
+                # distance nobody sent us: an instruction the model cannot satisfy
+                # honestly is one it will satisfy dishonestly.
+                (
+                    "  (a) The package: hours and the kilometres it includes, from "
+                    "RENTAL below. Say plainly that distance beyond it is charged on "
+                    "the meter at drop-off. If RENTAL gives a pickup time, state it in "
+                    "this bullet exactly as written there — it is what the fare was "
+                    "calculated on."
+                    if (state.cab_fare or {}).get("included_km")
+                    else "  (a) The package: the number of hours, from RENTAL below, "
+                    "and the pickup time if RENTAL gives one (state it exactly as "
+                    "written there — it is what the fare was calculated on). Say NOTHING "
+                    "about included kilometres or a distance limit: no figure for this "
+                    "package reached you, and the booking screen confirms it."
+                ),
+                (
+                    # They picked one. Repeating the whole list here is how a reply
+                    # ends up quoting three prices for a booking that has exactly one.
+                    "  (b) THE cab they chose, from RENTAL below — vehicle, seats and "
+                    "its exact price from HIM CAB FARES. One bullet, that cab only. Do "
+                    "not list the other cabs and do not suggest a different one."
+                    if _rental_cab_chosen(state)
+                    else "  (b) One bullet PER CAB from HIM CAB FARES — vehicle, seats, "
+                    "price — each as its own top-level bullet, never nested under a "
+                    "heading. These are the cabs available on this package: list every "
+                    "one of them and never mention a vehicle that is not listed."
+                    if has_fares
+                    else "  (b) No fare came back for this package, so say in one line "
+                         "that the price is confirmed on the booking screen. Do NOT "
+                         "state, estimate, range or imply any number."
+                ),
+                # Present ONLY when there is a reading. Asking for a conditional bullet
+                # ("include it if available") invited the model to fill the slot by
+                # narrating the absence: "There is no information available about the
+                # current temperature at your pickup location." An instruction that
+                # isn't there cannot be answered badly.
+                *(
+                    ["  (c) Current temperature and condition at the pickup, copied "
+                     "from REAL-TIME DATA. One line."]
+                    if _has_current_weather(state)
+                    else ["Write NO weather bullet: there is no live reading for the "
+                          "pickup. Do not mention temperature or conditions at all, and "
+                          "do not say that they are unavailable."]
+                ),
+                coupons_step,
+                forbidden_step,
+                # The close is the one place the two halves of this branch differ, and
+                # it reads the SAME gate the `booking_handoff` event does. Announcing an
+                # open booking screen while still asking which cab is the failure this
+                # pairing exists to make impossible.
+                (
+                    "Last line: state that the booking screen is open with their "
+                    "package, their cab and their pickup already filled in. It must NOT "
+                    "be a question — do not ask them to confirm, and do not ask for any "
+                    "further detail."
+                    if _rental_ready_to_book(state)
+                    else "Last line: ask which of the cabs above they would like. End "
+                         "on that question, and say NOTHING about a booking screen — "
+                         "nothing opens until they have picked a cab."
+                ),
+                "Hard limit: at most 7 lines in total, including the bullets.",
+            ]
         json_block = ""
 
     elif mode == slots.RIDE_MODE:
@@ -832,16 +1175,36 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
 
     # Only facts the user actually gave are stated as facts; everything the planner
     # could not confirm is listed under assumptions instead of being filled in here.
-    trip_facts = [
-        f"- Destination: {destination_display}",
-        f"- Origin: {origin_display}",
-        f"- Group: {resolved_group_type}"
-        + (f" ({entities.group_size} people)" if entities.group_size else " (size not stated)"),
-        f"- Travel dates: {entities.travel_dates or 'not stated — do not name specific dates'}",
-        f"- Visitor type: {state.visitor_type or 'unknown'}",
-    ]
-    if mode != slots.RIDE_MODE:
-        # A resident booking a cab is not choosing a holiday length or a budget tier.
+    #
+    # A rental gets its own list, and the omission is the point: this block used to
+    # open with "Destination: not stated — answer generally about Himachal Pradesh",
+    # which is an invitation to write about a place in a reply whose whole job is a car,
+    # a duration and a price. Worse, when the extractor had picked a place up in passing
+    # ("a car for 8 hours around Manali"), the line named it as the trip's destination.
+    if mode == slots.RENTAL_MODE:
+        trip_facts = [
+            f"- Pickup: {origin_display}",
+            f"- Date: {entities.travel_dates or 'not stated — do not name a date'}",
+            f"- Pickup time: {entities.pickup_time or 'not stated — do not state a time'}",
+            "- There is NO destination and NO trip length. They are hiring a car by the "
+            "hour; where they go is their business and they need not have decided.",
+        ]
+        if entities.group_size:
+            trip_facts.insert(1, f"- Party: {entities.group_size} people")
+    else:
+        trip_facts = [
+            f"- Destination: {destination_display}",
+            f"- Origin: {origin_display}",
+            f"- Group: {resolved_group_type}"
+            + (f" ({entities.group_size} people)" if entities.group_size
+               else " (size not stated)"),
+            f"- Travel dates: "
+            f"{entities.travel_dates or 'not stated — do not name specific dates'}",
+            f"- Visitor type: {state.visitor_type or 'unknown'}",
+        ]
+    if mode not in (slots.RIDE_MODE, slots.RENTAL_MODE):
+        # Neither a resident booking a cab nor a rider hiring by the hour is
+        # choosing a holiday length or a budget tier.
         trip_facts.insert(2, (
             f"- Duration: {duration_days} days"
             + ("" if entities.duration_days else " (ASSUMED — the user never said)")
@@ -855,14 +1218,23 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
             f"{', '.join(entities.interests) if entities.interests else 'general sightseeing'}"
         )
 
-    journey_section = _build_journey_section(state)
+    journey_section = (
+        _build_rental_section(state) if mode == slots.RENTAL_MODE
+        else _build_journey_section(state)
+    )
+
+    # "TRIP" is the wrong word for a car hired by the hour, and a heading is an
+    # instruction like any other — the model wrote trips under it.
+    facts_heading = (
+        "THIS RENTAL" if mode == slots.RENTAL_MODE else "TRIP"
+    )
 
     return f"""You are the AI travel concierge for **Him Cab** — Himachal Pradesh's most trusted local cab service. Help the user genuinely, and guide them toward booking their travel with Him Cab.
 
 ## LANGUAGE (STRICT)
 {language_instruction}
 
-## TRIP
+## {facts_heading}
 {chr(10).join(trip_facts)}
 {user_context}
 {assumptions_section}{journey_section}{travel_section}{outstation_instructions}{local_instructions}
@@ -977,6 +1349,43 @@ async def writer_node(state: AgentState) -> dict:
     log.info("writer_node_entered", session_id=state.session_id, intent=state.intent)
 
     mode = slots.response_mode(state.intent, state.visitor_type)
+
+    # A cancellation never reaches this node — the graph routes it to `cancel_node`
+    # straight out of the router. This is the guard under that, because the cost of
+    # being wrong here is the whole reported bug: with no branch of its own, a
+    # CANCELLED turn would fall through to the itinerary prompt below and answer
+    # "cancel my booking" with a four-day plan and a booking screen. Every future
+    # branch added to this graph gets that protection for free.
+    if mode == slots.CANCELLED_MODE:
+        from app.agent.cancellation import (
+            cancel_scope,
+            cancellation_event,
+            cancellation_message,
+            clear_request,
+        )
+        from app.agent.language import detect_reply_language
+
+        log.warning("writer_reached_by_a_cancellation", session_id=state.session_id)
+        lang_key, _ = detect_reply_language(state)
+        latest = next(
+            (m.content for m in reversed(state.messages)
+             if isinstance(m, HumanMessage) and isinstance(m.content, str)),
+            "",
+        )
+        scope = cancel_scope(latest, state.entities)
+        entities, cleared = clear_request(state.entities)
+        text = cancellation_message(scope, lang_key)
+        if state.token_stream is not None:
+            await state.token_stream.put(text)
+            await state.token_stream.put(None)
+        return {
+            "final_response_text": text,
+            "messages": [AIMessage(content=text)],
+            "entities": entities,
+            "structured_events": [cancellation_event(scope, cleared)],
+            "node_trace": ["writer"],
+        }
+
     wants_itinerary = mode == slots.ITINERARY_MODE
     system_prompt = _build_system_prompt(state)
 
@@ -1095,6 +1504,18 @@ async def writer_node(state: AgentState) -> dict:
                 "payload": state.snowfall_data,
             })
 
+        # What can be hired, restated on the answering turn as well as the asking one.
+        # A rider who was quoted an 8-hour package can then switch to 4 or 12 with a
+        # tap, and the app never has to remember a list from an earlier turn.
+        if mode == slots.RENTAL_MODE and state.rental_packages:
+            structured_events.append({
+                "type": "rental_packages",
+                "payload": {
+                    "packages": state.rental_packages,
+                    "selected_hours": state.entities.rental_hours,
+                },
+            })
+
         # Emit the real cab fare as its own structured event (fare card in the app)
         if state.cab_fare:
             structured_events.append({
@@ -1125,7 +1546,7 @@ async def writer_node(state: AgentState) -> dict:
         #
         # This is a handoff, not a booking — nothing is reserved here, which is why the
         # reply announces the screen rather than asking them to confirm.
-        if mode in (slots.RIDE_MODE, slots.ITINERARY_MODE):
+        if mode in (slots.RIDE_MODE, slots.ITINERARY_MODE, slots.RENTAL_MODE):
             handoff = _build_booking_handoff(state)
             if handoff:
                 structured_events.append({

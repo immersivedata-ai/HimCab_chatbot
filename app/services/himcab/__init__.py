@@ -15,7 +15,20 @@ from app.services.himcab.offers_service import (
     get_offers_service,
     usable_offers,
 )
-from app.services.himcab.quote_builder import build_fare_quote_input
+from app.services.himcab.quote_builder import (
+    build_fare_quote_input,
+    build_rental_quote_input,
+    matching_package,
+)
+from app.services.himcab.rental_service import (
+    RentalPackage,
+    available_packages,
+    default_packages,
+    get_rental_service,
+    offered_hours,
+    offered_packages,
+    packages_payload,
+)
 
 __all__ = [
     "FareService",
@@ -27,4 +40,13 @@ __all__ = [
     "get_offers_service",
     "usable_offers",
     "build_fare_quote_input",
+    "build_rental_quote_input",
+    "matching_package",
+    "RentalPackage",
+    "available_packages",
+    "default_packages",
+    "get_rental_service",
+    "offered_hours",
+    "offered_packages",
+    "packages_payload",
 ]
