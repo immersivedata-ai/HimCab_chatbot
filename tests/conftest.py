@@ -11,14 +11,13 @@ the providers rate-limit — occasionally wrong for reasons that have nothing to
 the code under test.
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-from langchain_core.messages import HumanMessage, AIMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.state import AgentState
-from app.models.session import ExtractedEntities, Language
-
+from app.domain.conversation import ExtractedEntities, Language
 
 # ── No test may reach the network ─────────────────────────────────────────────
 
@@ -85,8 +84,7 @@ def no_network(monkeypatch):
     give different distances; tests that care about an exact figure stub the engine
     themselves.
     """
-    from app.services.external import geocoding as geocoding_module
-    from app.services.external import routing as routing_module
+    from app.integrations.external import geocoding as geocoding_module, routing as routing_module
 
     geocoder = geocoding_module.GeocodingService()
     router = routing_module.RoutingService()
@@ -117,7 +115,7 @@ def no_network(monkeypatch):
     monkeypatch.setattr("app.services.geo.get_routing_service", lambda: router)
 
     # The offers backend is a real host too — a test must never call it.
-    from app.services.himcab import offers_service as offers_module
+    from app.integrations.himcab import offers_service as offers_module
 
     offers = offers_module.OffersService()
     offers._get = AsyncMock(return_value={"data": []})
@@ -128,7 +126,7 @@ def no_network(monkeypatch):
 
     # The rental rate card lives on the same backend. A fresh instance per test, so the
     # package cache cannot leak a rate card from one test into the next.
-    from app.services.himcab import rental_service as rental_module
+    from app.integrations.himcab import rental_service as rental_module
 
     rental = rental_module.RentalService()
     rental._get = AsyncMock(return_value={"data": []})
@@ -198,8 +196,8 @@ def places_query_state():
 @pytest.fixture
 def mock_firestore():
     """Mock Firestore services."""
-    with patch("app.services.firestore.get_session_service") as session_mock, \
-         patch("app.services.firestore.get_user_profile_service") as profile_mock:
+    with patch("app.repositories.firestore.get_session_service") as session_mock, \
+         patch("app.repositories.firestore.get_user_profile_service") as profile_mock:
         session_svc = AsyncMock()
         profile_svc = AsyncMock()
         session_mock.return_value = session_svc

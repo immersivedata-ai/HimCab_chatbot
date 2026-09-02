@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI — runs on every push and pull request.
+#
+# Fast checks first. Lint and the dependency-sync check take seconds and catch the
+# most common breakages, so a bad push fails in under a minute rather than after the
+# full suite. Type checking and tests run in parallel with them, because a failure in
+# one is independent of the others and a developer wants every problem in one report,
+# not one per push.
+# ─────────────────────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes the run in flight for the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: ruff check
+        run: ruff check app tests scripts
+      # NOTE: `ruff format --check` is deliberately NOT run yet. The codebase has never
+      # been auto-formatted, and doing it now would rewrite 57 files — burying real
+      # changes under whitespace and flattening the hand-aligned comment columns and
+      # box-drawing separators these modules use to stay readable. Adopting the
+      # formatter is a decision worth making on its own, in its own commit, with the
+      # hash recorded in .git-blame-ignore-revs so it does not poison `git blame`.
+
+  deps:
+    name: Dependencies in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      # requirements*.txt are generated from pyproject.toml. Editing one without the
+      # other is how the image and a developer's venv end up on different versions.
+      - run: python scripts/gen_requirements.py --check
+
+  types:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # A RATCHET, not a cliff. `mypy app` currently reports 54 errors, all predating
+      # the introduction of this job — mostly Any-returns and message-list variance in
+      # the agent nodes. Making that blocking today would mean either fixing all 54 in
+      # one unreviewable commit or loosening the config until it proves nothing.
+      #
+      # So: the layers that ARE clean are enforced and must stay clean, and the rest is
+      # reported without failing the build. When a package reaches zero, move it up
+      # into the blocking step. That way the number only ever goes down.
+      - name: Type check (enforced — these layers are clean)
+        run: mypy app/domain app/schemas
+      - name: Type check (advisory — whole app)
+        run: mypy app
+        continue-on-error: true
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pip install -e . --no-deps
+      # -m "not integration": those need real credentials and somebody else's uptime,
+      # neither of which belongs in a merge gate. See tests/integration/README.md.
+      - name: pytest
+        run: pytest -m "not integration" --cov --cov-report=term-missing --cov-report=xml
+        env:
+          # The Settings model requires these; no call is made with them in unit tests
+          # (tests/conftest.py blocks the network via its autouse `no_network` fixture).
+          GCP_PROJECT_ID: ci-test-project
+          GCP_REGION: us-central1
+          VERTEX_AI_LOCATION: us-central1
+          GEMINI_FLASH_MODEL: gemini-2.5-flash-lite
+          FIREBASE_PROJECT_ID: ci-test-project
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Proves the image still builds — the Dockerfile copies specific paths, so a
+      # package added or moved without updating it fails here rather than at deploy.
+      - run: docker build -t himcab-ai-assistant:ci .

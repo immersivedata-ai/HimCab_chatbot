@@ -66,7 +66,7 @@ SSE events emitted by /stream:
   2. `structured` → a renderable card. Types: itinerary | weather_alert |
                     snowfall_alert | cab_fare | offers | booking_handoff |
                     rental_packages | request_cancelled. See `StructuredEvent` in
-                    app/models/session.py for each payload shape. Ignore unknown types.
+                    app/schemas/chat.py for each payload shape. Ignore unknown types.
   3. `done`       → completion; carries the `persona` this turn was served as
   4. `error`      → failure
 
@@ -102,19 +102,21 @@ from app.api.middleware.rider_auth import RiderIdentity, get_rider
 from app.core.config import settings
 from app.core.exceptions import RateLimitExceededError
 from app.core.logging import get_logger
-from app.models.location import RiderLocation
-from app.models.session import (
+from app.domain.conversation import MessageRole, TripSession
+from app.domain.location import RiderLocation
+from app.integrations.himcab import available_packages
+from app.repositories.firestore import get_session_service
+from app.schemas.chat import (
     ChatHistoryMessage,
     ChatHistoryResponse,
     ChatMessageRequest,
     ChatResponse,
-    MessageRole,
     PersonaRouteResponse,
     ResolvedLocation,
     RiderCoordinates,
     StartChatResponse,
-    TripSession,
 )
+from app.services import geo
 from app.services.chat_session import (
     LOCAL,
     OUTSTATION,
@@ -123,8 +125,6 @@ from app.services.chat_session import (
     resolve_persona,
     start_chat,
 )
-from app.services.firestore import get_session_service
-from app.services.himcab import available_packages
 from app.services.local_cache import RateLimiter
 
 log = get_logger(__name__)
@@ -386,7 +386,7 @@ async def _handle_start(
     lon: float | None = None,
     accuracy_m: float | None = None,
 ) -> StartChatResponse:
-    location = await RiderLocation.resolve(lat, lon, accuracy_m)
+    location = await geo.resolve_rider_location(lat, lon, accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
 
     # The rental greeting asks for a duration, and a duration is matched exactly by the
@@ -421,7 +421,7 @@ async def _handle_stream(
     accuracy_m: float | None = None,
 ) -> EventSourceResponse:
     _enforce_rate_limit(rider.user_id)
-    location = await RiderLocation.resolve(lat, lon, accuracy_m)
+    location = await geo.resolve_rider_location(lat, lon, accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
     session = await resolve_chat(
         rider.user_id,
@@ -453,7 +453,7 @@ async def _handle_message(
     rider: RiderIdentity, persona: str, body: ChatMessageRequest
 ) -> ChatResponse:
     _enforce_rate_limit(rider.user_id)
-    location = await RiderLocation.resolve(body.lat, body.lon, body.accuracy_m)
+    location = await geo.resolve_rider_location(body.lat, body.lon, body.accuracy_m)
     served = _effective_persona(persona, location, rider.user_id)
     session = await resolve_chat(
         rider.user_id,
@@ -535,7 +535,7 @@ async def route_by_location(
     evidence behind the call. The rider's own words still win over it: someone who says
     "I'm coming from Delhi" is treated as a visitor whatever their phone reports.
     """
-    location = await RiderLocation.resolve(
+    location = await geo.resolve_rider_location(
         coordinates.lat, coordinates.lon, coordinates.accuracy_m
     )
     persona, reason = resolve_persona(OUTSTATION, location)

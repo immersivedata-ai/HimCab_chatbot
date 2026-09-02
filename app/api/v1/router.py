@@ -4,7 +4,7 @@ app/api/v1/router.py
 Central v1 API router — mounts all route modules.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter
 
@@ -21,7 +21,7 @@ api_router.include_router(alerts.router)
 api_router.include_router(user.router)
 
 # Track startup time for uptime reporting
-_startup_time = datetime.now(timezone.utc)
+_startup_time = datetime.now(UTC)
 
 
 @api_router.get("/health", tags=["Health"])
@@ -33,13 +33,13 @@ async def health_check():
     record for conversations, so losing it is what actually breaks the product. There
     is no cache tier to report on any more — caching and rate limiting are in-process.
     """
-    from app.services.firestore import get_session_service
+    from app.repositories.firestore import get_session_service
 
     # Cheap round-trip against the pointer collection — proves we can read Firestore
     # without writing anything or depending on any composite index.
     firestore_ok = await get_session_service().ping()
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     return {
         "status": "healthy" if firestore_ok else "unhealthy",

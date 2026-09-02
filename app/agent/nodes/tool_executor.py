@@ -32,10 +32,9 @@ from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.enums import TripType
 from app.core.logging import get_logger
-from app.models.session import ExtractedEntities
-from app.services import geo
-from app.services.external.weather import get_weather_service
-from app.services.himcab import (
+from app.domain.conversation import ExtractedEntities
+from app.integrations.external.weather import get_weather_service
+from app.integrations.himcab import (
     build_fare_quote_input,
     build_rental_quote_input,
     get_fare_service,
@@ -47,7 +46,8 @@ from app.services.himcab import (
     packages_payload,
     usable_offers,
 )
-from app.services.himcab.models import FareQuote, Offer
+from app.integrations.himcab.models import FareQuote, Offer
+from app.services import geo
 
 log = get_logger(__name__)
 
@@ -71,7 +71,7 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
         result = await asyncio.wait_for(coro_or_value, timeout=TOOL_TIMEOUT_SECONDS)
         return result
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.warning(
             "tool_call_timeout",
             tool=label,
@@ -319,7 +319,7 @@ async def _rental_tools(state: AgentState) -> dict:
 
     results: dict[str, Any] = {}
     if tasks:
-        results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values())))
+        results = dict(zip(tasks.keys(), await asyncio.gather(*tasks.values()), strict=False))
 
     weather_obj = results.get("weather")
     cab_fare = _package_fare(results.get("cab_fare"))
@@ -518,7 +518,7 @@ async def tool_executor_node(state: AgentState) -> dict:
     # ── Execute all in parallel ───────────────────────────────────────────────
     task_keys = list(tasks.keys())
     raw_results = await asyncio.gather(*tasks.values(), return_exceptions=False)
-    results = dict(zip(task_keys, raw_results))
+    results = dict(zip(task_keys, raw_results, strict=False))
 
     failed = [k for k, v in results.items() if v is None]
     if failed:

@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     enable_rentals: bool = True                # Feature flag; False = no rental route
     #: The rate card changes rarely and every rental turn needs it, so it is held
     #: briefly rather than re-fetched per message. Packages themselves are NEVER
-    #: stored in this repo — see app/services/himcab/rental_service.py.
+    #: stored in this repo — see app/integrations/himcab/rental_service.py.
     rental_packages_cache_ttl_seconds: int = 3_600      # 1 h
     #: The durations the rental PRODUCT sells, as the app's Rent a Car screen states
     #: them: "you can rent a car for max 8hrs and min 3hrs for the day". The rate card
@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     rental_max_hours: int = 8
 
     # ── Him Cab offers (real coupons, same Spring backend) ────────────────────
-    # The assistant quotes ONLY these — see app/services/himcab/offers_service.py for
+    # The assistant quotes ONLY these — see app/integrations/himcab/offers_service.py for
     # why it fetches them rather than staying silent about discounts.
     enable_offers: bool = True                # Feature flag; False = never mention coupons
     #: Personalised, used whenever the rider's numeric id is known. `{riderId}` is
@@ -154,7 +154,7 @@ class Settings(BaseSettings):
         rather than left to whoever set the env var.
         """
         if isinstance(v, str):
-            v = [part for part in v.replace("[", "").replace("]", "").split(",")]
+            v = list(v.replace("[", "").replace("]", "").split(","))
         hours = {int(str(h).strip()) for h in v if str(h).strip()}
         return sorted(h for h in hours if h > 0)
 
@@ -168,7 +168,10 @@ def get_settings() -> Settings:
 # Module-level convenience alias
 settings: Settings = get_settings()
 
-# Inject GCP project ID into environment for google-auth library
-import os
+# Inject the GCP project id into the environment for the google-auth library.
+# Deliberately at the bottom: it needs `settings`, which is constructed above, so
+# it cannot move to the top of the file with the other imports.
+import os  # noqa: E402
+
 if "GOOGLE_CLOUD_PROJECT" not in os.environ:
     os.environ["GOOGLE_CLOUD_PROJECT"] = settings.gcp_project_id

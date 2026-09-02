@@ -38,18 +38,18 @@ import sys
 
 sys.path.insert(0, ".")
 
-from app.core.config import settings                                    # noqa: E402
-from app.services.himcab.fare_service import FareService                # noqa: E402
-from app.services.himcab.quote_builder import (                         # noqa: E402
+from app.core.config import settings
+from app.domain.conversation import ExtractedEntities
+from app.integrations.himcab.fare_service import FareService
+from app.integrations.himcab.quote_builder import (
     build_rental_quote_input,
     matching_package,
 )
-from app.services.himcab.rental_service import (                        # noqa: E402
+from app.integrations.himcab.rental_service import (
     RentalPackage,
     RentalService,
     distinct_packages,
 )
-from app.models.session import ExtractedEntities                        # noqa: E402
 
 OK, BAD, WARN = "  OK  ", " FAIL ", " WARN "
 
@@ -167,7 +167,7 @@ async def check_estimate(jwt: str, packages, hours_wanted, group_size, show_raw:
             for h in settings.rental_hour_options
         ]
 
-    targets = [h for h in (hours_wanted or [p.hours for p in packages])]
+    targets = list(hours_wanted or [p.hours for p in packages])
     service = FareService()
     any_priced = False
 

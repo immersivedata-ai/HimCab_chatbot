@@ -28,14 +28,14 @@ Tier 4 means these endpoints never 404 on a missing/expired session — the fron
 cannot get into a broken state that requires it to "reset" anything.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 from app.core.enums import Persona
 from app.core.logging import get_logger
-from app.models.location import RiderLocation
-from app.models.session import Language, MessageRole, TripSession
-from app.services.firestore import get_session_service
+from app.domain.conversation import Language, MessageRole, TripSession
+from app.domain.location import RiderLocation
+from app.repositories.firestore import get_session_service
 
 log = get_logger(__name__)
 
@@ -357,13 +357,13 @@ async def _find_resumable(persona: str, user_id: str) -> Optional[TripSession]:
         log.warning("chat_session_resume_lookup_failed", user_id=user_id, error=str(e))
         return None
 
-    cutoff = datetime.now(timezone.utc) - _RESUME_WINDOW
+    cutoff = datetime.now(UTC) - _RESUME_WINDOW
     for session in recent:
         if session.persona != persona:
             continue
         updated = session.updated_at
         if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
+            updated = updated.replace(tzinfo=UTC)
         if updated >= cutoff:
             return session
     return None

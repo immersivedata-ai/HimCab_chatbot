@@ -11,17 +11,17 @@ hides the fact that a feature was never wired up — so if a field stops being u
 it is removed rather than left as a placeholder.
 """
 
-from typing import Annotated, Any, Optional
 from operator import add
+from typing import Annotated, Any, Optional
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.itinerary import Itinerary
-from app.models.location import RiderLocation
-from app.models.session import ExtractedEntities, Language
-from app.models.user import UserProfile
+from app.domain.conversation import ExtractedEntities, Language
+from app.domain.itinerary import Itinerary
+from app.domain.location import RiderLocation
+from app.domain.user import UserProfile
 
 
 class AgentState(BaseModel):
@@ -116,7 +116,7 @@ class AgentState(BaseModel):
     pickup: Optional[dict] = None
     #: Rental blocks from the rate card ({hours, included_km, label}), rental flow only.
     #: The reply offers exactly these, because the backend matches a duration against
-    #: them exactly — see app/services/himcab/rental_service.py.
+    #: them exactly — see app/integrations/himcab/rental_service.py.
     rental_packages: list[dict] = Field(default_factory=list)
 
     # ── Generated output (from Writer node) ───────────────────────────────────

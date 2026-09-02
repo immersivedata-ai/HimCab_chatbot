@@ -48,10 +48,10 @@ async def lifespan(app: FastAPI):
     log.info("app_shutting_down")
 
     # Close HTTP clients used by external services
-    from app.services.external.geocoding import get_geocoding_service
-    from app.services.external.routing import get_routing_service
-    from app.services.external.weather import get_weather_service
-    from app.services.himcab import get_fare_service, get_offers_service
+    from app.integrations.external.geocoding import get_geocoding_service
+    from app.integrations.external.routing import get_routing_service
+    from app.integrations.external.weather import get_weather_service
+    from app.integrations.himcab import get_fare_service, get_offers_service
     try:
         await get_weather_service().close()
         await get_fare_service().close()
@@ -144,6 +144,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def add_trace_id(request, call_next):
         import uuid
+
         import structlog
         trace_id = request.headers.get("X-Trace-ID", str(uuid.uuid4()))
         structlog.contextvars.bind_contextvars(trace_id=trace_id)

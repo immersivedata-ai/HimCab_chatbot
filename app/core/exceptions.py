@@ -7,7 +7,6 @@ Custom exception hierarchy and global FastAPI exception handlers.
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-
 # ── Base ──────────────────────────────────────────────────────────────────────
 
 class HimCabBaseError(Exception):

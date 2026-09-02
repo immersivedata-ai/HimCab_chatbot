@@ -48,10 +48,14 @@ import re
 from dataclasses import dataclass
 from difflib import get_close_matches
 from enum import Enum
-from typing import Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
-from app.core.enums import CancelScope, Intent, Persona, ResponseMode, SlotName
-from app.models.session import ExtractedEntities
+from app.core.enums import Intent, Persona, ResponseMode, SlotName
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from app.domain.conversation import ExtractedEntities
 
 # ── Personas ──────────────────────────────────────────────────────────────────
 # Aliases onto app/core/enums.py, which is the one place these values are written

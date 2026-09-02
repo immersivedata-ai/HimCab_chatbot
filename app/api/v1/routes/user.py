@@ -16,8 +16,8 @@ from fastapi import APIRouter, Depends
 
 from app.api.middleware.rider_auth import RiderIdentity, get_rider
 from app.core.logging import get_logger
-from app.models.user import TravelPreferences
-from app.services.firestore import get_session_service, get_user_profile_service
+from app.domain.user import TravelPreferences
+from app.repositories.firestore import get_session_service, get_user_profile_service
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/user", tags=["User"])

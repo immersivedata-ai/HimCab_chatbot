@@ -21,12 +21,9 @@ from fastapi import APIRouter, Depends
 from app.api.middleware.rider_auth import RiderIdentity, get_rider
 from app.core.exceptions import AuthorizationError
 from app.core.logging import get_logger
-from app.models.session import (
-    CreateSessionRequest,
-    CreateSessionResponse,
-    TripSession,
-)
-from app.services.firestore import get_session_service
+from app.domain.conversation import TripSession
+from app.repositories.firestore import get_session_service
+from app.schemas.session import CreateSessionRequest, CreateSessionResponse
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/session", tags=["Session"])
@@ -50,7 +47,7 @@ async def create_session(
 
     # Add system greeting message if initial_message provided
     if body.initial_message:
-        from app.models.session import MessageRole
+        from app.domain.conversation import MessageRole
         session.add_message(MessageRole.USER, body.initial_message)
 
     await session_svc.create_session(session)

@@ -62,7 +62,7 @@ async def clarify_node(state: AgentState) -> dict:
     from app.agent import slots
     from app.agent.language import detect_reply_language
     from app.core.config import settings
-    from app.services.himcab import available_packages
+    from app.integrations.himcab import available_packages
 
     lang_key, _ = detect_reply_language(state)
     question = state.clarification_question

@@ -90,7 +90,7 @@ _HINDI_MARKERS = {
     "raha", "rahi", "rahe", "wala", "wali", "wale", "bata", "batao", "bataye",
     "lekin", "magar", "phir", "abhi", "kal", "aaj", "parso",
     "acha", "accha", "achha", "theek", "thik", "yaar", "bhai", "ji",
-    "log", "saath", "liye", "bhi", "koi", "kuch", "sab", "bana", "banao", "banao",
+    "log", "saath", "liye", "bhi", "koi", "kuch", "sab", "bana", "banao",
 }
 
 # Ordinary English function words. Counted so a message with markers on both sides goes
@@ -113,7 +113,7 @@ _MIN_MARKERS = 2
 _RECENT_TURNS = 4
 
 
-def _user_messages(state: "AgentState", limit: int) -> list[str]:
+def _user_messages(state: AgentState, limit: int) -> list[str]:
     """The last `limit` user messages, newest last."""
     texts = [
         m.content for m in state.messages
@@ -130,7 +130,7 @@ def _count_markers(text: str) -> tuple[int, int]:
     return hindi, english
 
 
-def detect_reply_language(state: "AgentState") -> tuple[str, str]:
+def detect_reply_language(state: AgentState) -> tuple[str, str]:
     """Return (lang_key, human_name) for the one language the whole reply should use.
 
     lang_key is 'en' | 'hi'; human_name is a phrase to drop into a prompt.

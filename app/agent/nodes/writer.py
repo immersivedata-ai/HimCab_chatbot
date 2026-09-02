@@ -38,7 +38,7 @@ import asyncio
 import json
 from typing import Optional
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agent import slots
 from app.agent.language import detect_reply_language
@@ -46,7 +46,8 @@ from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.enums import TripType
 from app.core.logging import get_logger
-from app.models.itinerary import (
+from app.domain.conversation import ExtractedEntities
+from app.domain.itinerary import (
     ActivityType,
     BudgetRange,
     CabPackage,
@@ -56,7 +57,6 @@ from app.models.itinerary import (
     TravelInfo,
     WeatherForecast,
 )
-from app.models.session import ExtractedEntities
 from app.services.vertex_ai import get_vertex_ai_service
 
 log = get_logger(__name__)
@@ -191,7 +191,7 @@ def _build_offers_block(state: AgentState) -> str:
 
     The reply used to be told never to mention a discount at all, which was right when
     the only coupons available were ones the model made up. Now that offers come from
-    the backend (`app/services/himcab/offers_service.py`), staying silent means a rider
+    the backend (`app/integrations/himcab/offers_service.py`), staying silent means a rider
     pays full price with a valid coupon sitting in their account.
 
     The rule is therefore narrower, not looser: quote these codes exactly, and nothing
@@ -1312,7 +1312,7 @@ async def _generate_streaming(llm, messages, token_queue) -> str:
     full = ""
     emitted = 0
     stopped = False       # once the JSON fence appears, stop emitting to the user
-    HOLD = 3              # chars held back so a partial "```" fence isn't shown
+    hold = 3              # chars held back so a partial "```" fence isn't shown
 
     async for chunk in llm.astream(messages):
         piece = getattr(chunk, "content", None) or ""
@@ -1328,7 +1328,7 @@ async def _generate_streaming(llm, messages, token_queue) -> str:
             emitted = fence
             stopped = True
         else:
-            safe = len(full) - HOLD
+            safe = len(full) - hold
             if safe > emitted:
                 await token_queue.put(full[emitted:safe])
                 emitted = safe
@@ -1422,13 +1422,7 @@ async def writer_node(state: AgentState) -> dict:
         # Retry: if structured extraction failed, ask the model to output just JSON
         if itinerary_dict is None and wants_itinerary:
             log.info("structured_extraction_retry", session_id=state.session_id)
-            retry_messages = messages + [
-                AIMessage(content=full_response),
-                HumanMessage(content=(
-                    "Please output ONLY the structured JSON itinerary from your response above. "
-                    "No explanation, just the JSON wrapped in ```json ... ```"
-                )),
-            ]
+            retry_messages = [*messages, AIMessage(content=full_response), HumanMessage(content="Please output ONLY the structured JSON itinerary from your response above. " "No explanation, just the JSON wrapped in ```json ... ```")]
             try:
                 retry_response = await asyncio.wait_for(
                     llm.ainvoke(retry_messages),

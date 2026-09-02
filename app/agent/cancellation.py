@@ -39,9 +39,12 @@ classified. A rider with a confirmed cab is sent to the screen that owns it inst
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from app.core.enums import CancelScope, ReplyLanguage
-from app.models.session import ExtractedEntities
+
+if TYPE_CHECKING:
+    from app.domain.conversation import ExtractedEntities
 
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 

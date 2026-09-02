@@ -28,7 +28,7 @@ Three guarantees this node makes, each covering a reported failure:
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -39,10 +39,10 @@ from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models.itinerary import BudgetRange, GroupType
-from app.models.session import ExtractedEntities
+from app.domain.conversation import ExtractedEntities
+from app.domain.itinerary import BudgetRange, GroupType
+from app.integrations.himcab import available_packages, offered_hours
 from app.services import geo
-from app.services.himcab import available_packages, offered_hours
 from app.services.vertex_ai import get_vertex_ai_service
 
 log = get_logger(__name__)
@@ -440,7 +440,7 @@ async def planner_node(state: AgentState) -> dict:
         f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
         for m in state.messages[-10:]
     )
-    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+    today = datetime.now(UTC).strftime("%A, %d %B %Y")
     asked_context = (
         f"\nThe assistant's last question asked about: {previously_asked}. The "
         f"user's latest message is most likely the answer to it (it may be a short "

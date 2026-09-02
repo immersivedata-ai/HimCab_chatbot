@@ -21,41 +21,57 @@ travel_assistant/
 │   │   ├── nodes/              # Individual graph nodes (planner, router, writer, ...)
 │   │   ├── graph.py            # Graph assembly & compilation
 │   │   ├── slots.py            # What the agent asks for, and when (conversation policy)
+│   │   ├── cancellation.py     # Recognising and answering "call it off"
 │   │   ├── language.py         # Which language the reply is written in
 │   │   └── state.py            # AgentState schema
-│   ├── api/
+│   ├── api/                    # HTTP delivery — nothing else imports this
 │   │   ├── v1/
 │   │   │   ├── routes/         # FastAPI route handlers
 │   │   │   └── router.py
-│   │   └── middleware/         # Auth, rate-limit, logging middleware
-│   ├── core/
-│   │   ├── config.py           # Settings (pydantic-settings)
-│   │   ├── logging.py          # Structured logging
-│   │   └── exceptions.py       # Custom exception classes
-│   ├── services/
-│   │   ├── chat_session.py     # Which conversation a rider is in
-│   │   ├── firestore.py        # Firestore session & profile service
-│   │   ├── local_cache.py      # In-process TTL cache + rate limiter
-│   │   ├── vertex_ai.py        # Vertex AI / Gemini client
-│   │   ├── geo.py              # Coordinates → local/visitor, nearest town, distances
-│   │   ├── himcab/             # Him Cab backend clients (fares, offers, distances)
-│   │   └── external/           # 3rd party API wrappers (weather)
-│   ├── models/                 # Pydantic models (session, itinerary, user, alerts, location)
+│   │   └── middleware/         # Rider JWT auth
+│   ├── schemas/                # Wire formats: request/response bodies. A CONTRACT
+│   │   ├── chat.py             #   /v1/chat/* — incl. StructuredEvent (the card shapes)
+│   │   ├── session.py          #   /v1/session/*
+│   │   └── alerts.py           #   /v1/alerts/himachal
+│   ├── domain/                 # Entities — what the system IS. Imports nothing above
+│   │   ├── conversation.py     #   TripSession, Message, ExtractedEntities
+│   │   ├── itinerary.py        #   Itinerary, DayPlan, Activity, CabPackage
+│   │   ├── user.py             #   UserProfile, past trips, loyalty
+│   │   ├── location.py         #   RiderLocation (a resolved GPS fix)
+│   │   └── alerts.py           #   WeatherReport, TravelAlert
+│   ├── repositories/           # Persistence — the only code that knows Firestore
+│   │   └── firestore.py        #   Session & user-profile stores
+│   ├── integrations/           # Outbound HTTP to systems we don't own
+│   │   ├── himcab/             #   OUR Spring backend: fares, rentals, offers, vehicles
+│   │   └── external/           #   Third parties: geocoding, routing, weather
+│   ├── services/               # Application logic that is neither entity nor I/O client
+│   │   ├── chat_session.py     #   Which conversation a rider is in
+│   │   ├── geo.py              #   Composing a Journey from a fix and a destination
+│   │   ├── vertex_ai.py        #   Vertex AI / Gemini client
+│   │   └── local_cache.py      #   In-process TTL cache + rate limiter
+│   ├── core/                   # Cross-cutting: config, vocabulary, errors, logging
+│   │   ├── config.py           #   Settings (pydantic-settings)
+│   │   ├── enums.py            #   The vocabulary every layer branches on
+│   │   ├── logging.py          #   Structured logging
+│   │   └── exceptions.py       #   Custom exception classes
 │   ├── prompts/                # Prompt templates & builder
 │   └── main.py                 # FastAPI app entrypoint
 ├── tests/
-│   └── unit/
+│   ├── unit/                   # Mirrors app/ — agent, api, integrations, services
+│   └── integration/            # Real backends; not run in CI (see its README)
 ├── secrets/                     # GCP/Firebase credential JSONs (gitignored, not committed)
 ├── deploy/
 │   └── cloudrun.yaml
 ├── docs/                       # Architecture docs & reference material
-├── scripts/                    # Dev setup & data seeding scripts
+├── scripts/                    # Dev tooling, diagnostics, seeding
 ├── frontend/                   # Static test HTML clients (local only — not built into the image)
+├── .github/workflows/ci.yml    # Lint, deps-in-sync, mypy, tests, docker build
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt
+├── requirements.txt            # GENERATED from pyproject.toml — see scripts/gen_requirements.py
+├── requirements-dev.txt        # GENERATED; dev tooling only, never in the image
 ├── .env.example
-└── pyproject.toml
+└── pyproject.toml              # Packaging + ruff/mypy/pytest/coverage config
 ```
 
 ## Quick Start
