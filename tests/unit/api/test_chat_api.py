@@ -17,6 +17,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.domain.conversation import Language, MessageRole, TripSession
 
 # ── Test doubles ──────────────────────────────────────────────────────────────
@@ -259,9 +260,9 @@ class TestStart:
         rider = {"Authorization": f"Bearer {_fake_jwt({'riderId': 4242})}"}
         body = client.post("/v1/chat/rental/start", headers=rider).json()
 
-        assert "3 hrs" in body["message"] and "8 hrs" in body["message"]
+        assert "4 hrs" in body["message"] and "8 hrs" in body["message"]
         packages = body["structured_events"][0]["payload"]["packages"]
-        assert [p["hours"] for p in packages] == [3, 5, 8]
+        assert [p["hours"] for p in packages] == settings.rental_hour_options
         # Flagged, so the app never draws a price next to one of these.
         assert not any(p["from_rate_card"] for p in packages)
 
@@ -279,7 +280,7 @@ class TestStart:
         body = client.post("/v1/chat/rental/start", headers=AUTH).json()
 
         packages = body["structured_events"][0]["payload"]["packages"]
-        assert [p["hours"] for p in packages] == [3, 5, 8]
+        assert [p["hours"] for p in packages] == settings.rental_hour_options
         assert not any(p["from_rate_card"] or p["included_km"] for p in packages)
         no_network["rental"]._get.assert_not_awaited()
 

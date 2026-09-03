@@ -17,20 +17,23 @@ here — hours, included kilometres and the category they belong to all come fro
 rate card, so changing a package there changes what the chatbot offers with no code
 change and no redeploy.
 
-THE BOOKABLE WINDOW
-───────────────────
-The rate card says what the backend can price; `settings.rental_min_hours` /
-`rental_max_hours` say what the PRODUCT sells — "max 8hrs and min 3hrs", as the app's
-Rent a Car screen puts it. Both have to hold, so what the rider is offered is the rate
-card narrowed to that window (`_within_window`). A 12-hour chart left configured in the
-backend must not reappear as a chip on a screen that says the maximum is eight.
+WHAT IS SOLD
+────────────
+The rate card says what the backend can PRICE; `settings.rental_hour_options` says what
+the product SELLS. It is an allowlist, and it wins: the rider is offered those durations
+and no others (`_is_sold`). The card supplies the kilometres against them and nothing
+more — a 6- or 12-hour chart left configured in the backend must not reappear as a chip
+on a screen that sells 4 and 8.
 
-When the rate card cannot be read at all, the configured durations
-(`settings.rental_hour_options`, 3/5/8) are offered instead — see `default_packages`.
-That still buys the rider a PRICE: the fare endpoint matches the chart itself from
-`rentHours`, so a duration we could not parse a package for can still be quoted (see
-`tool_executor._rental_tools`). What is lost is only what the package INCLUDES, which
-nothing then claims.
+There is no separate min/max window any more. Two settings describing one product
+statement could disagree, and the one that lost was whichever the reader did not check;
+anything wanting a range takes min()/max() of the same list.
+
+When the rate card cannot be read at all, those same durations are offered anyway — see
+`default_packages`. That still buys the rider a PRICE: the fare endpoint matches the
+chart itself from `rentHours`, so a duration we could not parse a package for can still
+be quoted (see `tool_executor._rental_tools`). What is lost is only what the package
+INCLUDES, which nothing then claims.
 
 WHAT THIS DOES NOT DO
 ─────────────────────
@@ -123,9 +126,13 @@ def distinct_packages(packages: list[RentalPackage]) -> list[RentalPackage]:
     return [by_hours[h] for h in sorted(by_hours)]
 
 
-def _within_window(hours: int) -> bool:
-    """True when `hours` is a duration the product sells. See THE BOOKABLE WINDOW."""
-    return settings.rental_min_hours <= hours <= settings.rental_max_hours
+def _is_sold(hours: int) -> bool:
+    """True when `hours` is a duration the product sells. See WHAT IS SOLD.
+
+    Membership, not a range: the configured list IS the product, so a chart the backend
+    happens to price in between two of them is still not something a rider may choose.
+    """
+    return hours in settings.rental_hour_options
 
 
 def default_packages() -> list[RentalPackage]:
@@ -139,7 +146,7 @@ def default_packages() -> list[RentalPackage]:
     return [
         RentalPackage(hours=h, from_rate_card=False)
         for h in settings.rental_hour_options
-        if _within_window(h)
+        if _is_sold(h)
     ]
 
 
@@ -284,17 +291,16 @@ class RentalService:
             return []
 
         parsed = distinct_packages(self._parse_packages(raw))
-        packages = [p for p in parsed if _within_window(p.hours)]
-        dropped = [p.hours for p in parsed if not _within_window(p.hours)]
+        packages = [p for p in parsed if _is_sold(p.hours)]
+        dropped = [p.hours for p in parsed if not _is_sold(p.hours)]
         if dropped:
             # Not an error — the backend prices these, the product does not sell them.
-            # Logged because a rate card that is ENTIRELY outside the window looks
-            # exactly like an unreadable one from here on, and this is the difference.
+            # Logged because a rate card offering NOTHING we sell looks exactly like an
+            # unreadable one from here on, and this line is the difference.
             log.info(
-                "rental_packages_outside_window",
+                "rental_packages_not_sold",
                 dropped_hours=dropped,
-                min_hours=settings.rental_min_hours,
-                max_hours=settings.rental_max_hours,
+                sold_hours=list(settings.rental_hour_options),
             )
         if packages:
             self._cache.set(

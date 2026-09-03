@@ -120,29 +120,28 @@ async def check_rate_card(jwt: str, show_raw: bool):
         line(WARN, f"no included km on: {', '.join(str(p.hours) + ' hrs' for p in missing_km)}")
         print("      distanceInMeters would be sent as 0 for these -- see step 2.")
 
-    # The product's window on top of the backend's charts. A chart outside it is priced
-    # by the backend and never offered by the chat, which is the difference between this
-    # tool's output and what a rider sees — so it is stated rather than left implicit.
-    offered = [
-        p for p in packages
-        if settings.rental_min_hours <= p.hours <= settings.rental_max_hours
-    ]
+    # The product's allowlist on top of the backend's charts. A chart for a duration we
+    # do not sell is priced by the backend and never offered by the chat, which is the
+    # difference between this tool's output and what a rider sees — so it is stated
+    # rather than left implicit.
+    sold = list(settings.rental_hour_options)
+    offered = [p for p in packages if p.hours in sold]
     dropped = [p for p in packages if p not in offered]
-    print(f"\n      bookable window: {settings.rental_min_hours}-"
-          f"{settings.rental_max_hours} hours (rental_min_hours / rental_max_hours)")
+    print("\n      durations sold: "
+          + ", ".join(str(h) for h in sold) + " hours (rental_hour_options)")
     if dropped:
-        line(WARN, "outside the window, so NEVER offered in chat: "
+        line(WARN, "not sold, so NEVER offered in chat: "
                    + ", ".join(p.label for p in dropped))
     if offered:
         line(OK, "offered in chat: " + ", ".join(p.label for p in offered))
     else:
-        line(WARN, "nothing on the rate card is inside the bookable window")
+        line(WARN, "the rate card has no chart for any duration we sell")
         print("")
-        print(f"  -> The chat offers the configured durations instead "
-              f"({', '.join(str(h) for h in settings.rental_hour_options)} hrs).")
+        print("  -> The chat offers the configured durations anyway ("
+              + ", ".join(str(h) for h in sold) + " hrs), unpriced by the card.")
         print("    Step 2 shows whether the backend can price those. If it cannot,")
-        print("    either widen the window (rental_min_hours / rental_max_hours) or")
-        print("    configure charts for those hours on the backend.")
+        print("    either set RENTAL_HOUR_OPTIONS to durations it charts, or")
+        print("    configure charts for these hours on the backend.")
 
     await service.close()
     return raw, offered

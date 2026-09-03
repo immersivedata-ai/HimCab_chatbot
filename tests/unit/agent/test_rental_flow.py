@@ -49,10 +49,14 @@ from app.services.chat_session import RENTAL, resolve_persona, welcome_message
 # What the rate card returns: a chart per category, so hours repeat across cabs. The
 # 12-hour chart is deliberately present and deliberately never offered — the backend
 # prices it, the product does not sell it.
+#: A rate card as the Spring backend returns one. Deliberately carries charts the
+#: backend can PRICE but the product does not SELL (3 and 12) alongside the ones it
+#: does (4 and 8) — that gap is the whole point of `_is_sold`, and a fixture holding
+#: only sellable durations would pass whether or not the filter existed.
 RATE_CARD = {"data": [
     {"categoryId": 1, "name": "Economy", "rentalChartList": [
         {"maxHour": 3, "maxKilometer": 30, "farePerKilometer": 14, "gst": 5},
-        {"maxHour": 5, "maxKilometer": 50, "farePerKilometer": 13, "gst": 5},
+        {"maxHour": 4, "maxKilometer": 40, "farePerKilometer": 13, "gst": 5},
         {"maxHour": 8, "maxKilometer": 80, "farePerKilometer": 13, "gst": 5},
         {"maxHour": 12, "maxKilometer": 120, "farePerKilometer": 12, "gst": 5},
     ]},
@@ -61,21 +65,28 @@ RATE_CARD = {"data": [
     ]},
 ]}
 
-#: A duration nothing sells: outside the window AND absent from the rate card.
+#: The durations the product sells, read from config rather than restated — a test
+#: that hard-coded them would keep passing while the assistant offered something
+#: else entirely, which is the failure this whole module exists to catch.
+SOLD = list(settings.rental_hour_options)
+
+#: A duration nothing sells: absent from `rental_hour_options` AND from the rate card.
 UNSOLD_HOURS = 6
 
 
 def _parsed() -> list[RentalPackage]:
-    """Everything the rate card defines, before the product's window is applied."""
+    """Everything the rate card defines, before the product's allowlist is applied."""
     return distinct_packages(RentalService()._parse_packages(RATE_CARD))
 
 
 def _packages() -> list[RentalPackage]:
-    """What `get_packages` hands back: the rate card inside the bookable window."""
-    return [
-        p for p in _parsed()
-        if settings.rental_min_hours <= p.hours <= settings.rental_max_hours
-    ]
+    """What `get_packages` hands back: the rate card narrowed to what we SELL.
+
+    Reads `settings.rental_hour_options` rather than restating it, so changing the
+    durations the product sells changes this helper too — a test that hard-coded them
+    would pass while the assistant offered something else entirely.
+    """
+    return [p for p in _parsed() if p.hours in settings.rental_hour_options]
 
 
 # ── 1. Packages come from the rate card, never from this repo ─────────────────
@@ -84,13 +95,13 @@ class TestPackagesComeFromTheRateCard:
 
     def test_the_rate_card_becomes_the_offered_packages(self):
         assert [p.label for p in _packages()] == [
-            "3 hrs / 30 km", "5 hrs / 50 km", "8 hrs / 80 km"
+            "4 hrs / 40 km", "8 hrs / 80 km"
         ]
 
     def test_the_same_hours_across_cabs_collapse_to_one_choice(self):
         """The rate card defines a chart PER CATEGORY, so 8 hours appears once per cab.
         The rider is picking a duration, not a duration-and-a-car."""
-        assert [p.hours for p in _parsed()] == [3, 5, 8, 12]
+        assert [p.hours for p in _parsed()] == [3, 4, 8, 12]
 
     @pytest.mark.asyncio
     async def test_a_chart_outside_the_products_window_is_not_offered(self):
@@ -99,7 +110,7 @@ class TestPackagesComeFromTheRateCard:
         service = RentalService()
         service._get = AsyncMock(return_value=RATE_CARD)
 
-        assert [p.hours for p in await service.get_packages(rider_jwt="token")] == [3, 5, 8]
+        assert [p.hours for p in await service.get_packages(rider_jwt="token")] == SOLD
 
     @pytest.mark.parametrize(
         "envelope",
@@ -135,7 +146,7 @@ class TestPackagesComeFromTheRateCard:
         first = await service.get_packages(rider_jwt="token")
         second = await service.get_packages(rider_jwt="token")
 
-        assert [p.hours for p in first] == [p.hours for p in second] == [3, 5, 8]
+        assert [p.hours for p in first] == [p.hours for p in second] == SOLD
         service._get.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -152,7 +163,7 @@ class TestPackagesComeFromTheRateCard:
 
         # ...and the moment the backend answers properly, it takes effect.
         service._get.return_value = RATE_CARD
-        assert [p.hours for p in await service.get_packages(rider_jwt="token")] == [3, 5, 8]
+        assert [p.hours for p in await service.get_packages(rider_jwt="token")] == SOLD
 
     @pytest.mark.asyncio
     async def test_switching_rentals_off_offers_nothing_at_all(self):
@@ -182,7 +193,8 @@ class TestDurationMustMatchAPackage:
         "hours,found",
         # 12 is on the rate card and outside the product's window, so it never reaches
         # this list — see `test_a_chart_outside_the_products_window_is_not_offered`.
-        [(3, True), (5, True), (8, True), (6, False), (12, False), (None, False)],
+        [(4, True), (8, True), (3, False), (5, False), (6, False), (12, False),
+         (None, False)],
     )
     def test_only_a_configured_duration_matches(self, hours, found):
         """`findMatchingRentalChart` compares hours exactly. Returning the nearest
@@ -434,7 +446,7 @@ class TestTheFareComesFromTheBackend:
 
         result = await self._run(self._state(rental_hours=8), rental, fare, weather)
 
-        assert [p["hours"] for p in result["rental_packages"]] == [3, 5, 8]
+        assert [p["hours"] for p in result["rental_packages"]] == SOLD
         assert all(p["from_rate_card"] for p in result["rental_packages"])
 
     @pytest.mark.asyncio
@@ -450,7 +462,7 @@ class TestTheFareComesFromTheBackend:
         assert "input" not in captured, "asked the backend to price an unlisted duration"
         assert result["cab_fare"] is None
         # The packages still reach the reply, so it can offer the real ones.
-        assert [p["hours"] for p in result["rental_packages"]] == [3, 5, 8]
+        assert [p["hours"] for p in result["rental_packages"]] == SOLD
 
     @pytest.mark.asyncio
     async def test_an_unreadable_rate_card_still_gets_a_price(self):
@@ -469,7 +481,7 @@ class TestTheFareComesFromTheBackend:
         result = await self._run(self._state(rental_hours=8), rental, fare, weather)
 
         # The rider still chooses from the durations the product sells...
-        assert [p["hours"] for p in result["rental_packages"]] == [3, 5, 8]
+        assert [p["hours"] for p in result["rental_packages"]] == SOLD
         assert not any(p["from_rate_card"] for p in result["rental_packages"])
         # ...and the backend is still asked to price the one they picked.
         assert captured["input"].rent_hours == 8
@@ -999,8 +1011,8 @@ class TestTheDurationQuestionOffersTheRealPackages:
     async def test_the_asking_turn_names_the_rate_cards_packages(self):
         result = await self._clarify(self._clarify_state())
 
-        assert "3 hrs / 30 km" in result["final_response_text"]
-        assert "5 hrs / 50 km" in result["final_response_text"]
+        assert "4 hrs / 40 km" in result["final_response_text"]
+        assert "8 hrs / 80 km" in result["final_response_text"]
         assert "8 hrs / 80 km" in result["final_response_text"]
         # The 12-hour chart is on the rate card and outside the product's window.
         assert "12 hrs" not in result["final_response_text"]
@@ -1011,7 +1023,7 @@ class TestTheDurationQuestionOffersTheRealPackages:
 
         events = result["structured_events"]
         assert [e["type"] for e in events] == ["rental_packages"]
-        assert [p["hours"] for p in events[0]["payload"]["packages"]] == [3, 5, 8]
+        assert [p["hours"] for p in events[0]["payload"]["packages"]] == SOLD
         assert result["rental_packages"] == events[0]["payload"]["packages"]
 
     @pytest.mark.asyncio
@@ -1021,7 +1033,7 @@ class TestTheDurationQuestionOffersTheRealPackages:
         result = await self._clarify(self._clarify_state(), rate_card={"data": []})
 
         text = result["final_response_text"]
-        assert "3 hrs" in text and "5 hrs" in text and "8 hrs" in text
+        assert "4 hrs" in text and "8 hrs" in text
         packages = result["structured_events"][0]["payload"]["packages"]
         assert not any(p["from_rate_card"] for p in packages)
 
@@ -1170,7 +1182,7 @@ class TestAnUnlistedDurationIsReAsked:
 
         text = result["final_response_text"]
         assert f"{UNSOLD_HOURS}-hour package" in text
-        assert "3 hrs / 30 km" in text and "8 hrs / 80 km" in text
+        assert "4 hrs / 40 km" in text and "8 hrs / 80 km" in text
 
     @pytest.mark.asyncio
     async def test_an_offered_duration_is_left_alone(self):
@@ -1199,7 +1211,7 @@ class TestAnUnlistedDurationIsReAsked:
         assert result["entities"].rental_hours == UNSOLD_HOURS
 
     def test_the_wording_offers_the_alternatives_in_both_languages(self):
-        labels = ["3 hrs / 30 km", "8 hrs / 80 km"]
+        labels = ["4 hrs / 40 km", "8 hrs / 80 km"]
         for lang in ("en", "hi"):
             text = slots.rental_hours_question(labels, lang, rejected=UNSOLD_HOURS)
             assert str(UNSOLD_HOURS) in text
@@ -1712,34 +1724,34 @@ class TestASentenceIsReadInCode:
     async def test_the_planner_reads_the_sentence_when_vertex_is_down(self):
         state = AgentState(
             session_id="s", user_id="u", intent="rental_query", visitor_type=RENTAL,
-            messages=[HumanMessage(content="I need a car for 5 hours from Manali kal")],
+            messages=[HumanMessage(content="I need a car for 4 hours from Manali kal")],
             entities=ExtractedEntities(visitor_type=RENTAL),
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service",
                    side_effect=RuntimeError("vertex down")):
             result = await planner_node(state)
 
-        assert result["entities"].rental_hours == 5
+        assert result["entities"].rental_hours == 4
         assert result["entities"].origin == "Manali"
 
     @pytest.mark.asyncio
     async def test_the_model_still_leads_and_is_never_overwritten(self):
-        """Code fills GAPS. A rider correcting themselves ("make it 5, not 8") is the
+        """Code fills GAPS. A rider correcting themselves ("make it 4, not 8") is the
         model's job to read, and this must not undo it."""
         state = AgentState(
             session_id="s", user_id="u", intent="rental_query", visitor_type=RENTAL,
-            messages=[HumanMessage(content="actually make it 5 hours not 8 hours")],
+            messages=[HumanMessage(content="actually make it 4 hours not 8 hours")],
             entities=ExtractedEntities(visitor_type=RENTAL),
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(rental_hours=5)
+            return_value=PlannerExtraction(rental_hours=4)
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm
             result = await planner_node(state)
 
-        assert result["entities"].rental_hours == 5
+        assert result["entities"].rental_hours == 4
 
     @pytest.mark.asyncio
     async def test_a_place_mentioned_in_passing_is_never_a_destination(self):
@@ -2058,7 +2070,7 @@ class TestTheRentalPromptHasNoTripInIt:
                       "included_km": None, "options": [
                           {"category_name": "Economy", "total_fare_inr": 900,
                            "seat_capacity": 4}]},
-            rental_packages=[{"hours": 3, "included_km": None, "label": "3 hrs",
+            rental_packages=[{"hours": 4, "included_km": None, "label": "4 hrs",
                               "from_rate_card": False}],
         )
 

@@ -87,18 +87,24 @@ class Settings(BaseSettings):
     #: briefly rather than re-fetched per message. Packages themselves are NEVER
     #: stored in this repo — see app/integrations/himcab/rental_service.py.
     rental_packages_cache_ttl_seconds: int = 3_600      # 1 h
-    #: The durations the rental PRODUCT sells, as the app's Rent a Car screen states
-    #: them: "you can rent a car for max 8hrs and min 3hrs for the day". The rate card
-    #: is still the source of truth for what can be PRICED — these three only decide
-    #: what the rider is offered, and are what the assistant falls back to when the
-    #: rate card cannot be read (a duration from product config beats an open question
-    #: the rider can only answer wrongly). Env: RENTAL_HOUR_OPTIONS="3,5,8".
-    rental_hour_options: list[int] = Field(default=[3, 5, 8])
-    #: The bookable window. A rental chart outside it is NOT offered even when the rate
-    #: card defines one — a 12-hour chart left in the backend must not reappear as a
-    #: chip on a screen that says the maximum is 8.
-    rental_min_hours: int = 3
-    rental_max_hours: int = 8
+    #: THE durations the rental product sells. An ALLOWLIST, not a preference: a rider
+    #: is offered these and nothing else, whatever charts exist in the Spring backend.
+    #:
+    #: The rate card is still the source of truth for what can be PRICED and for what
+    #: each package INCLUDES — it supplies the kilometres against these hours. What it
+    #: cannot do is introduce a duration of its own: a 6- or 12-hour chart left
+    #: configured in the backend must not surface as a chip on a screen that sells 4
+    #: and 8. This is also the list the assistant offers when the rate card cannot be
+    #: read at all, so the rider is never asked an open "how many hours?" that invites
+    #: an answer the backend matches no chart for.
+    #:
+    #: One list, deliberately. There used to be a separate min/max window alongside it,
+    #: which meant two settings could disagree about the same product statement — and
+    #: the one that lost was whichever the reader did not check. Anything wanting a
+    #: range takes min()/max() of this.
+    #:
+    #: Env: RENTAL_HOUR_OPTIONS="4,8".
+    rental_hour_options: list[int] = Field(default=[4, 8])
 
     # ── Him Cab offers (real coupons, same Spring backend) ────────────────────
     # The assistant quotes ONLY these — see app/integrations/himcab/offers_service.py for

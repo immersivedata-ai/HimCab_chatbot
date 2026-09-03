@@ -219,22 +219,22 @@ class TestARentalSentenceIsUnderstood:
     async def test_the_same_sentence_in_hinglish(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
-            "Kal subah 6 baje Manali se gaadi chahiye 5 ghante ke liye, hum 4 hain",
+            "Kal subah 6 baje Manali se gaadi chahiye 4 ghante ke liye, hum 4 hain",
             NOTHING,
         )
 
         assert turn.produced
-        assert chat.entities.rental_hours == 5
+        assert chat.entities.rental_hours == 4
         assert chat.entities.pickup_time == "06:00"
         assert chat.entities.origin == "Manali"
 
     @pytest.mark.asyncio
     async def test_a_sentence_is_still_understood_when_vertex_is_down(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        turn = await chat.say("3 hrs from Kullu tomorrow at 10 am, 2 of us", None)
+        turn = await chat.say("4 hrs from Kullu tomorrow at 10 am, 2 of us", None)
 
         assert turn.produced
-        assert chat.entities.rental_hours == 3
+        assert chat.entities.rental_hours == 4
         assert chat.entities.origin == "Kullu"
 
     @pytest.mark.asyncio
