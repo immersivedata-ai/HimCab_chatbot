@@ -34,6 +34,7 @@ from app.agent.nodes.planner import PlannerExtraction, planner_node
 from app.agent.nodes.tool_executor import tool_executor_node
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.enums import SlotName
 from app.domain.conversation import ExtractedEntities
 from app.integrations.himcab.models import FareCategoryFare, FareQuote
 from app.integrations.himcab.quote_builder import build_rental_quote_input, matching_package
@@ -1396,8 +1397,10 @@ class TestARentalStaysARentalWhateverThePhoneSays:
         ))
 
         assert session.entities.visitor_type == RENTAL
-        # …and the fix is still used for what it is actually good for: the pickup.
-        assert session.entities.origin == place
+        # …and the fix does NOT answer the pickup question. It used to: `origin` was
+        # set to `place` here, so the rider was never asked where the car should
+        # collect them. See TestTheRentalAlwaysAsksWhereToCollectThem below.
+        assert session.entities.origin is None
 
     def test_the_questions_and_the_reply_survive_the_fix(self):
         """The two decisions that were being made off the clobbered value."""
@@ -1430,6 +1433,106 @@ class TestARentalStaysARentalWhateverThePhoneSays:
         ))
 
         assert session.entities.visitor_type == "local"
+
+
+# ── 9b. The pickup is ASKED FOR, never assumed from the phone ─────────────────
+
+class TestTheRentalAlwaysAsksWhereToCollectThem:
+    """Reported: "the system is not asking for the pickup location".
+
+    The Rent a Car screen sends a GPS fix. `apply_location` wrote the reverse-geocoded
+    town into `entities.origin` for every persona, so by the time the slot policy ran
+    the pickup looked ANSWERED and the question was skipped — the rider went straight
+    from the duration to the date, and the fare was priced from whatever settlement
+    their phone sat nearest.
+
+    That is defensible for a trip, where `origin` means "which city are you travelling
+    from" and a fix genuinely answers it. It is wrong for a rental, where `origin` is
+    the address a driver is sent to. `is_precise` only promises the fix is within 15 km
+    of the named town, and somebody hiring a car from an airport, a hotel or an office
+    is not at the town centre.
+    """
+
+    def _rental_session(self):
+        from app.domain.conversation import TripSession
+
+        session = TripSession(user_id="u", persona=RENTAL)
+        session.entities.visitor_type = RENTAL
+        return session
+
+    def _fix(self, **overrides):
+        from app.domain.location import RiderLocation
+
+        return RiderLocation(**{
+            "lat": 31.1048, "lon": 77.1734, "in_himachal": True,
+            "place_name": "Shimla", "place_distance_km": 3.2,
+            "state": "Himachal Pradesh", **overrides,
+        })
+
+    def test_a_precise_fix_does_not_fill_the_pickup(self):
+        from app.services.chat_session import apply_location
+
+        session = self._rental_session()
+        apply_location(session, self._fix())
+
+        assert session.entities.origin is None
+        assert session.entities.home_city is None
+        # The coordinates are still kept — they are the map pin and the weather lookup.
+        assert session.rider_location is not None
+
+    def test_the_pickup_question_is_actually_asked(self):
+        from app.services.chat_session import apply_location
+
+        session = self._rental_session()
+        apply_location(session, self._fix())
+        session.entities.rental_hours = 8
+
+        decision = slots.decide(
+            session.entities, "rental_query", RENTAL, "en", max_attempts=2
+        )
+        assert decision.ask_field == SlotName.ORIGIN
+        assert "pick you up" in decision.question
+
+    @pytest.mark.parametrize("persona", ["local", "outstation"])
+    def test_a_trip_still_takes_its_origin_from_the_fix(self, persona):
+        """The convenience this removes from rentals is untouched everywhere else —
+        for a journey, the starting CITY is exactly what a fix is good for."""
+        from app.domain.conversation import TripSession
+        from app.services.chat_session import apply_location
+
+        session = TripSession(user_id="u", persona=persona)
+        session.entities.visitor_type = persona
+        apply_location(session, self._fix())
+
+        assert session.entities.origin == "Shimla"
+
+
+class TestHereMeansTheDeviceFix:
+    """Once the pickup is always asked for, "here" is a reply riders actually give.
+
+    It used to parse as a PLACE: `parse_place("here")` returned "Here", which became
+    the pickup, was geocoded to something somewhere, and priced. Exactly the failure
+    `_NOT_A_PLACE` already guards for "cancel" and "rent a car".
+    """
+
+    @pytest.mark.parametrize(
+        "reply", ["here", "Here", "from here", "yahin", "yahin se", "my location",
+                  "current location", "where i am"],
+    )
+    def test_deixis_never_becomes_a_place(self, reply):
+        assert slots.parse_place(reply) is None
+        assert slots.means_current_location(reply) is True
+
+    @pytest.mark.parametrize(
+        "reply", ["Shimla", "shimla mall road", "Kasol", "Manali bus stand"],
+    )
+    def test_a_real_pickup_is_still_read_normally(self, reply):
+        assert slots.parse_place(reply) is not None
+        assert slots.means_current_location(reply) is False
+
+    def test_here_in_a_named_town_is_not_treated_as_deixis(self):
+        """"here in Shimla" names a place. It must not be swallowed as "the fix"."""
+        assert slots.means_current_location("here in shimla") is False
 
 
 # ── 11. A whole sentence, read in code as well as by the model ────────────────

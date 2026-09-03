@@ -38,6 +38,7 @@ from app.agent import slots
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.enums import SlotName
 from app.core.logging import get_logger
 from app.domain.conversation import ExtractedEntities
 from app.domain.itinerary import BudgetRange, GroupType
@@ -540,6 +541,45 @@ Report what the user has stated. Use null for anything they have not."""
         # where they live, and writing it here is what used to turn them into a local.
         if visitor_type == LOCAL and origin_in_hp and not merged.get("home_city"):
             merged["home_city"] = merged.get("origin")
+
+    # ── "Here" — the pickup answered by pointing rather than naming ───────────
+    # Only for the rental pickup, and only as a reply to that exact question. Now that
+    # a rental always asks where the car should collect them, "here" / "yahin" / "my
+    # location" is a reply riders genuinely give — and it used to parse as a PLACE
+    # called "Here", which the geocoder resolved to something and the car was sent to.
+    #
+    # The fix is the honest reading of it, and a better one than the pickup this flow
+    # used to assume: exact coordinates the rider has just confirmed, rather than a
+    # town centre nobody was asked about. It is accepted only when the fix is precise
+    # — `is_precise` is what makes `place_name` a name worth saying out loud, and the
+    # reply announces the pickup. Without one we would be guessing at a name and
+    # sending a car on it, so the question is simply asked again.
+    if (
+        is_rental
+        and latest_text
+        and previously_asked == SlotName.ORIGIN
+        and not merged.get("origin")
+        and slots.means_current_location(latest_text)
+    ):
+        fix = state.rider_location
+        if fix is not None and fix.is_precise and fix.place_name:
+            merged["origin"] = fix.place_name
+            log.info(
+                "rental_pickup_from_device_fix",
+                place=fix.place_name,
+                distance_km=fix.place_distance_km,
+                session_id=state.session_id,
+            )
+        else:
+            # Deliberately fills nothing: `decide` then re-asks, and the second wording
+            # ("just the name of the city or town the car should come to") is exactly
+            # the right thing to say to somebody whose "here" we could not place.
+            log.info(
+                "rental_pickup_here_without_usable_fix",
+                has_fix=fix is not None,
+                is_precise=bool(fix and fix.is_precise),
+                session_id=state.session_id,
+            )
 
     # ── Read the reply as an answer to the question we asked ──────────────────
     # Strictly scoped: only the fields that question covered, only if the reply has

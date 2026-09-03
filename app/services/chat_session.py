@@ -192,12 +192,16 @@ async def _load_owned_session(session_id: str, user_id: str) -> Optional[TripSes
 def apply_location(session: TripSession, location: Optional[RiderLocation]) -> bool:
     """Attach a fresh GPS fix to a conversation. True when anything changed.
 
-    Beyond storing the fix, this fills in the pickup city — but ONLY when the fix
-    actually sits on a town we know (`is_precise`). A fix 40 km from the nearest named
-    place is perfectly good for measuring a distance and useless as a place name: it
-    would have the reply announce "your trip from Mandi" to somebody who has never been
-    there. In that case the coordinates are still used for the route, and the assistant
-    asks which city they are starting from, as it always did.
+    Beyond storing the fix, this fills in the starting city for a TRIP — but only when
+    the fix actually sits on a town we know (`is_precise`). A fix 40 km from the nearest
+    named place is perfectly good for measuring a distance and useless as a place name:
+    it would have the reply announce "your trip from Mandi" to somebody who has never
+    been there. In that case the coordinates are still used for the route, and the
+    assistant asks which city they are starting from, as it always did.
+
+    A RENTAL never has its pickup filled in this way. There, `origin` is the address a
+    driver is sent to rather than a city someone is travelling from, and the rider is
+    always asked for it.
 
     A rider who has already NAMED their starting city keeps it. Their words outrank
     their phone: someone booking a Delhi pickup from their Shimla sofa means Delhi.
@@ -214,7 +218,31 @@ def apply_location(session: TripSession, location: Optional[RiderLocation]) -> b
 
     session.rider_location = location
 
-    if location.place_name and location.is_precise and not session.entities.origin:
+    # Decided once, up here, because BOTH blocks below turn on it — the pickup fill
+    # and the persona. See each for why a rental is different.
+    is_rental = RENTAL in (session.persona, session.entities.visitor_type)
+
+    # A fix answers "which city are you travelling FROM" — a city-level fact about a
+    # journey, and a question worth skipping when the phone already knows.
+    #
+    # It does NOT answer "where should the car pick you up?", which is what `origin`
+    # means in a rental: a PICKUP POINT, the address a driver is sent to. `is_precise`
+    # only promises the fix is within PRECISE_FIX_KM (15 km) of the town the geocoder
+    # named, and a reverse-geocoded town centre is not an address. Filling it here meant
+    # the pickup question was silently already answered, so the rider was never asked
+    # — and a car booked from an airport, a hotel or an office was quoted, and sent, to
+    # whatever settlement the phone happened to sit nearest.
+    #
+    # So a rental always asks. The coordinates are still used for what they are good
+    # for: the map pin and the weather (`tool_executor._rental_tools`), and once the
+    # rider names a pickup that agrees with the fix, `_fix_matches_origin` hands the
+    # exact coordinates to `geo.resolve_pickup` — a better pin than this line ever set.
+    if (
+        location.place_name
+        and location.is_precise
+        and not session.entities.origin
+        and not is_rental
+    ):
         session.entities.origin = location.place_name
         if location.in_himachal:
             session.entities.home_city = location.place_name
@@ -233,7 +261,6 @@ def apply_location(session: TripSession, location: Optional[RiderLocation]) -> b
     # cab quote or an itinerary; the reply had nothing to do with hiring a car. Every
     # other guard against this (`resolve_persona`, `classify_visitor_type`,
     # `needs_for`, `response_mode`) reads a value this line had already destroyed.
-    is_rental = RENTAL in (session.persona, session.entities.visitor_type)
     if not is_rental and session.entities.visitor_type != location.visitor_type:
         session.entities.visitor_type = location.visitor_type
         changed = True

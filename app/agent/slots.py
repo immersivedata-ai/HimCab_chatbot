@@ -115,6 +115,13 @@ _NOT_A_PLACE = {
     # under that, for a phrasing it misses.
     "cancel", "cancelled", "canceled", "cancellation", "abort", "nevermind",
     "forget", "rehne", "rehnedo", "chhodo", "chodo", "band",
+    # Deixis. "Where should the car pick you up?" answered with "here" used to pass
+    # this parser outright: the pickup became the place "Here", the geocoder found
+    # something somewhere, and the car was sent to it. These words REFER to the
+    # rider's position, they do not name it — `means_current_location` reads them
+    # against the device's fix instead. Same failure as "cancel" above, same fix.
+    "here", "there", "loc", "position", "spot", "yahan", "yahin",
+    "idhar", "yaha", "yhan", "wahan", "jagah", "यहाँ", "यहीं", "इधर",
 }
 
 _QUESTION_HINTS = ("?", "kya ", "kaise", "kahan ", "kaunsa", "what ", "which ", "how ", "why ")
@@ -146,12 +153,61 @@ def parse_place(text: str) -> Optional[str]:
     text = text.strip().strip(".,!")
     if not text or _looks_like_a_question(text) or any(c.isdigit() for c in text):
         return None
+    # A reply that POINTS at the rider's position does not name a place. Deferring to
+    # the one recognizer rather than repeating its vocabulary in `_NOT_A_PLACE` keeps
+    # a phrase from being rejected by one and accepted by the other — "where i am"
+    # parsed as the place "Where I Am" precisely because the two lists disagreed.
+    if means_current_location(text):
+        return None
     toks = _tokens(text)
     if not 1 <= len(toks) <= 3 or len("".join(toks)) < 3:
         return None
     if any(t in _NOT_A_PLACE or t in _NON_ANSWERS or _looks_like_time_word(t) for t in toks):
         return None
     return text.title()
+
+
+#: Ways a rider says "collect me where I am" rather than naming a place. Matched as
+#: whole words against the normalised reply, so "here" fires and "Herebad" does not.
+_CURRENT_LOCATION_WORDS = frozenset({
+    "here", "yahan", "yahin", "yaha", "yhan", "idhar", "yahi",
+    "यहाँ", "यहीं", "इधर",
+})
+
+#: Phrases where the words alone are not enough — "my location", "current location".
+_CURRENT_LOCATION_PHRASES = (
+    "my location", "current location", "my current location", "this location",
+    "where i am", "where im", "where i m", "same place", "same location",
+    "my position", "present location", "meri location", "abhi jahan",
+    "abhi jaha", "jahan hu", "jaha hu", "jahan hoon", "jaha hoon",
+)
+
+
+def means_current_location(text: str) -> bool:
+    """True when the reply POINTS at the rider's position instead of naming a place.
+
+    Only meaningful for the pickup question, and only answerable when the app actually
+    sent a fix — which is why this returns a boolean and resolves nothing. The caller
+    (`planner_node`) is where `state.rider_location` lives, and it decides whether
+    there is a usable fix to turn this into a pickup, or whether to ask again.
+
+    Deliberately narrow. A phrase this misses costs one more question; a phrase it
+    wrongly matches sends a car to the wrong place.
+    """
+    low = " ".join((text or "").lower().split())
+    if not low:
+        return False
+    if any(phrase in low for phrase in _CURRENT_LOCATION_PHRASES):
+        return True
+    tokens = _tokens(low)
+    if not tokens or len(tokens) > 3:
+        return False
+    # Every word must be deixis or filler — "here" and "from here" yes, "here in
+    # Shimla" no, because that one names a place and `parse_place` should have it.
+    filler = {"from", "se", "pe", "par", "at", "on", "in", "the", "my", "mere", "meri"}
+    return any(t in _CURRENT_LOCATION_WORDS for t in tokens) and all(
+        t in _CURRENT_LOCATION_WORDS or t in filler for t in tokens
+    )
 
 
 def parse_duration_days(text: str) -> Optional[int]:
