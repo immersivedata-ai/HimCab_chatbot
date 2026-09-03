@@ -16,6 +16,8 @@ an itinerary. Two independent causes, both covered here:
      switched them to Hindi AND to the cab-only reply with no itinerary.
 """
 
+from typing import ClassVar
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -177,3 +179,125 @@ class TestTheReportedConversation:
         assert persona == "outstation"
         assert slots.response_mode("plan_trip", persona) == slots.ITINERARY_MODE
         assert _language("I want to go to Kasol", persona=persona) == "en"
+
+
+# ── 7. A short answer is not a language sample ────────────────────────────────
+
+class TestAnAnswerDoesNotChangeTheLanguage:
+    """Reported: "all of a sudden started giving response in English instead of Hindi".
+
+    The assistant asks a local rider its questions in Hindi. They answer the way anyone
+    answers a form — "4 people", "2 of us", "tomorrow at 5" — and every one of those is
+    mostly English FUNCTION words, whoever is typing them. Those words were counted as
+    evidence, so the reply that a Hindi question had just solicited was itself what
+    switched the conversation to English, one turn after it started.
+
+    Two things caused it, and both are covered here:
+
+      1. the threshold was checked against the WEIGHTED total, and the newest message
+         carries the highest weight — so a single "of" scored enough to clear a bar
+         meant to require two separate words
+      2. short replies voted at all
+    """
+
+    ANSWERS: ClassVar[list] = [
+        "4 people", "2 of us", "tomorrow at 5", "at 6 am", "from my home",
+        "3 of us", "for 2 days",
+    ]
+
+    @pytest.mark.parametrize("answer", ANSWERS)
+    def test_a_local_answering_a_question_stays_in_hindi(self, answer):
+        assert _language("Manali", answer, persona="local") == "hi"
+
+    @pytest.mark.parametrize("answer", ANSWERS)
+    def test_the_same_answer_leaves_a_visitor_in_english(self, answer):
+        """Symmetric: it is not evidence either way, so the persona still decides."""
+        assert _language("Manali", answer, persona="outstation") == "en"
+
+    def test_a_whole_local_conversation_of_short_answers_stays_hindi(self):
+        """The reported shape, turn by turn: Hindi welcome, then it drifts."""
+        conversation = ["Manali", "Kullu se", "4 people", "tomorrow at 5", "2 of us"]
+        for turn in range(1, len(conversation) + 1):
+            assert _language(*conversation[:turn], persona="local") == "hi", (
+                f"switched to English at turn {turn}: {conversation[turn - 1]!r}"
+            )
+
+    def test_real_english_prose_still_switches_a_local(self):
+        """The guard is about ANSWERS, not about refusing to listen. A local who
+        actually writes English gets English."""
+        assert _language(
+            "I would like to book a cab to Manali for my family", persona="local"
+        ) == "en"
+
+    def test_an_explicit_request_still_wins_from_a_local(self):
+        assert _language("Manali", "please reply in english", persona="local") == "en"
+
+    def test_devanagari_in_a_short_answer_is_still_hindi(self):
+        """Script is unambiguous at any length — it never needed the word count."""
+        assert _language("मनाली", persona="outstation") == "hi"
+
+
+# ── 8. A local is booking a ride, so it is never asked how many DAYS ──────────
+
+class TestALocalIsNeverAskedHowManyDays:
+    """Reported: the local flow asks "how many days are you travelling for?".
+
+    `response_mode` already returns RIDE_MODE for a resident — the reply is a cab, a
+    fare, a drive time and the weather, with no itinerary in it. But the QUESTIONS were
+    keyed on the intent alone, and a local and a visitor both arrive as `plan_trip`, so
+    the resident was walked through the itinerary checklist to produce a reply that
+    could not use the answers.
+    """
+
+    def test_duration_is_not_asked_of_a_local(self):
+        from app.agent import slots
+
+        needs = slots.needs_for("plan_trip", "local")
+        assert "duration_days" not in needs
+
+    def test_a_visitor_is_still_asked_it(self):
+        from app.agent import slots
+
+        assert "duration_days" in slots.needs_for("plan_trip", "outstation")
+
+    @pytest.mark.parametrize("intent", ["plan_trip", "clarification", "cost_query"])
+    def test_no_travel_intent_asks_a_local_for_days(self, intent):
+        from app.agent import slots
+
+        assert "duration_days" not in slots.needs_for(intent, "local")
+
+    def test_the_ride_still_asks_what_it_actually_needs(self):
+        """Where to, where from, how many, and when — each one feeds the fare or the
+        cab. Dropping the days must not quietly drop these."""
+        from app.agent import slots
+
+        needs = slots.needs_for("plan_trip", "local")
+        assert needs["destination"] is slots.Need.REQUIRED
+        for field in ("origin", "group_size", "travel_dates"):
+            assert needs[field] is slots.Need.IMPORTANT
+
+    def test_a_local_asking_about_the_weather_is_still_asked_nothing_but_the_place(self):
+        """The ride table is scoped to travel intents — a lookup keeps its own."""
+        from app.agent import slots
+
+        assert list(slots.needs_for("weather_query", "local")) == ["destination"]
+
+    def test_the_question_sequence_a_local_actually_sees(self):
+        from app.agent import slots
+        from app.domain.conversation import ExtractedEntities
+
+        entities = ExtractedEntities(
+            visitor_type="local", destination="Manali", origin="Kullu"
+        )
+        asked = []
+        for _ in range(6):
+            decision = slots.decide(
+                entities, "plan_trip", "local", "hi", max_attempts=2
+            )
+            if not decision.ask_field:
+                break
+            asked.append(str(decision.ask_field))
+            setattr(entities, decision.ask_field,
+                    {"group_size": 3, "travel_dates": "kal"}[decision.ask_field])
+
+        assert asked == ["group_size", "travel_dates"]

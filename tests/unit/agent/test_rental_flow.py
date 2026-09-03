@@ -314,10 +314,21 @@ class TestTheRentalConversation:
         assert slots.response_mode(drifted_intent, RENTAL) == slots.RENTAL_MODE
 
     def test_the_trip_checklist_is_untouched_for_everyone_else(self):
-        for persona in (None, "local", "outstation"):
+        """The rental tables must not have leaked into the other personas.
+
+        `duration_days` is asked of a VISITOR, who is being handed a day-by-day plan.
+        A local is booking a ride and is not asked it — that is `_RIDE_NEEDS`, not
+        rental bleed — so the two are asserted apart rather than lumped together.
+        """
+        for persona in (None, "outstation"):
             needs = slots.needs_for("plan_trip", persona)
             assert needs["destination"] is slots.Need.REQUIRED
             assert "duration_days" in needs
+
+        local = slots.needs_for("plan_trip", "local")
+        assert local["destination"] is slots.Need.REQUIRED
+        assert local["group_size"] is slots.Need.IMPORTANT
+        assert "duration_days" not in local
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("pickup", ["Delhi", "Chandigarh", "Shimla", "Manali"])

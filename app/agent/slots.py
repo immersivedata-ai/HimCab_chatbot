@@ -1076,6 +1076,30 @@ _COST_NEEDS: dict[str, Need] = {
     SlotName.GROUP_SIZE: Need.IMPORTANT,
 }
 
+#: A Himachal resident going somewhere is booking a RIDE, not planning a holiday —
+#: `response_mode` already returns RIDE_MODE for them and the reply is a cab, a fare, a
+#: drive time and the weather, with no itinerary anywhere in it.
+#:
+#: So there are no DAYS. "How many days are you travelling for?" is a question about an
+#: itinerary, and asking a resident how many days their drive to Manali lasts is the
+#: same mistake as asking a rental rider where they are going: a question whose answer
+#: the reply has no use for, about a thing they did not ask for. It was being asked
+#: because this table was keyed on the INTENT alone, and a local and a visitor both
+#: arrive here as `plan_trip`.
+#:
+#: Everything else a ride genuinely needs stays: where to, where from (the fare is
+#: priced on that leg), how many (it picks the cab) and when (the fare's booking time
+#: and the forecast).
+_RIDE_NEEDS: dict[str, Need] = {
+    SlotName.DESTINATION: Need.REQUIRED,
+    SlotName.ORIGIN: Need.IMPORTANT,
+    SlotName.GROUP_SIZE: Need.IMPORTANT,
+    SlotName.TRAVEL_DATES: Need.IMPORTANT,
+    # Deliberately absent, not UNUSED-by-omission: see above. A ride has no duration in
+    # days, and `_PLAN_TRIP_NEEDS` is where that question belongs.
+    SlotName.RETURN_JOURNEY_PREFERENCE: Need.OPTIONAL,
+}
+
 #: A rental is a car and a driver for a block of time. There is no destination — that
 #: is the whole point of hiring by the hour — so asking for one would be asking the
 #: rider to invent an answer. What the fare needs is the package and the pickup.
@@ -1159,8 +1183,9 @@ def needs_for(
 ) -> dict[str, Need]:
     """The slot policy for an intent. Unknown intents plan a trip (the safe default).
 
-    A RENTAL session is decided by the persona, NOT by this turn's intent — the same
-    rule `response_mode` already applies, and for the same reason. The router
+    The PERSONA decides, not just this turn's intent — the same rule `response_mode`
+    already applies, and for the same reason. That holds for a rental (hours, not a
+    destination) and equally for a local (a ride, so no trip length). The router
     re-classifies intent from every message, so "kasol" or "shimla" in a rental chat
     comes back as `plan_trip`; keying the questions off that alone asked a rider hiring
     a car by the hour where they wanted to GO and for how many DAYS, then read their
@@ -1173,6 +1198,11 @@ def needs_for(
         return _CANCEL_NEEDS
     if intent == RENTAL_INTENT or visitor_type == RENTAL:
         return _RENTAL_NEEDS
+    # Same rule, one persona along: a LOCAL travelling is booking a ride, and a ride has
+    # no days. Scoped to the travel intents so a resident asking about the weather in
+    # Manali still gets `_LOOKUP_NEEDS` and is asked nothing but the place.
+    if visitor_type == LOCAL and intent in _TRAVEL_INTENTS:
+        return _RIDE_NEEDS
     return _NEEDS.get(intent or "", _PLAN_TRIP_NEEDS)
 
 

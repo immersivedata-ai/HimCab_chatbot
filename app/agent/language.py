@@ -26,6 +26,10 @@ the assistant switched to Hindi and stayed there. Three things now prevent that:
      more evidence rather than to Hindi on a technicality
   3. the evidence is read across the recent conversation, not just the last message,
      so one stray token cannot flip a conversation that has been running in English
+  4. only messages long enough to be PROSE are counted. The short answers the
+     assistant's own questions solicit — "4 people", "2 of us", "tomorrow at 5" — are
+     mostly English function words whoever is typing them, and counting them flipped
+     Hindi conversations to English one answer after the assistant asked in Hindi
 
 Rule, in order:
 
@@ -33,7 +37,7 @@ Rule, in order:
     any Devanagari in a recent message                        → Hindi
     Hindi markers, and at least as many as English markers    → Hindi
     English markers and no Hindi markers                      → English
-    otherwise (a place name, a number, a greeting)            → the PERSONA DEFAULT
+    otherwise (a place name, a number, a short answer)        → the PERSONA DEFAULT
                                                                  local → Hindi
                                                                  outstation → English
 
@@ -106,7 +110,27 @@ _ENGLISH_MARKERS = {
 }
 
 #: Two markers is enough to be sure — one can be a name, a typo or a coincidence.
+#: Counted RAW, not weighted. Comparing the weighted total against this is what let a
+#: single word decide: the newest message carries the highest weight, so one "of" in
+#: the latest reply scored 4 and cleared a bar meant to need two separate words.
 _MIN_MARKERS = 2
+
+#: Below this many words a message is an ANSWER, not a language sample, and it casts no
+#: vote — the persona decides instead.
+#:
+#: This is the fix for a local conversation flipping to English mid-way. The assistant
+#: asks its questions in Hindi and the rider answers them the way anyone answers a
+#: form: "4 people", "2 of us", "tomorrow at 5". Every one of those is mostly English
+#: FUNCTION words ("of", "us", "at", "people"), so the reply that a Hindi question
+#: solicited was itself the evidence used to switch away from Hindi — and the rider saw
+#: the assistant change language for no reason they could see.
+#:
+#: A bare answer already followed the persona when it contained no markers at all
+#: ("Manali", "4", "kasol"); this only extends the same rule to the short answers that
+#: happen to contain one. Real prose — "mujhe manali jana hai", "Can you plan the trip
+#: for me" — clears it comfortably, which is what keeps a single sentence able to set
+#: the language on the first turn.
+_MIN_SAMPLE_WORDS = 4
 
 #: How many recent user messages the decision reads. A conversation that has been
 #: running in one language should not turn over on a single short reply.
@@ -148,18 +172,28 @@ def detect_reply_language(state: AgentState) -> tuple[str, str]:
     if _DEVANAGARI_RE.search(joined):
         return "hi", _LANGUAGE_NAMES["hi"]
 
+    # Only messages long enough to BE a language sample vote. See _MIN_SAMPLE_WORDS.
+    samples = [t for t in recent if len(_WORD_RE.findall(t.lower())) >= _MIN_SAMPLE_WORDS]
+
     # Weighted so the newest message leads but cannot single-handedly overturn the
     # conversation: a rider who has written three English sentences and then types
     # "kal" is asking about tomorrow, not switching language.
+    #
+    # The raw totals are what the thresholds are checked against, and the weighted ones
+    # only decide which side wins once both have real evidence. Mixing the two is what
+    # let one word in the newest message cross a bar meant to need two.
     hindi = english = 0
-    for weight, text in enumerate(recent, start=1):
+    raw_hindi = raw_english = 0
+    for weight, text in enumerate(samples, start=1):
         h, e = _count_markers(text)
+        raw_hindi += h
+        raw_english += e
         hindi += h * weight
         english += e * weight
 
-    if hindi >= _MIN_MARKERS and hindi >= english:
+    if raw_hindi >= _MIN_MARKERS and hindi >= english:
         return "hi", _LANGUAGE_NAMES["hi"]
-    if english >= _MIN_MARKERS and hindi == 0:
+    if raw_english >= _MIN_MARKERS and raw_hindi == 0:
         return "en", _LANGUAGE_NAMES["en"]
 
     # Ambiguous — a place name, a bare number, a greeting. Follow the persona.
