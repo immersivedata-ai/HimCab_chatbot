@@ -22,13 +22,14 @@ flow asks for a duration, a pickup, a date, a time and a cab, and nothing downst
 may demand one.
 """
 
+from datetime import timedelta
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent import slots
+from app.agent import sanitize, slots
 from app.agent.graph import route_after_planner
 from app.agent.nodes.planner import PlannerExtraction, planner_node
 from app.agent.nodes.tool_executor import tool_executor_node
@@ -72,6 +73,16 @@ SOLD = list(settings.rental_hour_options)
 
 #: A duration nothing sells: absent from `rental_hour_options` AND from the rate card.
 UNSOLD_HOURS = 6
+
+
+def _days_from_today(offset: int) -> str:
+    """A rental's travel_dates as the booking screen now receives it: a real date.
+
+    Computed rather than hard-coded, because the value depends on the day the suite
+    runs — a literal would pass today and fail tomorrow, which is precisely the class
+    of bug that made the offer tests start failing on a date.
+    """
+    return (sanitize.today_ist() + timedelta(days=offset)).isoformat()
 
 
 def _parsed() -> list[RentalPackage]:
@@ -1697,7 +1708,7 @@ class TestASentenceIsReadInCode:
             svc.return_value.get_flash_model.return_value = llm
             result = await planner_node(state)
 
-        assert result["entities"].travel_dates == "today"
+        assert result["entities"].travel_dates == sanitize.today_ist().isoformat()
 
     def test_nothing_is_invented_from_a_sentence_with_no_details(self):
         assert slots.read_rental_details("I need a car please") == {}
@@ -1727,7 +1738,7 @@ class TestASentenceIsReadInCode:
         entities = result["entities"]
         assert (entities.rental_hours, entities.origin) == (8, "Shimla")
         assert (entities.pickup_time, entities.group_size) == ("09:00", 4)
-        assert entities.travel_dates.lower() == "tomorrow"
+        assert entities.travel_dates == _days_from_today(1)
         # Nothing left to ask, so the turn goes on to price it.
         assert result["needs_clarification"] is False
 

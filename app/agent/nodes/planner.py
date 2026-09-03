@@ -34,7 +34,7 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from app.agent import slots
+from app.agent import sanitize, slots
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -642,6 +642,28 @@ Report what the user has stated. Use null for anything they have not."""
     # keeping word for word, and nothing renders it into a form.
     if is_rental and merged.get("travel_dates"):
         merged["travel_dates"] = slots.tidy_when(merged["travel_dates"])
+
+    # ── The validation gate ───────────────────────────────────────────────────
+    # Everything above WRITES into `merged` — the extraction model, the answer parsers
+    # and the sentence reader — and until this existed only the last two checked what
+    # they wrote. The model's output went straight through, so a group of 500, a
+    # negative trip length, a pickup of "Here" or a travel date of "yesterday" reached
+    # the fare request and the booking screen unopposed.
+    #
+    # Placed here, after every writer and before `_build_entities`, so there is exactly
+    # one gate and no route around it. A value that fails is dropped rather than
+    # corrected: the slot is empty again, so `slots.decide` asks for it on this very
+    # turn instead of the rider discovering the problem at the booking screen.
+    #
+    # For a rental this is also where "tomorrow" becomes a real date — see
+    # `sanitize.travel_date`.
+    merged, rejected = sanitize.sanitize_entities(merged, is_rental=is_rental)
+    if rejected:
+        log.info(
+            "entity_values_rejected",
+            fields=rejected,
+            session_id=state.session_id,
+        )
 
     # ── A duration we do not sell, refused on the turn it arrives ─────────────
     unbookable_hours = (

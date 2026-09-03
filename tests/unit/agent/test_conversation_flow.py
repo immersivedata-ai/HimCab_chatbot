@@ -20,12 +20,13 @@ user would experience — how many questions, and whether an answer ever arrives
 """
 
 from collections import Counter
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent import slots
+from app.agent import sanitize, slots
 from app.agent.graph import route_after_planner, route_after_router
 from app.agent.nodes.planner import PlannerExtraction, planner_node
 from app.agent.state import AgentState
@@ -258,7 +259,9 @@ class TestARentalSentenceIsUnderstood:
         assert turn.asked
         assert turn.result["last_asked_field"] == "origin"
         assert chat.entities.rental_hours == 8
-        assert chat.entities.travel_dates.lower() == "tomorrow"
+        assert chat.entities.travel_dates == (
+            sanitize.today_ist() + timedelta(days=1)
+        ).isoformat()
 
 
 # ── 2. "It never generates" ───────────────────────────────────────────────────
