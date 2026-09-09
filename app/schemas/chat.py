@@ -301,3 +301,37 @@ class ChatHistoryResponse(BaseModel):
     total_messages: int = Field(
         description="Total stored on the conversation, which may exceed len(messages)."
     )
+
+
+class GreetingResponse(BaseModel):
+    """Response for GET /v1/chat/{persona}/greeting — the opening bubble, and nothing else.
+
+    Exists so the app can render its first bubble without waiting for `/start`, which
+    has to reverse-geocode a fix, read the rental rate card and write a session to
+    Firestore before it can answer. None of that work changes this text.
+
+    The app should SHIP a copy of these strings and render from the copy on launch —
+    that is the only thing that survives a cold start, when the container itself is
+    still booting and no endpoint can answer. This endpoint is how that copy is kept
+    honest: fetch it in the background, and if it differs from the bundled string, the
+    copy is stale and the newer text wins.
+    """
+
+    persona: str = Field(description='"local", "outstation" or "rental".')
+    message: str = Field(
+        description=(
+            "The opening line, ready to render as the first assistant bubble. For "
+            "rental this is the GENERIC wording — `/start` returns a better one that "
+            "names the real hourly packages, so replace this when that arrives."
+        )
+    )
+    language: str = Field(
+        description="The persona's default reply language. The agent adapts from the rider's first message onward."
+    )
+    is_final: bool = Field(
+        description=(
+            "True when `/start` will return this same text, so there is nothing to "
+            "replace. False for rental, where the greeting is upgraded once the rate "
+            "card has been read."
+        )
+    )

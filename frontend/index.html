@@ -522,6 +522,71 @@
 
     // One call when the dialog opens. The backend creates the conversation and hands
     // back the greeting to show as the first assistant bubble.
+
+    // ── The first bubble, with nothing in front of it ──────────────────────
+    // Copies of the backend's WELCOME_MESSAGES, rendered with NO network call, so the
+    // greeting is on screen immediately — including while Cloud Run is still cold-
+    // starting, when no endpoint can answer at all. That is the whole point: only text
+    // the page already has can appear before the container has booted.
+    //
+    // /start is then free to take as long as it needs. It reverse-geocodes the fix,
+    // reads the rental rate card (with retries, if that backend is slow) and writes a
+    // session to Firestore before it can reply — and none of that work changes this
+    // text, so waiting for it to render the first bubble was three round trips spent
+    // on a string that was already known.
+    //
+    // GET /v1/chat/{persona}/greeting serves these same strings and is the canonical
+    // source; `checkGreetingDrift()` compares the two and complains in the console
+    // rather than letting a stale copy here quietly disagree with the backend.
+    const GREETINGS = {
+      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी हिमाचल यात्रा की योजना बनाने में मदद कर सकता हूँ। आप कहाँ जाना चाहते हैं?",
+      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip to Himachal Pradesh. Where would you like to go?",
+      "rental": "Welcome to Him Cab! 🙏 I can arrange a car and driver by the hour. How long do you need the car for?"
+    };
+
+    let $greetingBubble = null;   // held so the bubble can be upgraded in place
+    let $greetingCol    = null;   // …and so later cards attach to the same message
+    let greetingShown   = "";
+
+    function renderBundledGreeting(persona) {
+      greetingShown = GREETINGS[persona] || GREETINGS.outstation;
+      const made = addMessage("assistant", greetingShown);
+      // addMessage returns a bare bubble on one page and an object on the others.
+      $greetingBubble = made.bubble || made;
+      $greetingCol    = made.col || null;
+      return { bubble: $greetingBubble, col: $greetingCol };
+    }
+
+    // Replace the bundled text once the server's own greeting arrives — but only when
+    // it actually differs. For local and outstation it will not, so the bubble never
+    // flickers; for rental it will, because /start names the real hourly packages,
+    // which is a better question than the open one shown first.
+    function reconcileGreeting(serverText) {
+      if (!serverText || !$greetingBubble) return null;
+      if (serverText !== greetingShown) {
+        $greetingBubble.innerHTML = marked.parse(serverText);
+        greetingShown = serverText;
+      }
+      return $greetingCol;
+    }
+
+    // A bundled copy that has drifted shows the rider one greeting and then swaps it
+    // for another a second later, which is worse than the slow version this replaces.
+    // Cheap, unauthenticated, and never blocks anything.
+    async function checkGreetingDrift(persona) {
+      try {
+        const res = await fetch(`${API_BASE}/v1/chat/${persona}/greeting`);
+        if (!res.ok) return;
+        const { message } = await res.json();
+        if (message && message !== GREETINGS[persona]) {
+          console.warn(
+            `[greeting] The bundled copy for "${persona}" no longer matches the ` +
+            `backend. Update GREETINGS in this file.`, { bundled: GREETINGS[persona], backend: message }
+          );
+        }
+      } catch (_) { /* a drift check must never affect the page */ }
+    }
+
     async function startChat() {
       try {
         const res = await fetch(`${CHAT_API}/start`, {
@@ -536,7 +601,7 @@
 
         $sessionInfo.textContent = `session: ${data.session_id.slice(0, 8)}`;
         setStatus(true);
-        addMessage("assistant", data.message);
+        reconcileGreeting(data.message);
         return true;
       } catch (e) {
         showError("Could not start chat: " + e.message);
@@ -747,7 +812,10 @@
     setInterval(checkHealth, 30000);
 
     // Opening the dialog greets the user straight away.
+    // Greeting first, with no network call, then everything else in the background.
+    renderBundledGreeting(PERSONA);
     startChat();
+    checkGreetingDrift(PERSONA);
     $input.focus();
   </script>
 </body>

@@ -185,6 +185,50 @@ visitor whatever their phone reports.
 Skipping this endpoint is fine: `/start`, `/stream` and `/message` all accept the same
 coordinates and route themselves, returning the persona they actually used.
 
+#### 0b. The greeting, with nothing in front of it
+
+```
+GET /v1/chat/{local|outstation|rental}/greeting
+```
+
+No `Authorization` header, no session created, no backend called. Returns:
+
+```json
+{
+  "persona": "local",
+  "message": "नमस्ते! Him Cab में आपका स्वागत है 🙏 …",
+  "language": "hi",
+  "is_final": true
+}
+```
+
+**Render your own bundled copy of this string instead of calling this on the hot
+path.** `/start` cannot be fast — it reverse-geocodes the fix, reads the rental rate
+card (with retries, when that backend is slow) and writes a session to Firestore before
+it can answer, and none of that work changes the greeting text. Worse, on a cold start
+*no* endpoint answers until the container has booted, so only text the app already has
+can appear at all.
+
+The pattern:
+
+1. Draw the bundled greeting the instant the chat screen opens. No network call.
+2. Let the rider start typing immediately — `/stream` works whether or not `/start` ran.
+3. Call `/start` in the background for the `session_id`, the resolved persona and, for
+   rental, the package chips.
+4. Replace the bubble text only if what comes back differs.
+
+`is_final` tells you whether step 4 will do anything. It is `true` for local and
+outstation — `/start` returns the identical string, so the bubble never flickers — and
+`false` for rental, where `/start` upgrades the open "how long do you need the car
+for?" to one naming the durations the rate card actually sells. Both are answerable, so
+showing the generic one first costs the rider nothing, but the named one is what stops
+an unbookable answer and should replace it as soon as it lands.
+
+Call this endpoint in the background to confirm your bundled copy is still current. A
+copy that has drifted shows the rider one greeting and swaps it for another a moment
+later, which is a worse experience than the delay it was meant to remove.
+`frontend/local.html` is a worked example of the whole pattern.
+
 #### 1. Open the chat dialog
 ```
 POST /v1/chat/{local|outstation}/start?lat=31.1048&lon=77.1734

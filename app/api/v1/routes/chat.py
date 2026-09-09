@@ -29,13 +29,27 @@ The chat API consumed by the mobile app.
 ║  1. User opens the chat dialog:                                                  ║
 ║       POST /v1/chat/{local|outstation}/start?lat=&lon=                           ║
 ║       → {"session_id", "message", "language", "persona", "location"}             ║
-║       Render `message` as the first assistant bubble (the welcome greeting).     ║
 ║       Send lat/lon here too and the reply's `persona` is authoritative — it may  ║
 ║       differ from the path you called, and if it does, use it from then on.      ║
+║                                                                                  ║
+║     DO NOT WAIT FOR THIS TO DRAW YOUR FIRST BUBBLE. /start reverse-geocodes the  ║
+║     fix, reads the rental rate card and writes a session before it can answer,   ║
+║     and none of that changes the greeting TEXT. Ship a copy of the greeting in   ║
+║     the app, render it the moment the screen opens, and let /start finish in the ║
+║     background — then replace the text only if what comes back differs. For      ║
+║     local and outstation it will not, so nothing flickers; for rental it will,   ║
+║     because /start names the real hourly packages.                               ║
+║                                                                                  ║
+║       GET /v1/chat/{local|outstation|rental}/greeting   ← no auth, no I/O        ║
+║       → {"persona", "message", "language", "is_final"}                           ║
+║       The same strings, so your bundled copy can be checked against them. Only   ║
+║       your own copy survives a cold start, when no endpoint answers at all.      ║
 ║                                                                                  ║
 ║  2. User sends a message (streaming — preferred):                                ║
 ║       GET /v1/chat/{local|outstation}/stream?message=<text>&lat=&lon=            ║
 ║       → text/event-stream: token | structured | done | error                     ║
+║       Render each `token` as it lands. Waiting for the whole reply is what makes ║
+║       a fast backend feel slow.                                                  ║
 ║                                                                                  ║
 ║     …or non-streaming, if SSE is inconvenient:                                   ║
 ║       POST /v1/chat/{local|outstation}/message                                   ║
@@ -111,6 +125,7 @@ from app.schemas.chat import (
     ChatHistoryResponse,
     ChatMessageRequest,
     ChatResponse,
+    GreetingResponse,
     PersonaRouteResponse,
     ResolvedLocation,
     RiderCoordinates,
@@ -118,12 +133,14 @@ from app.schemas.chat import (
 )
 from app.services import geo
 from app.services.chat_session import (
+    DEFAULT_LANGUAGE,
     LOCAL,
     OUTSTATION,
     RENTAL,
     resolve_chat,
     resolve_persona,
     start_chat,
+    welcome_message,
 )
 from app.services.local_cache import RateLimiter
 
@@ -512,6 +529,70 @@ async def _handle_history(
 
 # ── Persona routing (call this first) ─────────────────────────────────────────
 
+# ── The opening bubble, with nothing in front of it ───────────────────────────
+
+def _greeting(persona: str) -> GreetingResponse:
+    """Build the greeting from constants. No Firestore, no geocoder, no rate card.
+
+    `/start` cannot be fast: it reverse-geocodes the fix, reads the rental rate card
+    (with retries, if the Him Cab backend is slow) and writes a session to Firestore
+    before it can answer. None of that work changes the TEXT, so an app that waits for
+    `/start` to render its first bubble is waiting on three round trips for a string
+    that was already known.
+
+    Rental is the one persona whose greeting improves later: `/start` names the real
+    hourly packages once the rate card has been read, which is a better question than
+    the open one here. `is_final` says which case the caller is in, so the app knows
+    whether to expect a replacement or leave the bubble alone.
+    """
+    return GreetingResponse(
+        persona=persona,
+        message=welcome_message(persona),
+        # `.value`, not `str()`: DEFAULT_LANGUAGE holds real enum members, and
+        # `str(Language.HINDI)` is "Language.HINDI". Elsewhere the value comes off a
+        # TripSession, which stores enums by value already, so `str()` is right there
+        # and wrong here.
+        language=DEFAULT_LANGUAGE.get(persona, DEFAULT_LANGUAGE[OUTSTATION]).value,
+        is_final=persona != RENTAL,
+    )
+
+
+#: Deliberately unauthenticated, unlike everything else under /v1/chat. The response is
+#: one constant string, identical for every rider and carrying nothing personal — and
+#: the entire point is that it answers before the app has done anything at all, which
+#: includes before it has a token to send. Requiring one would put the thing the app
+#: needs first behind the thing it gets last.
+_GREETING_DESCRIPTION = """\
+The opening assistant bubble for this persona, with no work behind it — no session is
+created, nothing is written, and no backend is called. Needs no `Authorization` header.
+
+**Render your own bundled copy of this string at launch rather than calling this.** A
+cold start blocks every endpoint including this one, so only text the app already has
+can appear while the container is still booting. Call this in the background to check
+the copy is current, and to pick up wording changes without shipping a release.
+"""
+
+
+@router.get(
+    "/local/greeting",
+    response_model=GreetingResponse,
+    description=_GREETING_DESCRIPTION,
+)
+async def greeting_local() -> GreetingResponse:
+    """The LOCAL opening line. Hindi, and final — `/start` returns the same text."""
+    return _greeting(LOCAL)
+
+
+@router.get(
+    "/outstation/greeting",
+    response_model=GreetingResponse,
+    description=_GREETING_DESCRIPTION,
+)
+async def greeting_outstation() -> GreetingResponse:
+    """The OUTSTATION opening line. English, and final — `/start` returns the same text."""
+    return _greeting(OUTSTATION)
+
+
 @router.post("/route", response_model=PersonaRouteResponse)
 async def route_by_location(
     coordinates: RiderCoordinates,
@@ -671,6 +752,23 @@ async def history_outstation(
 # A rental is a SERVICE the rider chose, not an inference about who they are, so —
 # unlike /local and /outstation — coordinates never reroute these. Their fix decides
 # the pickup point and the reply language, not whether they still want a car.
+
+@rental_router.get(
+    "/greeting",
+    response_model=GreetingResponse,
+    description=_GREETING_DESCRIPTION,
+)
+async def greeting_rental() -> GreetingResponse:
+    """The RENTAL opening line, in its generic form.
+
+    `is_final` is false here: this asks an open "how long do you need the car for?",
+    and `/start` replaces it with one that names the packages the rate card actually
+    sells. Both are answerable, so showing this one first costs the rider nothing —
+    but the duration is matched EXACTLY by the backend, so the named version is what
+    stops an unbookable answer, and it should replace this as soon as it arrives.
+    """
+    return _greeting(RENTAL)
+
 
 @rental_router.post("/start", response_model=StartChatResponse)
 async def start_chat_rental(
