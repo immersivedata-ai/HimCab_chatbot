@@ -50,13 +50,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# These pins are the versions the tool CONFIG below was written against, and the
+# versions every check in this repo has been run with. They are not decoration: the
+# `[tool.ruff.lint]` ignore list names UP045, a rule that did not exist in ruff 0.6.9,
+# and ruff refuses to parse a config naming a selector it does not know — so the
+# pinned version could not lint this project at all. Bump these deliberately, and
+# re-run `make check` when you do.
 dev = [
     "pytest==8.3.3",
     "pytest-asyncio==0.24.0",
     "pytest-mock==3.14.0",
     "pytest-cov==5.0.0",
-    "ruff==0.6.9",
-    "mypy==1.11.2",
+    "ruff==0.16.2",
+    "mypy==1.14.1",
+    # PyYAML ships no type stubs of its own, and `ignore_missing_imports` does not
+    # cover that case — a package that exists but is untyped raises `import-untyped`
+    # instead, which blocked mypy before it checked anything else.
+    "types-PyYAML==6.0.12.20240917",
     "pre-commit==3.8.0",
 ]
 

@@ -10,9 +10,23 @@
 name: CI
 
 on:
+  # EVERY branch, not just main. Restricted to `[main]`, this workflow could never
+  # match a push to a feature branch — and GitHub does not quietly skip that, it
+  # records the run as a startup failure with no jobs and mails "Run failed at
+  # startup". Every push to refactor/project-structure failed that way, which looked
+  # like a broken workflow file rather than a trigger that excluded the branch.
+  #
+  # Running on all branches also means the suite gates work BEFORE a pull request
+  # exists, which is when it is most useful. The cost is a duplicate run once a branch
+  # has an open PR (one for the push, one for the PR); the concurrency group below
+  # cancels superseded attempts within each, and two runs is a small price for never
+  # pushing a red branch unknowingly.
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
+  # So a run can be triggered by hand from the Actions tab, which is also how you
+  # verify a workflow change without an empty commit.
+  workflow_dispatch:
 
 concurrency:
   # A new push supersedes the run in flight for the same ref.
