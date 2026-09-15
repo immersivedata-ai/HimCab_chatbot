@@ -439,15 +439,16 @@ class TestLocalRiderGetsACabNotAnItinerary:
 
         assert final.get("structured_itinerary") is None
         assert "itinerary" not in _event_types(final)
-        assert "FORBIDDEN" in agent.writer_prompt
-        assert "day-by-day plan" in agent.writer_prompt
-        assert "ITINERARY JSON" not in agent.writer_prompt
-        # The sightseeing brief that used to be added for locals is gone.
-        assert "LOCAL VISITOR INSTRUCTIONS" not in agent.writer_prompt
-        # The arrival-day brief is itinerary guidance; in a cab reply it was what
-        # produced "you can enjoy light sightseeing when you arrive".
-        assert "Day 1 must begin" not in agent.writer_prompt
-        assert "travel fatigue" not in agent.writer_prompt
+
+        # Asserted of the REPLY, not of the prompt. A ride reply is assembled rather
+        # than generated (app/agent/ride_reply.py), so there is no prompt to inspect —
+        # and checking the text itself is the stronger test anyway: the old version
+        # only proved we had TOLD the model not to write a brochure, which it did
+        # regardless, recommending Mall Road and the Ridge off its own knowledge.
+        reply = final["final_response_text"].lower()
+        for brochure in ("mall road", "ridge", "jakhu", "kufri", "sightseeing",
+                         "hidden gem", "day 1", "itinerary"):
+            assert brochure not in reply, f"the ride reply reads like a brochure: {brochure!r}"
 
     @pytest.mark.asyncio
     async def test_only_cabs_that_seat_the_group_reach_the_rider(self, agent):
@@ -458,20 +459,43 @@ class TestLocalRiderGetsACabNotAnItinerary:
         offered = [o["category_name"] for o in fare["payload"]["options"]]
 
         assert offered == ["Economy", "Sedan", "SUV"]
-        assert "Mini Bus" not in agent.writer_prompt
-        assert "Tempo Traveller" not in agent.writer_prompt
+        # And the reply names exactly those — no vehicle the party cannot book.
+        reply = final["final_response_text"]
+        for seats_them in ("Economy", "Sedan", "SUV"):
+            assert seats_them in reply
+        assert "Mini Bus" not in reply
+        assert "Tempo Traveller" not in reply
 
     @pytest.mark.asyncio
     async def test_the_reply_carries_the_drive_time_and_temperature(self, agent):
         final = await self._local_turn(agent)
 
         route = final["route_estimate"]
-        assert "THIS JOURNEY" in agent.writer_prompt
-        # Quoted from the resolved route, whatever the engine returned for it.
-        assert route["duration_text"] in agent.writer_prompt
-        assert f"{round(route['distance_km'])} km" in agent.writer_prompt
-        assert "9.4" in agent.writer_prompt             # current temperature
+        reply = final["final_response_text"]
+
+        # Copied from the resolved route, whatever the engine returned for it — and
+        # now verifiable in the reply itself rather than in an instruction. The unit is
+        # asserted in either script: a local rider is answered in Hindi, so the reply
+        # reads "202 किमी" rather than "202 km".
+        assert route["duration_text"] in reply
+        assert str(round(route["distance_km"])) in reply
+        assert ("km" in reply or "किमी" in reply)
+        assert "9.4" in reply                            # current temperature
         assert route["distance_km"] > 0
+
+        # The forecast and the snowfall RISK are real data that belong in an itinerary,
+        # where somebody is choosing what to do with four days. Here they were what
+        # produced a seven-day outlook and a "snowfall risk" line in a reply meant to
+        # be a cab and a price.
+        #
+        # The current CONDITION is not that, and may well be "light snow" — it is one
+        # of the four facts a ride reply is for. So the check is on the forecast
+        # wording, in both scripts, and on the reply staying short enough that a
+        # multi-day outlook could not fit in it.
+        assert "forecast" not in reply.lower()
+        assert "भविष्यवाणी" not in reply          # "forecast"
+        assert "जोखिम" not in reply               # "risk"
+        assert len(reply.splitlines()) <= 8, f"the ride reply has grown: {reply!r}"
 
     @pytest.mark.asyncio
     async def test_the_rider_is_handed_to_the_booking_screen_with_map_pins(self, agent):
@@ -495,8 +519,18 @@ class TestLocalRiderGetsACabNotAnItinerary:
         """The app owns the booking flow — the assistant only opens the door to it."""
         final = await self._local_turn(agent)
 
-        assert "Do not ask whether they want to book" in agent.writer_prompt
-        assert "shall I book" not in agent.writer_prompt.lower()
+        reply = final["final_response_text"]
+
+        # The app owns booking; this reply only opens the door. It is a statement, and
+        # a statement cannot drift into "shall I book?" or into offering to plan a trip
+        # the way a generated one did.
+        assert "?" not in reply, f"the ride reply asks a question: {reply!r}"
+        for asked in ("shall i book", "would you like", "do you want", "plan your"):
+            assert asked not in reply.lower()
+        assert (
+            "booking screen" in reply.lower()
+            or "बुकिंग स्क्रीन" in reply
+        ), f"the reply does not point at the booking screen: {reply!r}"
         assert final["structured_events"]
 
     @pytest.mark.asyncio

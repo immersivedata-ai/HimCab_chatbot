@@ -1399,8 +1399,10 @@ async def writer_node(state: AgentState) -> dict:
             cancellation_message,
             clear_request,
         )
-        from app.agent.language import detect_reply_language
-
+        # NOTE: `detect_reply_language` is imported at module level and must NOT be
+        # re-imported here. A function-local import of a name binds it local for the
+        # WHOLE function, so re-importing it made every earlier use in this function —
+        # including the ride branch above — raise UnboundLocalError.
         log.warning("writer_reached_by_a_cancellation", session_id=state.session_id)
         lang_key, _ = detect_reply_language(state)
         latest = next(
@@ -1419,6 +1421,53 @@ async def writer_node(state: AgentState) -> dict:
             "messages": [AIMessage(content=text)],
             "entities": entities,
             "structured_events": [cancellation_event(scope, cleared)],
+            "node_trace": ["writer"],
+        }
+
+    # ── A ride is assembled, not generated ────────────────────────────────────
+    # Every line of it is a fact the system already holds: the route from the routing
+    # engine, the fares from the Him Cab backend, the temperature from the weather
+    # provider. There is nothing to compose, only to state.
+    #
+    # Asking the model to state facts it was handed kept failing. The prompt grew a
+    # FORBIDDEN list — no day-by-day plan, no sightseeing, no hidden gems, no comfort
+    # reassurance — and replies still arrived recommending Mall Road and the Ridge and
+    # offering to plan a holiday, with no price and no booking screen in them. Not one
+    # of those landmarks came from a tool.
+    #
+    # So it follows `cancellation`: a table the model cannot be talked out of. See
+    # app/agent/ride_reply.py for what is given up in exchange.
+    if mode == slots.RIDE_MODE:
+        from app.agent.ride_reply import build_ride_reply
+
+        lang_key, _ = detect_reply_language(state)
+        text = build_ride_reply(state, lang_key)
+        if state.token_stream is not None:
+            await state.token_stream.put(text)
+            await state.token_stream.put(None)
+
+        events: list[dict] = []
+        handoff = _build_booking_handoff(state)
+        if handoff:
+            events.append({"type": "booking_handoff", "payload": handoff})
+        if state.cab_fare:
+            events.append({"type": "cab_fare", "payload": state.cab_fare})
+        if state.offers:
+            events.append({"type": "offers", "payload": {"offers": state.offers}})
+
+        log.info(
+            "ride_reply_assembled",
+            has_fare=bool(state.cab_fare),
+            cabs=len((state.cab_fare or {}).get("options") or []),
+            has_route=state.route_estimate is not None,
+            offers=len(state.offers or []),
+            events=[e["type"] for e in events],
+            session_id=state.session_id,
+        )
+        return {
+            "final_response_text": text,
+            "messages": [AIMessage(content=text)],
+            "structured_events": events,
             "node_trace": ["writer"],
         }
 

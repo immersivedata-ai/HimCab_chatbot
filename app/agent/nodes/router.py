@@ -38,6 +38,26 @@ log = get_logger(__name__)
 ROUTER_SYSTEM_PROMPT = build_router_prompt()
 
 
+def _answers_the_question(asked_field: str, text: str) -> bool:
+    """True when `text` reads as an answer to the question we just asked.
+
+    Asked of the SAME strict parser the planner will use on the next node, so the two
+    can never disagree about whether a reply was an answer. Those parsers are
+    deliberately biased towards rejecting — see app/agent/slots.py — which is what
+    keeps a genuine topic switch ("actually, what's the weather there?") from being
+    swallowed as one: it does not parse as a city, so it keeps its own intent.
+    """
+    from app.agent import slots
+
+    slot = slots.SLOTS.get(asked_field)
+    if slot is None or not text or not text.strip():
+        return False
+    try:
+        return slot.parse(text.strip()) is not None
+    except Exception:  # a parser must never take down the turn
+        return False
+
+
 async def router_node(state: AgentState) -> dict:
     """
     LangGraph Router Node.
@@ -119,19 +139,31 @@ async def router_node(state: AgentState) -> dict:
                 session_id=state.session_id,
             )
 
-        # A bare reply to our own question ("delhi", "5") carries no signal of its own,
-        # so the classifier drops it into general_query — which would answer it as an
-        # open question instead of continuing the trip. When a question is in flight,
-        # that specific bucket is reclassified as the answer it almost certainly is.
-        # A recognisable topic switch ("actually, what's the weather there?") keeps its
-        # own intent and is still answered.
-        if intent == "general_query" and state.entities.last_asked_field:
+        # A bare reply to our own question ("kasol", "delhi", "5") carries no signal of
+        # its own, so the classifier files it under whatever the WORD looks like. That
+        # used to be handled for `general_query` alone, and the gap was the reported
+        # bug: asked "which city in Himachal do you live in?", the rider answered
+        # "kasol" and the router returned `places_query` — a question about a place.
+        #
+        # Everything downstream then did the right thing for the wrong question.
+        # `places_query` is not a travel intent, so `response_mode` returned ANSWER, the
+        # fare was never requested (`pricing_intent=False`), no booking handoff shipped,
+        # and the rider who wanted a cab from Kasol to Shimla got a write-up of Shimla's
+        # attractions instead.
+        #
+        # So the test is no longer which bucket the classifier chose, but whether the
+        # message actually ANSWERS the question in flight — asked of the same parser the
+        # planner will use, so the two cannot disagree. A real topic switch ("actually,
+        # what's the weather there?") does not parse as an answer and keeps its intent.
+        asked = state.entities.last_asked_field
+        if asked and intent != Intent.CLARIFICATION and _answers_the_question(asked, latest_message):
             log.info(
                 "intent_reclassified_as_answer",
-                asked_about=state.entities.last_asked_field,
+                asked_about=asked,
+                classifier_said=intent,
                 session_id=state.session_id,
             )
-            intent = "clarification"
+            intent = Intent.CLARIFICATION
 
         log.info(
             "intent_classified",

@@ -167,3 +167,67 @@ class TestRouterNode:
 
         assert result["intent"] == "general_query"
         assert "router" in result["node_trace"]
+
+
+# ── A bare answer is an answer, whatever the word looks like ──────────────────
+
+
+class TestAnAnswerIsNotMistakenForAQuestion:
+    """The reported failure, and its root cause.
+
+        assistant  aap himachal mein kis shehar mein rehte hain?   (which city do you live in?)
+        rider      kasol
+        assistant  <a write-up of Shimla's attractions, no cab, no price>
+
+    The router classified "kasol" as `places_query` — a question ABOUT a place — and
+    everything downstream then did the right thing for the wrong question:
+    `places_query` is not a travel intent, so `response_mode` returned ANSWER, the fare
+    was never requested, no booking handoff shipped, and a resident who wanted a cab
+    from Kasol to Shimla got a brochure.
+
+    The old guard only rescued `general_query`, so a bare place name that looked like a
+    topic went straight past it. The test is now whether the message ANSWERS the
+    question in flight, asked of the same parser the planner will use.
+    """
+
+    @pytest.mark.parametrize(
+        "asked,reply",
+        [
+            ("origin", "kasol"),
+            ("origin", "Shimla"),
+            ("destination", "manali"),
+            ("group_size", "4"),
+            ("group_size", "4 people"),
+        ],
+    )
+    def test_a_bare_answer_is_read_as_one(self, asked, reply):
+        from app.agent.nodes.router import _answers_the_question
+
+        assert _answers_the_question(asked, reply) is True
+
+    @pytest.mark.parametrize(
+        "asked,reply",
+        [
+            # A real topic switch keeps its own intent and is still answered.
+            ("origin", "actually, what's the weather there?"),
+            ("origin", "what places can I see in Manali"),
+            ("destination", "how many days should I go for"),
+            # An answer aimed at a different field is not an answer to this one.
+            ("origin", "4"),
+            ("group_size", "kasol"),
+            # Nothing at all.
+            ("origin", ""),
+            ("origin", "   "),
+        ],
+    )
+    def test_anything_else_keeps_its_intent(self, asked, reply):
+        from app.agent.nodes.router import _answers_the_question
+
+        assert _answers_the_question(asked, reply) is False
+
+    def test_an_unknown_field_is_never_an_answer(self):
+        """A field the slot table does not define cannot be answered, and must not
+        crash the turn trying."""
+        from app.agent.nodes.router import _answers_the_question
+
+        assert _answers_the_question("not_a_slot", "kasol") is False
