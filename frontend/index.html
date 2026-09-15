@@ -813,9 +813,15 @@
 
     // Opening the dialog greets the user straight away.
     // Greeting first, with no network call, then everything else in the background.
-    renderBundledGreeting(PERSONA);
+    //
+    // The persona is a literal here because this page IS the outstation client — it
+    // has no PERSONA variable, unlike local.html where a GPS fix can switch it.
+    // Passing one anyway threw a ReferenceError on this line, which stopped the two
+    // statements under it: no greeting was drawn and startChat() never ran, so the
+    // page opened blank and never asked the rider anything.
+    renderBundledGreeting("outstation");
     startChat();
-    checkGreetingDrift(PERSONA);
+    checkGreetingDrift("outstation");
     $input.focus();
   </script>
 </body>

@@ -159,3 +159,56 @@ class TestTheBundledCopyMatchesTheBackend:
         assert "reconcileGreeting(" in html
         # The old shape: the first bubble built straight out of the /start payload.
         assert 'addMessage("assistant", data.message)' not in html
+
+
+# ── 3. The bootstrap has to actually run ──────────────────────────────────────
+
+_BOOT_CALL_RE = re.compile(
+    r"(?:renderBundledGreeting|checkGreetingDrift)\(\s*([^)]*?)\s*\)"
+)
+#: A raw string on purpose: written as a normal one, the trailing word-boundary
+#: escape becomes a literal backspace character, the pattern then matches nothing,
+#: and every page looks broken.
+_DECLARED_RE = r"(?:const|let|var)\s+{name}\b"
+
+
+@pytest.mark.parametrize("relative", CLIENTS)
+class TestTheGreetingBootstrapCanRun:
+    """The instant greeting is worth nothing if the line that draws it throws.
+
+    index.html was patched with `renderBundledGreeting(PERSONA)` — but that page has no
+    PERSONA variable, because it IS the outstation client and nothing can switch it.
+    The ReferenceError stopped the two statements under it, so `startChat()` never ran:
+    the page opened blank and never asked the rider anything. Reported as "outstation
+    does not initiate with the initial message and does not take the parameters".
+
+    The test above this one passed throughout, because it only checked that the string
+    "renderBundledGreeting(" appeared in the file. Asserting that a call is PRESENT
+    says nothing about whether it can execute, so this asserts what it is called with.
+    """
+
+    def test_every_greeting_call_is_given_something_that_exists(self, relative):
+        html = (REPO_ROOT / relative).read_text(encoding="utf-8")
+
+        for raw_arg in _BOOT_CALL_RE.findall(html):
+            arg = raw_arg.strip()
+            if not arg or arg.startswith(('"', "'")):
+                continue                      # a literal always resolves
+            if arg == "persona":
+                continue                      # the parameter inside the definitions
+            assert re.search(_DECLARED_RE.format(name=re.escape(arg)), html), (
+                f"{relative}: greeting bootstrap is passed {arg!r}, which the page "
+                f"never declares — that is a ReferenceError, and it stops the "
+                f"statements after it from running at all."
+            )
+
+    def test_the_persona_it_greets_as_is_the_one_it_chats_as(self, relative):
+        """A page that greets as one persona and calls another's endpoints would show
+        the right opening line and then behave like a different product."""
+        html = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        expected = {
+            "frontend/index.html": "outstation",
+            "frontend/local.html": "local",
+            "frontend/rental.html": "rental",
+        }[relative]
+        assert f"/v1/chat/{expected}" in html
