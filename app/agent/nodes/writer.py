@@ -41,6 +41,7 @@ from typing import Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agent import slots
+from app.agent.guardrails import apply_guardrails
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -1385,6 +1386,9 @@ async def writer_node(state: AgentState) -> dict:
     log.info("writer_node_entered", session_id=state.session_id, intent=state.intent)
 
     mode = slots.response_mode(state.intent, state.visitor_type)
+    # Decided once for the whole turn, so the reply, the ride template and the guard
+    # that reads the reply back can never disagree about which language this is.
+    lang_key, _reply_language = detect_reply_language(state)
 
     # A cancellation never reaches this node — the graph routes it to `cancel_node`
     # straight out of the router. This is the guard under that, because the cost of
@@ -1404,7 +1408,6 @@ async def writer_node(state: AgentState) -> dict:
         # WHOLE function, so re-importing it made every earlier use in this function —
         # including the ride branch above — raise UnboundLocalError.
         log.warning("writer_reached_by_a_cancellation", session_id=state.session_id)
-        lang_key, _ = detect_reply_language(state)
         latest = next(
             (m.content for m in reversed(state.messages)
              if isinstance(m, HumanMessage) and isinstance(m.content, str)),
@@ -1440,7 +1443,6 @@ async def writer_node(state: AgentState) -> dict:
     if mode == slots.RIDE_MODE:
         from app.agent.ride_reply import build_ride_reply
 
-        lang_key, _ = detect_reply_language(state)
         text = build_ride_reply(state, lang_key)
         if state.token_stream is not None:
             await state.token_stream.put(text)
@@ -1644,6 +1646,20 @@ async def writer_node(state: AgentState) -> dict:
             structured_events=len(structured_events),
             session_id=state.session_id,
         )
+
+        # ── The last gate before a rider reads it ─────────────────────────────
+        # Everything above enforces the rules on the way IN: the prompt states them,
+        # and the live fare, forecast and route are stamped over the itinerary JSON.
+        # None of that touches the PROSE, so until here every rule the prompt stated
+        # was enforced only by the model's willingness to follow it — and a prompt
+        # that forbade sightseeing in writing still produced Mall Road and the Ridge.
+        #
+        # This reads the finished text back and checks its claims against the facts
+        # this turn actually holds. A coupon code the offers endpoint never returned,
+        # or a price when no fare was fetched, takes its line out; the rest is logged
+        # so a pattern is visible before it becomes a complaint.
+        # Findings are logged inside the guard; the caller only needs the text.
+        clean_text, _findings = apply_guardrails(state, clean_text, mode, lang_key)
 
         return {
             "final_response_text": clean_text,
