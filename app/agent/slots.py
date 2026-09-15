@@ -593,13 +593,19 @@ def _clock_from_sentence(text: str) -> Optional[str]:
     return None
 
 
-def _place_from_sentence(text: str) -> Optional[str]:
-    """The pickup named in `text` ("from Shimla", "Shimla se"), or None.
+def _place_beside_marker(text: str, patterns, stop_words: set) -> Optional[str]:
+    """The place name sitting next to one of `patterns`, or None.
 
     Words are collected AWAY from the marker and stop at the first one that cannot be
-    part of a place name, so the name is taken and nothing around it.
+    part of a place name, so the name is taken and nothing around it. `stop_words`
+    differs between the pickup scan and the destination scan: a pronoun is harmless
+    beside "from" and fatal beside "jana", where "mei shimla jana hai" would otherwise
+    yield the place "Mei Shimla".
+
+    Patterns are tried in order and the first that yields a place `parse_place` accepts
+    wins, so a specific marker gets its turn before a general one.
     """
-    for pattern, side in _SENTENCE_FROM_RES:
+    for pattern, side in patterns:
         match = pattern.search(text)
         if not match:
             continue
@@ -608,7 +614,7 @@ def _place_from_sentence(text: str) -> Optional[str]:
             candidate = candidate[::-1]
         words: list[str] = []
         for word in candidate:
-            if word.lower() in _PLACE_STOP_WORDS:
+            if word.lower() in stop_words:
                 break
             words.append(word)
             if len(words) == 3:
@@ -621,6 +627,169 @@ def _place_from_sentence(text: str) -> Optional[str]:
         if place:
             return place
     return None
+
+
+def _place_from_sentence(text: str) -> Optional[str]:
+    """The pickup named in `text` ("from Shimla", "Shimla se"), or None."""
+    return _place_beside_marker(text, _SENTENCE_FROM_RES, _PLACE_STOP_WORDS)
+
+
+
+# ── Reading a whole sentence (trip flow) ──────────────────────────────────────
+#
+# The reported bug: the greeting asks "आप कहाँ जाना चाहते हैं?", the rider answers
+# "mei shimla jana chahta hu", and the assistant asks where they want to go again.
+#
+# `parse_place` is the code-level safety net for a reply to a question we asked, and it
+# accepts at most three words on purpose — a longer string is a sentence, and letting a
+# sentence become a destination is how "plan a trip" once became a place. So a bare
+# "shimla" was recovered and a sentence containing it was not, which left the whole
+# trip flow depending on the extraction model. When the model missed a phrasing, the
+# detail was silently lost and the same question came back.
+#
+# The rental flow already had this net (`read_rental_details`); trips never did. This
+# is the same idea, with the same rule: every value is anchored on an unmistakable
+# marker, and `parse_place` is still the gate, so every rejection this module already
+# makes applies here too. A phrasing this misses costs one more question. A wrong
+# destination costs somebody the wrong trip, so the patterns stay narrow.
+
+#: Words that cannot be part of a place name when reading a TRIP sentence. Extends the
+#: pickup set with the pronouns and trip verbs that sit right beside a destination —
+#: without "mei", "mei shimla jana hai" yields the place "Mei Shimla".
+_TRIP_PLACE_STOP_WORDS = _PLACE_STOP_WORDS | {
+    # First-person, the usual left-hand neighbour of a Hinglish destination.
+    "mai", "main", "mei", "me", "mujhe", "mujhko", "mera", "meri", "mere",
+    "hum", "humein", "hamein", "hamara", "humara", "apne", "apna",
+    "i", "we", "us", "our", "you", "your", "lets", "let",
+    # The journey itself, not a place in it.
+    "se", "from", "tak", "trip", "tour", "travel", "travelling", "traveling",
+    "holiday", "vacation", "journey", "plan", "planning", "visit", "visiting",
+    "go", "going", "goes", "chalo", "chalein", "ja", "jaa", "jana", "jaana",
+    "ghumna", "ghoomna", "dekhna", "jaunga", "jaungi", "jaenge", "jayenge",
+    "chahta", "chahti", "chahte", "raha", "rahi", "rahe", "hu", "hun", "hoon",
+    # When words. `parse_place` rejects any candidate containing one of these, so
+    # without them "a trip to Dharamshala next week" collects three words, fails the
+    # gate, and loses the DESTINATION rather than just the date sitting after it.
+    "next", "this", "coming", "week", "weekend", "month", "days", "din", "dino",
+    "nights", "agle", "agla", "agli", "hafte", "hafta", "mahine", "mahina", "baad",
+}
+
+#: Where a DESTINATION sits relative to its marker. Ordered most specific first: the
+#: first pattern that yields a place `parse_place` accepts wins, so "I want to go to
+#: Manali" is read by the "go to" rule rather than by the bare "to" rule finding "to go".
+_SENTENCE_TO_RES = (
+    # English — the place follows the marker.
+    (
+        re.compile(
+            r"\b(?:go(?:ing)?|head(?:ing|ed)?|fly(?:ing)?|driv(?:e|ing)"
+            r"|travel(?:ling|ing)?|reach(?:ing)?)\s+to\s+([a-z][a-z' ]{2,39})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+    (
+        re.compile(
+            r"\b(?:trip|tour|holiday|vacation|journey|getaway)\s+to\s+([a-z][a-z' ]{2,39})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+    (
+        re.compile(
+            r"\b(?:visit(?:ing)?|explor(?:e|ing)|see)\s+([a-z][a-z' ]{2,39})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+    # Hindi and Hinglish — the place PRECEDES the marker.
+    (
+        re.compile(
+            r"\b([a-z][a-z' ]{2,39})\s+(?:jana|jaana|jaunga|jaungi|jaenge|jayenge"
+            r"|ghumna|ghoomna|ghoom|dekhna|chalna|chalenge|chalein)\b",
+            re.IGNORECASE,
+        ),
+        "before",
+    ),
+    (
+        # "manali ja rahe hain" — the present continuous, and the commonest way a
+        # Hinglish sentence says where somebody is headed.
+        re.compile(r"\b([a-z][a-z' ]{2,39})\s+ja\s+rah[aeiou]\b", re.IGNORECASE),
+        "before",
+    ),
+    (
+        re.compile(r"\b([a-z][a-z' ]{2,39})\s+tak\b", re.IGNORECASE),
+        "before",
+    ),
+    # Last resort. Deliberately last: a bare "to" also matches "to go", which
+    # `parse_place` then rejects as request vocabulary, so the specific rules above
+    # get their turn first.
+    (
+        re.compile(r"\bto\s+([a-z][a-z' ]{2,39})", re.IGNORECASE),
+        "after",
+    ),
+)
+
+#: "3 days", "5 din", "a week". Anchored on the unit, so a bare number is never a trip
+#: length — the same rule `parse_rental_hours` follows for hours.
+_SENTENCE_DAYS_RE = re.compile(
+    r"\b(\d{1,2})\s*(?:day|days|din|dino|raat|nights?)\b", re.IGNORECASE
+)
+#: "for a week", "a week", "one week" — a LENGTH. Deliberately requires the article or
+#: a number, so "next week" and "this week" stay what they are: a date, not a seven-day
+#: trip the rider never asked for.
+_SENTENCE_WEEK_RE = re.compile(r"\b(?:for\s+)?(?:a|one|1)\s+week\b", re.IGNORECASE)
+
+
+def read_trip_details(text: str) -> dict[str, Any]:
+    """Every trip detail stated unambiguously in `text`. Absent keys mean "not said".
+
+    The trip-flow twin of `read_rental_details`, and the reason a sentence like "mei
+    shimla jana chahta hu" no longer loses its destination when the extraction model
+    misses it. Deterministic, so the same sentence reads the same way every time and
+    still reads at all when Vertex is down.
+
+    Returns only what is anchored on a real marker. Nothing here guesses: a sentence
+    with no destination marker in it yields no destination.
+    """
+    if not text or not text.strip():
+        return {}
+
+    stripped = text.strip()
+    low = stripped.lower()
+    found: dict[str, Any] = {}
+
+    destination = _place_beside_marker(stripped, _SENTENCE_TO_RES, _TRIP_PLACE_STOP_WORDS)
+    if destination:
+        found["destination"] = destination
+
+    # "shimla se manali jana hai" — the same sentence carries both ends. `se`/`from` is
+    # the origin marker and is a stop word for the destination scan, so the two cannot
+    # read each other's place.
+    origin = _place_from_sentence(stripped)
+    if origin and origin != destination:
+        found["origin"] = origin
+
+    when = _first_group(_SENTENCE_WHEN_RES, stripped)
+    if when:
+        found["travel_dates"] = when.strip()
+
+    days_match = _SENTENCE_DAYS_RE.search(low)
+    if days_match:
+        days = _in_range(int(days_match.group(1)), 1, 30)
+        if days:
+            found["duration_days"] = days
+    elif _SENTENCE_WEEK_RE.search(low):
+        found["duration_days"] = 7
+
+    for pattern in _SENTENCE_GROUP_RES:
+        match = pattern.search(low)
+        if match:
+            size = _in_range(int(match.group(1)), 1, 60)
+            if size:
+                found["group_size"] = size
+            break
+
+    return found
 
 
 def tidy_when(text: Optional[str]) -> Optional[str]:

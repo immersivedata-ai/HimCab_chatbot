@@ -371,15 +371,42 @@ class TestTheAgentAlwaysGetsToAnAnswer:
         assert turn.result["assumed_fields"] == []
 
     @pytest.mark.asyncio
-    async def test_a_reply_answers_only_the_question_that_was_asked(self):
-        """We asked for the starting city, so "3 days" fills nothing — the date parser
-        never gets a look at a reply aimed at a different field."""
+    async def test_a_reply_is_never_misfiled_into_the_wrong_field(self):
+        """We asked for the starting city and got "3 days".
+
+        The dangerous half is that a duration must never become a PLACE — that is the
+        failure the strict parsers exist for, and it still holds. Nor is it a date:
+        "3 days" is a length, and filing it as when-they-travel would invent a
+        departure the rider never gave.
+
+        `duration_days` IS recorded, and that is deliberate. It used to be dropped,
+        because nothing read a trip sentence in code — the same gap that lost the
+        destination out of "mei shimla jana chahta hu". A rider who has just said
+        "3 days" and is then asked how many days is the exact complaint this whole
+        change is about, so an explicitly-marked duration is kept whichever question
+        was in flight. It is anchored on its unit, so a bare "3" still fills nothing.
+        """
         chat = Conversation()
         await chat.say("Manali", extraction(destination="Manali"))
         turn = await chat.say("3 days", None)  # extractor down: code-only path
 
-        assert turn.result["entities"].origin is None
-        assert turn.result["entities"].duration_days is None
+        entities = turn.result["entities"]
+        assert entities.origin is None
+        assert entities.travel_dates is None
+        assert entities.duration_days == 3
+
+    @pytest.mark.asyncio
+    async def test_a_bare_number_still_fills_nothing(self):
+        """The marker is what makes "3 days" readable. Without it there is no sentence
+        to read, and the reply falls back to the strict parser for the question that
+        was actually asked — which rejects a number as a city."""
+        chat = Conversation()
+        await chat.say("Manali", extraction(destination="Manali"))
+        turn = await chat.say("3", None)
+
+        entities = turn.result["entities"]
+        assert entities.origin is None
+        assert entities.duration_days is None
 
     @pytest.mark.asyncio
     async def test_the_user_can_tell_the_agent_to_just_get_on_with_it(self):

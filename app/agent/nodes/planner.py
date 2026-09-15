@@ -604,27 +604,34 @@ Report what the user has stated. Use null for anything they have not."""
                 if visitor_type == LOCAL and recovered_in_hp and not merged.get("home_city"):
                     merged["home_city"] = merged.get("origin")
 
-    # ── Read the whole sentence for rental details, in code ───────────────────
-    # `read_answer` above handles a bare reply to the question in flight. This handles
-    # the other thing riders actually type — "I need a car tomorrow at 9 am from Shimla
-    # for 8 hours, 4 of us" — which used to depend entirely on the extraction model. A
-    # miss there was silent: the detail vanished, and the assistant asked for something
-    # it had just been told or answered around it, which is what a rider experiences as
-    # an irrelevant reply.
+    # ── Read the whole sentence, in code ──────────────────────────────────────
+    # `read_answer` above handles a BARE reply to the question in flight ("manali").
+    # This handles the other thing riders actually type — a sentence — which used to
+    # depend entirely on the extraction model. A miss there was silent: the detail
+    # vanished, and the assistant asked for something it had just been told, which is
+    # what a rider experiences as not being listened to.
+    #
+    # Reported twice, once per flow. For rentals it was "I need a car tomorrow at 9 am
+    # from Shimla for 8 hours". For trips it was the very first turn: the greeting asks
+    # "आप कहाँ जाना चाहते हैं?", the rider answers "mei shimla jana chahta hu", and the
+    # same question comes back — because `parse_place` caps an answer at three words on
+    # purpose, so a bare "shimla" was recovered and a sentence containing it was not.
     #
     # Only fills fields still EMPTY after the model's turn, so the model stays the
     # primary reader and this can never overwrite something the rider corrected. Every
-    # value is anchored on an unmistakable marker — see `slots.read_rental_details`.
-    if is_rental and latest_text:
+    # value is anchored on an unmistakable marker — see the two readers in `slots`.
+    if latest_text:
+        reader = slots.read_rental_details if is_rental else slots.read_trip_details
         from_sentence = {
             field: value
-            for field, value in slots.read_rental_details(latest_text).items()
+            for field, value in reader(latest_text).items()
             if merged.get(field) in (None, "", [], {})
         }
         if from_sentence:
             merged.update(from_sentence)
             log.info(
-                "rental_sentence_read_in_code",
+                "sentence_read_in_code",
+                flow="rental" if is_rental else "trip",
                 fields=sorted(from_sentence),
                 llm_ok=llm_ok,
                 session_id=state.session_id,
