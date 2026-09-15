@@ -6,10 +6,13 @@ Configures middleware, mounts routers, sets up lifespan events.
 """
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -159,21 +162,70 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(api_router)
 
-    # ── Root ──────────────────────────────────────────────────────────────────
-    # This service is an API and nothing else. It used to also serve the browser test
-    # clients (/, /local, /rental) out of frontend/; those are gone from the image so
-    # that the deployed URL is exactly the contract an integrator reads — no page that
-    # looks like the product, no second copy of the flow to keep in step with it.
-    # Test locally against the API itself, or against /docs.
+    # ── Root and the browser test clients ─────────────────────────────────────
+    # The three single-file pages in frontend/ drive the three workflows end to end —
+    # outstation trips, local rides and hourly rentals — against the same public
+    # endpoints any client calls, with a rider JWT pasted in by whoever is testing.
+    # They are the only way to exercise a whole conversation by hand, so they ship.
+    #
+    # Gated on the environment rather than always-on. A page that looks like the
+    # product sitting beside the API is fine while a team is testing and wrong once
+    # this URL is the contract somebody integrates against — so production serves the
+    # API and nothing else, and no code change is needed to make that true.
+    #
+    # NOTE: deploy.ps1 sets APP_ENV=development on Cloud Run, so today the deployed
+    # URL DOES serve these. That is deliberate while the flows are being tested; set
+    # APP_ENV=production to turn them off without touching this file.
+    frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+    serve_test_ui = not settings.is_production and frontend_dir.is_dir()
+
+    if serve_test_ui:
+        # Mounted as well as routed, so a page can pull a sibling asset if one is ever
+        # added next to it.
+        app.mount(
+            "/frontend",
+            StaticFiles(directory=str(frontend_dir), html=True),
+            name="frontend",
+        )
+
+        def _page(filename: str):
+            return FileResponse(str(frontend_dir / filename))
+
+        @app.get("/outstation", include_in_schema=False)
+        async def outstation_ui():
+            """Visitor planning a trip — day-by-day itinerary, English by default."""
+            return _page("index.html")
+
+        @app.get("/local", include_in_schema=False)
+        async def local_ui():
+            """Himachal resident booking a ride — cab, fare and drive time, Hindi first."""
+            return _page("local.html")
+
+        @app.get("/rental", include_in_schema=False)
+        async def rental_ui():
+            """A car and driver by the hour — packages, pickup and a price."""
+            return _page("rental.html")
+
     @app.get("/", include_in_schema=False)
     async def root():
-        """Signpost, so the base URL is not a bare 404 for whoever opens it."""
-        return {
+        """Signpost, so the base URL is not a bare 404 for whoever opens it.
+
+        Names the test clients when they are being served, because the usual reason
+        somebody opens the bare URL is to find them.
+        """
+        body = {
             "service": "Him Cab — AI Tourist Travel Assistant",
             "version": "1.0.0",
             "docs": "/docs" if not settings.is_production else None,
             "health": "/v1/health",
         }
+        if serve_test_ui:
+            body["test_clients"] = {
+                "outstation": "/outstation",
+                "local": "/local",
+                "rental": "/rental",
+            }
+        return body
 
     return app
 

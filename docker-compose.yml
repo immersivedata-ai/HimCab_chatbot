@@ -17,7 +17,8 @@ services:
       APP_ENV: development
       APP_DEBUG: "true"
     volumes:
-      - ./app:/app/app        # Hot reload in dev
+      - ./app:/app/app             # Hot reload in dev
+      - ./frontend:/app/frontend   # Edit a test page and just refresh the browser
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
     restart: unless-stopped
     healthcheck:

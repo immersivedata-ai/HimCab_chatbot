@@ -7,9 +7,21 @@ $IMAGE = "us-central1-docker.pkg.dev/$PROJECT/travel-assistant-repo/travel-assis
 $SERVICE = "travel-assistant-api"
 $REGION = "us-central1"
 
-# This service deploys as an API only. The browser test clients under frontend/ are
-# excluded from the image (.dockerignore) and no longer served, so there are no pages
-# to check for here - what ships is app/ and nothing else.
+# The browser test clients ship INSIDE the image (Dockerfile COPY frontend/) and are
+# served by FastAPI on the same origin, so there is nothing separate to upload. What
+# can go wrong is silent: a missing page still builds, still deploys, and returns 404
+# to whoever opens it - so they are checked here instead of in a browser afterwards.
+$FRONTEND_PAGES = @("index.html", "local.html", "rental.html")
+
+Write-Host "Checking test client pages..." -ForegroundColor Cyan
+foreach ($page in $FRONTEND_PAGES) {
+    $path = Join-Path $PSScriptRoot "frontend\$page"
+    if (-not (Test-Path $path)) {
+        Write-Host "Missing frontend\$page - that workflow would 404. Aborting." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  frontend\$page" -ForegroundColor DarkGray
+}
 
 Write-Host "Building and pushing container..." -ForegroundColor Cyan
 gcloud builds submit --tag $IMAGE --project=$PROJECT
@@ -39,4 +51,11 @@ Write-Host "  ReDoc        : $URL/redoc"         -ForegroundColor DarkGray
 Write-Host "  OpenAPI JSON : $URL/openapi.json"  -ForegroundColor DarkGray
 Write-Host "  Health       : $URL/v1/health"     -ForegroundColor DarkGray
 Write-Host ""
+Write-Host "Test clients - paste a real Him Cab rider JWT into each to get live fares:" -ForegroundColor Cyan
+Write-Host "  Outstation   : $URL/outstation" -ForegroundColor Green
+Write-Host "  Local        : $URL/local"      -ForegroundColor Green
+Write-Host "  Rental       : $URL/rental"     -ForegroundColor Green
+Write-Host ""
 Write-Host "Every /v1/chat/* call needs: Authorization: Bearer <Him Cab rider JWT>" -ForegroundColor DarkGray
+Write-Host "The test clients are served because APP_ENV is development. Set it to" -ForegroundColor DarkGray
+Write-Host "production to serve the API alone, with no rebuild." -ForegroundColor DarkGray

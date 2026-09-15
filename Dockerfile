@@ -22,6 +22,13 @@ COPY --from=builder /install /usr/local
 # Copy application source
 COPY app/ ./app/
 
+# The browser test clients, served by FastAPI itself (see the frontend block in
+# app/main.py) — no web server of their own. They MUST land at /app/frontend, one
+# level up from the package, because that mount resolves the path relative to app/.
+# Every page calls the same rider-authenticated endpoints any client would; the token
+# is pasted in by whoever is testing. Served only when APP_ENV is not production.
+COPY frontend/ ./frontend/
+
 # Set ownership
 RUN chown -R appuser:appuser /app
 USER appuser
