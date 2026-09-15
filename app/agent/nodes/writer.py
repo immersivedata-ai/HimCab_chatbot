@@ -789,13 +789,16 @@ def _build_system_prompt(state: AgentState) -> str:
             "that journey. Account for travel fatigue — lighter activities on arrival day.\n"
         )
 
-    # Deliberately absent from a rental. The profile summary carries "Has visited:
-    # Manali, Kasol recently", "Frequent destinations: …", "Interests: trekking" and
-    # "eligible for loyalty discounts" — a travel history has no bearing on a car hired
-    # by the hour, and every line of it invites the reply to bring up a place the rider
-    # never mentioned or a discount no coupon backs.
+    # Itinerary and answer modes only. The profile summary carries "Has visited: Manali,
+    # Kasol recently", "Frequent destinations: …", "Interests: trekking" and "eligible
+    # for loyalty discounts". That is real material for somebody choosing what to do
+    # with four days — and noise in the two replies that are a transaction.
+    #
+    # A rental never had it. A RIDE did, and should not: a travel history invites the
+    # reply to bring up a place the rider never mentioned ("since you enjoyed Kasol…")
+    # or a discount no coupon backs, in a message whose whole job is a cab and a price.
     user_context = ""
-    if state.user_context_summary and mode != slots.RENTAL_MODE:
+    if state.user_context_summary and mode not in (slots.RENTAL_MODE, slots.RIDE_MODE):
         user_context = f"\n**User Profile:** {state.user_context_summary}"
 
     # ── Outstation-specific instructions ──────────────────────────────────────
@@ -1089,7 +1092,7 @@ def _build_system_prompt(state: AgentState) -> str:
             f"Line 1: confirm the journey — {origin_display} to {destination_display}. "
             f"One sentence, no adjectives.",
             "Then EXACTLY these bullets, in this order, and NOTHING else:",
-            "  (a) Drive time and distance, copied from THIS JOURNEY below.",
+            "  (a) Drive time and distance, copied from THIS JOURNEY above.",
             (
                 "  (b) One bullet PER CAB from HIM CAB FARES — vehicle, seats, price. "
                 "They are already narrowed to what seats this group: recommend all of "
@@ -1099,8 +1102,16 @@ def _build_system_prompt(state: AgentState) -> str:
                      "is confirmed on the booking screen. Do NOT state, estimate, "
                      "range or imply any number."
             ),
-            "  (c) Current temperature and condition at the destination, if REAL-TIME "
-            "DATA has them. One line.",
+            # Only when there is a forecast to copy. Pointing at a REAL-TIME DATA
+            # section that is not in the prompt leaves the model with a step it cannot
+            # satisfy, and it resolves that either by announcing the gap — the exact
+            # thing step 2 forbids — or by supplying a temperature of its own.
+            *(
+                ["  (c) Current temperature and condition at the destination, copied "
+                 "from REAL-TIME DATA. One line."]
+                if _has_current_weather(state)
+                else []
+            ),
             coupons_step,
             "FORBIDDEN — do not write any of these, in any wording: a day-by-day plan, "
             "sightseeing or things-to-do suggestions, hidden gems, hotel or food "
@@ -1191,6 +1202,22 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
         ]
         if entities.group_size:
             trip_facts.insert(1, f"- Party: {entities.group_size} people")
+    elif mode == slots.RIDE_MODE:
+        # A resident booking a cab between two places they already know. The reply is
+        # four facts — the journey, the cabs, the price, the booking screen — and the
+        # steps below forbid group composition, trip length and anything sightseeing-
+        # shaped outright.
+        #
+        # So those facts are not given here either. Stating them and then forbidding
+        # their use is a prompt that contradicts itself, and the model resolves that
+        # by using them: "travelling with family means comfort matters", "you can
+        # enjoy light sightseeing when you arrive". Group size still reaches the
+        # reply — through HIM CAB FARES, which is already narrowed to cabs that seat
+        # the party, which is the only form of it a ride actually needs.
+        trip_facts = [
+            f"- Destination: {destination_display}",
+            f"- Origin: {origin_display}",
+        ]
     else:
         trip_facts = [
             f"- Destination: {destination_display}",
@@ -1223,11 +1250,23 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
         else _build_journey_section(state)
     )
 
-    # "TRIP" is the wrong word for a car hired by the hour, and a heading is an
-    # instruction like any other — the model wrote trips under it.
-    facts_heading = (
-        "THIS RENTAL" if mode == slots.RENTAL_MODE else "TRIP"
+    # Printed only when there is something under it. An empty "## REAL-TIME DATA"
+    # heading is a promise of facts followed by none, and the steps point at it — so
+    # the model either announces the gap ("weather could not be retrieved") or fills
+    # it. Leaving the heading out means there is nothing to answer.
+    realtime_section = (
+        f"\n## REAL-TIME DATA\n{weather_section}{snowfall_section}\n"
+        if (weather_section or snowfall_section)
+        else ""
     )
+
+    # A heading is an instruction like any other — the model writes what it says.
+    # "TRIP" over a car hired by the hour produced trips; over a resident's cab ride
+    # between two towns they know, it produced holidays.
+    facts_heading = {
+        slots.RENTAL_MODE: "THIS RENTAL",
+        slots.RIDE_MODE: "THIS RIDE",
+    }.get(mode, "TRIP")
 
     return f"""You are the AI travel concierge for **Him Cab** — Himachal Pradesh's most trusted local cab service. Help the user genuinely, and guide them toward booking their travel with Him Cab.
 
@@ -1238,10 +1277,7 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
 {chr(10).join(trip_facts)}
 {user_context}
 {assumptions_section}{journey_section}{travel_section}{outstation_instructions}{local_instructions}
-{fare_block}{offers_block}
-## REAL-TIME DATA
-{weather_section}{snowfall_section}
-
+{fare_block}{offers_block}{realtime_section}
 ## HOW TO REPLY (follow in order)
 {response_steps}
 {json_block}"""
