@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -28,6 +29,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 #: path → the page it must serve, one per workflow.
 PAGES = {
@@ -137,3 +140,72 @@ class TestProductionServesTheApiAlone:
     def test_the_api_itself_is_untouched(self, served):
         """The gate removes the pages, not the service."""
         assert served["root"]["health"] == "/v1/health"
+
+
+# ── The startup path, which is what a cold start pays for ─────────────────────
+
+
+class TestStartupStaysOffTheCriticalPath:
+    """A ~40s cold start was the reported "greeting takes 30-40 seconds".
+
+    This container serves the browser test pages as well as the API, so nothing can be
+    fetched — not the HTML, not the bundled greeting inside it — until the application
+    has finished importing and starting. The fixes were to stop importing a
+    language-model SDK nobody had asked for yet, and to stop the warm-up holding the
+    port. These tests hold both, because both are the kind of thing a later import
+    quietly undoes.
+    """
+
+    def test_the_vertex_sdk_is_not_imported_at_module_scope(self):
+        """`vertexai` and `langchain_google_vertexai` are about three seconds of Python
+        between them, and importing this module used to pay it. Nothing above the client
+        constructor needs the SDK, so nothing above it should wait for one."""
+        source = (
+            REPO_ROOT / "app" / "services" / "vertex_ai.py"
+        ).read_text(encoding="utf-8")
+        header = source.split("class VertexAIService")[0]
+        for heavy in ("\nimport vertexai", "\nfrom vertexai", "\nfrom langchain_google_vertexai"):
+            assert heavy not in header, (
+                f"{heavy.strip()!r} is back at module scope in vertex_ai.py — that is "
+                f"~3s added to every cold start, before the page can even be served."
+            )
+
+    def test_importing_the_app_does_not_drag_the_sdk_in(self):
+        """The check that actually matters: whatever the import graph looks like, the
+        SDK must not be resident merely because the app was imported."""
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, app.main; "
+             "print('vertexai' in sys.modules or 'langchain_google_vertexai' in sys.modules)"],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        assert result.returncode == 0, result.stderr[-1500:]
+        assert result.stdout.strip() == "False", (
+            "importing app.main pulled in the Vertex SDK; a cold start now pays for it "
+            "before it can serve a single page"
+        )
+
+    def test_the_warm_up_does_not_block_the_port(self):
+        """uvicorn does not accept a connection until startup returns, so anything slow
+        left inline there queues every request behind it — including the ones that need
+        none of it."""
+        source = (REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+        lifespan = source.split("async def lifespan")[1].split("yield")[0]
+        assert "create_task" in lifespan, "the warm-up is inline again"
+
+    def test_the_container_runs_one_worker(self):
+        """Cloud Run scales by adding INSTANCES. Extra workers inside one instance each
+        import the whole app and contend for the single vCPU it gets by default, which
+        multiplies the cold start rather than serving anyone faster."""
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert "--workers 1" in dockerfile
+        assert "--workers 4" not in dockerfile
+
+    def test_the_deploy_keeps_an_instance_warm(self):
+        """The only thing that removes a cold start entirely, rather than shortening it."""
+        deploy = (REPO_ROOT / "deploy.ps1").read_text(encoding="utf-8", errors="replace")
+        assert "--min-instances=1" in deploy
+        assert "--cpu-boost" in deploy

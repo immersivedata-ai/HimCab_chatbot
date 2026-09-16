@@ -5,6 +5,7 @@ FastAPI application entrypoint.
 Configures middleware, mounts routers, sets up lifespan events.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -34,18 +35,47 @@ async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
     log.info("app_starting", env=settings.app_env, debug=settings.app_debug)
 
-    # Pre-compile the LangGraph graph (avoids cold-start latency on first request)
-    from app.agent.graph import get_agent_graph
-    get_agent_graph()
-    log.info("langgraph_warmed_up")
+    # Warming runs in the BACKGROUND, so the server starts answering while it happens.
+    #
+    # It used to run here, inline, and uvicorn does not accept a connection until
+    # startup returns — so every request queued behind it, including the ones that need
+    # none of it. Constructing the Vertex client pulls in the SDK, about three seconds
+    # of Python, and this container also serves the browser test pages: nobody could
+    # even fetch the HTML until a language-model client they were not using had been
+    # built.
+    #
+    # The two things being warmed are still worth warming — a compiled graph and a live
+    # client mean the first rider does not pay for them — they simply do not need to
+    # block the port. The health check, the greeting endpoint and the pages depend on
+    # neither, and the first chat turn calls the same cached singletons, so it either
+    # finds them ready or builds them exactly as it would have.
+    async def _warm_up() -> None:
+        try:
+            from app.agent.graph import get_agent_graph
 
-    # Warm up Vertex AI client
-    from app.services.vertex_ai import get_vertex_ai_service
-    get_vertex_ai_service()
-    log.info("vertex_ai_warmed_up")
+            await asyncio.to_thread(get_agent_graph)
+            log.info("langgraph_warmed_up")
+
+            from app.services.vertex_ai import get_vertex_ai_service
+
+            await asyncio.to_thread(get_vertex_ai_service)
+            log.info("vertex_ai_warmed_up")
+        except Exception as e:
+            # A failed warm-up must never stop the service: the first request that
+            # needs one of these will construct it and surface the real error in
+            # context, which is far more useful than a container that will not start.
+            log.warning(
+                "warm_up_failed", error=str(e), error_type=type(e).__name__
+            )
+
+    warm_up_task = asyncio.create_task(_warm_up())
 
     log.info("app_started", version="1.0.0")
     yield
+
+    # Let a warm-up still in flight finish or be cancelled, rather than leaving a task
+    # dangling into shutdown.
+    warm_up_task.cancel()
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     log.info("app_shutting_down")

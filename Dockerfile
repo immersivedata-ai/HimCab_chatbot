@@ -44,5 +44,15 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/health')" || exit 1
 
-# Use uvicorn with uvloop for production performance
-CMD ["sh", "-c", "uvicorn app.main:app --host $APP_HOST --port $APP_PORT --workers 4 --loop uvloop"]
+# ONE worker, deliberately. This ran with four, and on Cloud Run that is four separate
+# processes each importing the whole application — roughly seven seconds of Python
+# apiece — while contending for the single vCPU an instance gets by default. It was the
+# largest part of a ~40s cold start, during which the browser cannot even fetch the
+# page, because this container serves the page too.
+#
+# Nothing is lost by dropping to one. The app is async end to end (FastAPI, httpx, the
+# async Firestore client), so concurrency comes from the event loop rather than from
+# processes, and Cloud Run scales by adding INSTANCES, not by the workers inside one.
+# Measured locally, on a machine with cores to spare: 9.58s to first served request
+# with four workers, 5.52s with one. On a single vCPU the gap is wider still.
+CMD ["sh", "-c", "uvicorn app.main:app --host $APP_HOST --port $APP_PORT --workers 1 --loop uvloop"]
