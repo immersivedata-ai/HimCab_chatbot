@@ -206,9 +206,9 @@ Hindi copy.
   "message": "Welcome to Him Cab! 🙏 What can I help you with today?",
   "language": "en",
   "flows": [
-    { "persona": "local",      "title": "Local ride",       "subtitle": "I live in Himachal — book a cab",      "base_path": "/v1/chat/local",      "language": "hi" },
-    { "persona": "outstation", "title": "Plan a trip",       "subtitle": "Visiting Himachal — a day-by-day plan", "base_path": "/v1/chat/outstation", "language": "en" },
-    { "persona": "rental",     "title": "Rent by the hour",  "subtitle": "A car and driver for a few hours",      "base_path": "/v1/chat/rental",     "language": "en" }
+    { "persona": "local",      "title": "Local ride",      "subtitle": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें", "base_path": "/v1/chat/local",      "language": "hi" },
+    { "persona": "outstation", "title": "Outstation ride", "subtitle": "Planning for long trips: a day-by-day plan",  "base_path": "/v1/chat/outstation", "language": "en" },
+    { "persona": "rental",     "title": "Rent by the hour", "subtitle": "A car and driver for a few hours",           "base_path": "/v1/chat/rental",     "language": "en" }
   ],
   "structured_events": [ { "type": "flow_options", "payload": { "flows": [ ... ] } } ]
 }
@@ -216,6 +216,9 @@ Hindi copy.
 
 Render `message` as the first assistant bubble and `flows` as tappable boxes (or render
 the `flow_options` structured event with the same code that handles every other card).
+Render each box's strings verbatim: `lang` localizes them, except the local box's subtitle,
+which is Hindi in both languages because that is the flow that answers in Hindi — the line
+under the title is where a rider looking for a Hindi conversation recognises it.
 
 When the rider taps a box, tell the backend which flow they chose:
 

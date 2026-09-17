@@ -344,6 +344,26 @@ class TestFlowChooser:
             "ऀ" <= ch <= "ॿ" for ch in body["flows"][0]["title"]
         )
 
+    def test_the_local_box_previews_its_language_in_the_english_chooser(self, api):
+        """The one box whose subtitle is NOT English on `lang=en`.
+
+        The chooser is asked for in English because nothing is known about the rider yet,
+        but the local flow is the one that ANSWERS in Hindi — so the line under its title
+        is written in Hindi, and that is where a rider who wants a Hindi conversation
+        recognises which box is theirs. A well-meant translation back to English would
+        take the only cue they have.
+        """
+        client, _, _, _ = api
+        flows = client.get("/v1/chat/flows").json()["flows"]
+        local = next(f for f in flows if f["persona"] == "local")
+
+        assert local["language"] == "hi"
+        assert any("\u0900" <= ch <= "\u097f" for ch in local["subtitle"])
+        # The other two answer in English, and read as English.
+        for flow in flows:
+            if flow["persona"] != "local":
+                assert not any("\u0900" <= ch <= "\u097f" for ch in flow["subtitle"])
+
     def test_selecting_rental_starts_the_rental_flow(self, api):
         client, sessions, _, _ = api
         body = client.post("/v1/chat/select", headers=AUTH, json={"flow": "rental"}).json()

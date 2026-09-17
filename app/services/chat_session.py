@@ -135,21 +135,26 @@ CHOOSER_MESSAGE: dict[str, str] = {
 
 #: The selectable services, in display order (the same order as the Persona enum, so it
 #: matches VALID_PERSONAS and the rest of the system). `id` is the persona a tap starts.
+#:
+#: The local box is the one deliberate exception to "en means English": its subtitle is
+#: written in Hindi in BOTH tables, because that flow answers in Hindi and the line under
+#: the title is where a rider who wants a Hindi conversation recognises it. The title
+#: stays English so the three boxes still scan as one list.
 _FLOWS: tuple[dict, ...] = (
     {
         "id": LOCAL,
         "title": {"en": "Local ride", "hi": "लोकल सवारी"},
         "subtitle": {
-            "en": "I live in Himachal — book a cab",
+            "en": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
             "hi": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
         },
     },
     {
         "id": OUTSTATION,
-        "title": {"en": "Plan a trip", "hi": "यात्रा की योजना"},
+        "title": {"en": "Outstation ride", "hi": "आउटस्टेशन सवारी"},
         "subtitle": {
-            "en": "Visiting Himachal — a day-by-day plan",
-            "hi": "हिमाचल घूमने आ रहे हैं — दिन-प्रतिदिन योजना",
+            "en": "Planning for long trips: a day-by-day plan",
+            "hi": "लंबी यात्रा की योजना — दिन-प्रतिदिन कार्यक्रम",
         },
     },
     {
