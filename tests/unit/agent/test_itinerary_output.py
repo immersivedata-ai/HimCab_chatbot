@@ -131,6 +131,87 @@ class TestItineraryValidationIsForgiving:
         assert isinstance(dumped["days"][0]["activities"][0]["type"], str)
 
 
+class TestLeakedMetadataIsStrippedFromProse:
+    """The reported screenshot: an itinerary reply whose activity bullets each carried a
+    stray "◦ type: sightseeing" sub-bullet, plus a "Recommended Mode: Cab" line — the
+    JSON schema's own field names echoed into the sentences the rider reads. Those belong
+    only in the ```json block; in the prose they are clutter."""
+
+    def test_the_screenshot_leaks_are_removed(self):
+        from app.agent.nodes.writer import _clean_response_text
+
+        raw = (
+            "Here is a suggested itinerary for your 2-day family trip to Manali.\n"
+            "\n"
+            "Your Journey: Kangra to Manali\n"
+            "- Distance: about 229 km\n"
+            "- Recommended Mode: Cab\n"
+            "\n"
+            "Day 1: Arrival in Manali & Local Exploration\n"
+            "- Morning/Afternoon: Begin your journey from Kangra to Manali.\n"
+            "  - type: travel\n"
+            "- Afternoon: Check into your accommodation and rest after your travel.\n"
+            "  - type: accommodation\n"
+            "  - type: rest\n"
+            "- Evening: Visit the Hadimba Devi Temple.\n"
+            "  - type: sightseeing\n"
+            "- Dinner: Enjoy local Himachali cuisine at a restaurant in Manali.\n"
+            "  - type: dining\n"
+            "\n"
+            "```json\n"
+            '{"destination": "Manali", "duration_days": 2}\n'
+            "```\n"
+        )
+
+        clean = _clean_response_text(raw)
+
+        # None of the leaked field lines survive.
+        assert "type:" not in clean
+        assert "Recommended Mode" not in clean.replace("recommended mode", "Recommended Mode")
+        assert "recommended_mode" not in clean.lower()
+        # The JSON block is gone, as before.
+        assert "```" not in clean
+        assert '"destination"' not in clean
+        # The real, human-readable content is untouched.
+        assert "Hadimba Devi Temple" in clean
+        assert "Distance: about 229 km" in clean
+        assert "Begin your journey from Kangra to Manali." in clean
+
+    def test_a_legitimate_sentence_starting_with_type_is_kept(self):
+        """The strip is for one-token field leaks, not any sentence about a 'type'."""
+        from app.agent.nodes.writer import _strip_leaked_metadata
+
+        text = (
+            "- This type of trek suits beginners.\n"
+            "- Best time to visit: early morning to beat the crowds.\n"
+        )
+        assert _strip_leaked_metadata(text) == text.strip()
+
+    def test_leaks_are_caught_under_any_bullet_style(self):
+        from app.agent.nodes.writer import _strip_leaked_metadata
+
+        text = (
+            "* Visit the temple.\n"
+            "  • type: spiritual\n"
+            "1. Lunch at a dhaba.\n"
+            "   ◦ type: dining\n"
+            "- Recommended Mode: Cab\n"
+        )
+        cleaned = _strip_leaked_metadata(text)
+        assert "type:" not in cleaned
+        assert "Recommended Mode" not in cleaned
+        assert "Visit the temple." in cleaned
+        assert "Lunch at a dhaba." in cleaned
+
+    def test_off_vocabulary_type_leak_is_also_removed(self):
+        """A leak the model wrote with a non-schema value ('check-in') is still a leak."""
+        from app.agent.nodes.writer import _strip_leaked_metadata
+
+        text = "- Check into the hotel.\n  - type: check-in\n"
+        assert "type:" not in _strip_leaked_metadata(text)
+        assert "Check into the hotel." in _strip_leaked_metadata(text)
+
+
 class TestStructuredEventTypesStayInSync:
     """`ChatResponse.structured_events` is typed, so an event type the writer emits but
     the enum doesn't list would fail response validation and 500 the request. This

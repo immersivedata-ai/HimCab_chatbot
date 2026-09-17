@@ -299,6 +299,100 @@ class TestStart:
         assert len(sessions.sessions) == 2
 
 
+# ── /flows and /select: the in-chat flow picker ───────────────────────────────
+
+class TestFlowChooser:
+    """The selectable service boxes that replace the persona dropdown. `/flows` offers
+    them; `/select` starts the one the rider tapped."""
+
+    def test_flows_lists_the_three_services_in_order(self, api):
+        client, _, _, _ = api
+        body = client.get("/v1/chat/flows").json()
+
+        assert [f["persona"] for f in body["flows"]] == ["local", "outstation", "rental"]
+        assert body["message"]
+        for flow in body["flows"]:
+            assert flow["title"] and flow["subtitle"]
+            assert flow["base_path"] == f"/v1/chat/{flow['persona']}"
+
+    def test_flows_also_ships_the_boxes_as_a_structured_event(self, api):
+        """So the app can render them with the same code as every other card."""
+        client, _, _, _ = api
+        events = client.get("/v1/chat/flows").json()["structured_events"]
+
+        assert [e["type"] for e in events] == ["flow_options"]
+        payload = events[0]["payload"]["flows"]
+        assert [f["persona"] for f in payload] == ["local", "outstation", "rental"]
+
+    def test_flows_needs_no_auth_and_creates_nothing(self, api):
+        """Like /greeting: it is a constant, shown before the app has a token."""
+        client, sessions, _, _ = api
+        resp = client.get("/v1/chat/flows")
+
+        assert resp.status_code == 200
+        assert sessions.sessions == {}
+        assert sessions.pointers == {}
+
+    def test_flows_localizes_to_hindi(self, api):
+        client, _, _, _ = api
+        body = client.get("/v1/chat/flows", params={"lang": "hi"}).json()
+
+        assert body["language"] == "hi"
+        # Devanagari in the neutral greeting and the box titles.
+        assert any("ऀ" <= ch <= "ॿ" for ch in body["message"])
+        assert any(
+            "ऀ" <= ch <= "ॿ" for ch in body["flows"][0]["title"]
+        )
+
+    def test_selecting_rental_starts_the_rental_flow(self, api):
+        client, sessions, _, _ = api
+        body = client.post("/v1/chat/select", headers=AUTH, json={"flow": "rental"}).json()
+
+        assert body["persona"] == "rental"
+        assert "car and driver" in body["message"] or "How long" in body["message"]
+        assert body["session_id"] in sessions.sessions
+        assert sessions.sessions[body["session_id"]].persona == "rental"
+
+    def test_selecting_local_starts_the_local_flow_in_hindi(self, api):
+        client, _, _, _ = api
+        body = client.post("/v1/chat/select", headers=AUTH, json={"flow": "local"}).json()
+
+        assert body["persona"] == "local"
+        assert body["language"] == Language.HINDI.value
+
+    def test_select_requires_auth(self, api):
+        """/flows is open; /select creates a session, so it needs the rider token."""
+        client, _, _, _ = api
+        assert client.post("/v1/chat/select", json={"flow": "local"}).status_code == 401
+
+    def test_an_invalid_flow_is_rejected(self, api):
+        client, _, _, _ = api
+        resp = client.post("/v1/chat/select", headers=AUTH, json={"flow": "spaceship"})
+        assert resp.status_code == 422
+
+    def test_select_applies_the_gps_override_like_start(self, api):
+        """A deliberate tap resolves the same way a screen tap does: a Delhi fix on a
+        'local' selection is served as outstation, and the response says so. Keeps one
+        rule for local-vs-visiting instead of two that can disagree."""
+        client, _, _, _ = api
+        body = client.post(
+            "/v1/chat/select", headers=AUTH, json={"flow": "local", **DELHI}
+        ).json()
+
+        assert body["persona"] == "outstation"
+        assert body["location"]["in_himachal"] is False
+
+    def test_selecting_rental_is_never_rerouted_by_a_fix(self, api):
+        """A rental is a service they chose; their coordinates say where to collect
+        them, not that they stopped wanting a car."""
+        client, _, _, _ = api
+        body = client.post(
+            "/v1/chat/select", headers=AUTH, json={"flow": "rental", **SHIMLA}
+        ).json()
+
+        assert body["persona"] == "rental"
+
+
 # ── /message and /stream: no session id anywhere ──────────────────────────────
 
 class TestSendMessage:
@@ -771,7 +865,7 @@ class TestResponsePayload:
 
         assert {t.value for t in StructuredEventType} == {
             "itinerary", "weather_alert", "snowfall_alert", "cab_fare", "offers",
-            "booking_handoff", "rental_packages", "request_cancelled",
+            "booking_handoff", "rental_packages", "request_cancelled", "flow_options",
         }
 
     def test_rate_limit_returns_429_with_retry_after(self, api):

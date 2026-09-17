@@ -20,6 +20,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.core.enums import Persona
+
 
 class RiderCoordinates(BaseModel):
     """The device's GPS fix, sent with a chat request.
@@ -88,6 +90,10 @@ class StructuredEventType(str, Enum):
     BOOKING_HANDOFF = "booking_handoff"
     RENTAL_PACKAGES = "rental_packages"
     REQUEST_CANCELLED = "request_cancelled"
+    #: The selectable services shown before a flow is chosen — the in-chat replacement
+    #: for the old persona dropdown. Payload: {flows: [FlowOption]}. Tapping one is
+    #: POST /v1/chat/select with `flow` = the box's `persona`.
+    FLOW_OPTIONS = "flow_options"
 
 
 class StructuredEvent(BaseModel):
@@ -158,6 +164,14 @@ class StructuredEvent(BaseModel):
                            known; absent when the pickup was never established.
                            Nothing is reserved — the app owns the booking, and the
                            reply never asks the rider to confirm.
+      - `flow_options`   → the selectable services shown before a flow is chosen, the
+                           in-chat replacement for the persona dropdown:
+                           {flows: [{persona, title, subtitle, base_path, language}]}.
+                           Render each as a tappable box; when the rider taps one, call
+                           POST /v1/chat/select with `flow` = that box's `persona`, and
+                           the backend starts that flow and returns its greeting. Carried
+                           on GET /v1/chat/flows and never mid-turn today, but shaped as a
+                           structured event so the same card-rendering code handles it.
 
     Zero or more events accompany any reply; clarification turns carry none.
     """
@@ -334,4 +348,73 @@ class GreetingResponse(BaseModel):
             "replace. False for rental, where the greeting is upgraded once the rate "
             "card has been read."
         )
+    )
+
+
+class FlowOption(BaseModel):
+    """One selectable service in the flow chooser — a box the rider taps to start it.
+
+    The in-chat replacement for the old persona dropdown. `persona` is what the tap
+    starts: send it back as `flow` on POST /v1/chat/select (or call {base_path}/start
+    directly). Title and subtitle are already localized to the language /flows was asked
+    for.
+    """
+
+    persona: str = Field(
+        description='"local", "outstation" or "rental" — pass this as `flow` to POST /v1/chat/select.'
+    )
+    title: str = Field(description="Short label for the box, e.g. 'Rent by the hour'.")
+    subtitle: str = Field(description="One line describing what this flow does.")
+    base_path: str = Field(
+        description=(
+            "This flow's chat endpoints, e.g. /v1/chat/rental. A tap is POST "
+            "/v1/chat/select with `flow`=persona; {base_path}/start does the same thing "
+            "for a client that prefers per-persona paths."
+        )
+    )
+    language: str = Field(description="The flow's default reply language ('en' | 'hi').")
+
+
+class FlowChooserResponse(BaseModel):
+    """Response for GET /v1/chat/flows — the neutral opening and the selectable flows.
+
+    Render `message` as the first assistant bubble and `flows` as tappable boxes (the
+    replacement for the persona dropdown). When the rider taps one, call POST
+    /v1/chat/select with `flow` = the box's `persona`; the backend starts that flow and
+    returns its greeting, exactly as /start does. `structured_events` carries the same
+    list as a single `flow_options` card, so the boxes render through the same code as
+    every other structured event.
+
+    No `Authorization` header, no session created, no backend called — it is a constant,
+    like `/greeting`, so it can be shown the instant the chat opens.
+    """
+
+    message: str = Field(description="Neutral opening line to show above the boxes.")
+    language: str = Field(description="The language `message` and the boxes are in.")
+    flows: list[FlowOption]
+    structured_events: list[StructuredEvent] = Field(
+        default_factory=list,
+        description="A single `flow_options` event mirroring `flows`, for card-based rendering.",
+    )
+
+
+class FlowSelectionRequest(BaseModel):
+    """Body for POST /v1/chat/select — the rider tapped a flow box.
+
+    Coordinates are optional and behave exactly as on /start: they set the pickup point
+    and, for local/outstation, a fix decides local-vs-visiting the same way the screen
+    the chat was opened from used to. Rental is never re-routed by a fix.
+    """
+
+    flow: Persona = Field(
+        description='The chosen flow: "local", "outstation" or "rental" (a box\'s `persona`).'
+    )
+    lat: Optional[float] = Field(
+        default=None, ge=-90, le=90, description="Optional device latitude — see ChatMessageRequest.lat."
+    )
+    lon: Optional[float] = Field(
+        default=None, ge=-180, le=180, description="Optional device longitude."
+    )
+    accuracy_m: Optional[float] = Field(
+        default=None, ge=0, description="Optional device-reported accuracy in metres."
     )

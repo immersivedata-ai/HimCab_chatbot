@@ -185,6 +185,53 @@ visitor whatever their phone reports.
 Skipping this endpoint is fine: `/start`, `/stream` and `/message` all accept the same
 coordinates and route themselves, returning the persona they actually used.
 
+#### 0a. Let the rider choose — the flow picker
+
+```
+GET  /v1/chat/flows?lang=en
+POST /v1/chat/select
+```
+
+The in-chat replacement for the persona dropdown. Instead of the app deciding the flow
+from a screen or a menu, the assistant opens with a neutral line and three selectable
+boxes; the rider taps one and that flow starts.
+
+`GET /v1/chat/flows` needs no `Authorization` header and does no I/O — it is a constant,
+like `/greeting`, so it can be drawn the instant the chat opens. Pass `?lang=hi` for the
+Hindi copy.
+
+**Response**: `FlowChooserResponse`
+```json
+{
+  "message": "Welcome to Him Cab! 🙏 What can I help you with today?",
+  "language": "en",
+  "flows": [
+    { "persona": "local",      "title": "Local ride",       "subtitle": "I live in Himachal — book a cab",      "base_path": "/v1/chat/local",      "language": "hi" },
+    { "persona": "outstation", "title": "Plan a trip",       "subtitle": "Visiting Himachal — a day-by-day plan", "base_path": "/v1/chat/outstation", "language": "en" },
+    { "persona": "rental",     "title": "Rent by the hour",  "subtitle": "A car and driver for a few hours",      "base_path": "/v1/chat/rental",     "language": "en" }
+  ],
+  "structured_events": [ { "type": "flow_options", "payload": { "flows": [ ... ] } } ]
+}
+```
+
+Render `message` as the first assistant bubble and `flows` as tappable boxes (or render
+the `flow_options` structured event with the same code that handles every other card).
+
+When the rider taps a box, tell the backend which flow they chose:
+
+```
+POST /v1/chat/select
+{ "flow": "rental", "lat": 31.1048, "lon": 77.1734 }
+```
+
+This returns a `StartChatResponse` identical to `POST /v1/chat/{flow}/start` — it is the
+single "the rider chose a service" call, so the app never has to build a per-persona
+path. Coordinates are optional and behave exactly as on `/start`: they set the pickup
+point, and for `local`/`outstation` a fix decides local-vs-visiting (a Delhi fix on a
+`local` selection is served as `outstation`, and the response's `persona` says so).
+`rental` is never re-routed by a fix. A client that prefers per-persona paths can call
+`{base_path}/start` from the box instead — same result.
+
 #### 0b. The greeting, with nothing in front of it
 
 ```
@@ -360,6 +407,7 @@ without breaking older app builds.
 | `rental_packages` | `{packages: [{hours, included_km, label, from_rate_card}], selected_hours}`. The hourly blocks the rider may choose from, shortest first; `selected_hours` is present once they have chosen one. **Render these as taps.** The backend matches a rental duration exactly (`rentHours == chart.getMaxHour()`), so a typed duration that is not on this list cannot be priced. The list is the rate card narrowed to the durations the product sells (`RENTAL_HOUR_OPTIONS`, currently 4 and 8 hours) — a chart for any other duration is priced by the backend but never offered here, so do not render one. When the rate card cannot be read at all, those same durations are sent with `from_rate_card: false` and `included_km: null`. Offer these as taps like any other — a `cab_fare` can still arrive for them, because the backend matches the rental chart from `rentHours` itself — but show no distance allowance beside one. Sent on the turn that ASKS for the duration and on every rental turn after it, so the list on screen is never stale. | `/v1/chat/rental/*` only |
 | `request_cancelled` | `{scope, dismiss_booking_screen, cleared_fields[], open_screen}`. The rider called the request off. **Act on this**: dismiss any booking sheet a previous `booking_handoff` opened and clear the fare/package cards for this conversation — what they describe no longer exists. `scope` is `request` (this chat's request, now dropped), `booked_trip` (they mean a cab already booked in the app) or `unclear` (either; the reply covers both). `open_screen` is `trips` when they need the app's own cancellation flow, else null. **Nothing is cancelled on the backend by this event** — a confirmed booking is cancelled only from the Trips screen (`DELETE /api/rider/trip/cancel-ride/{id}`), which is what notifies the driver. | The rider said cancel / never mind / rehne do |
 | `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, distance_source, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, offer_id, coupon_code, fare_after_offer_inr, options[]}`. On a rental it also carries `rental_hours`, `included_km`, `pickup_time` (`"HH:mm"`, the hour the fare was priced on — open the screen on exactly this time) and `category_selected_by_rider`, with `destination: null` since an hourly hire has no drop. A rental handoff is sent only once the rider has settled a duration AND picked a cab (or there was no priced list to pick from), because the Rent a Car screen cannot book without both — so the reply never announces a screen while still asking which cab. Open the booking screen with both pins already dropped on the map, the recommended cab preselected and the coupon prefilled (`offer_id` is exactly what `POST /api/rider/trip/book-ride` takes). `trip_type` (`OUTSTATION` \| `LOCAL`, decided by the journey's length rather than by the persona) is the rate card it was priced on — use it to open the booking screen that will accept the journey. Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A travelling rider's route was resolved — either persona |
+| `flow_options` | `{flows: [{persona, title, subtitle, base_path, language}]}`. The selectable services shown before a flow is chosen — the in-chat replacement for the persona dropdown. **Render each `flows[]` entry as a tappable box.** When the rider taps one, call `POST /v1/chat/select` with `flow` = that box's `persona`, and the backend starts that flow and returns its greeting. Carried on `GET /v1/chat/flows`; shaped as a structured event so the same card-rendering code handles it. | `GET /v1/chat/flows` |
 
 The `offers` event is **absent**, never empty, when nothing applies. The reply text and
 this event agree by construction: the assistant may name only the coupons listed here,

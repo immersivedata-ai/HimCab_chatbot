@@ -29,7 +29,7 @@ Three guarantees this node makes, each covering a reported failure:
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -365,6 +365,18 @@ def _known_slots(entities: ExtractedEntities) -> set[str]:
     return {name for name, slot in slots.SLOTS.items() if slot.read(entities)}
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """True when two slot values are the same, ignoring case for the string ones.
+
+    Place names arrive title-cased from the code readers ("Dharamshala") and however
+    the extraction model happened to capitalise them; "Kangra" and "kangra" are one
+    slot value, and reading them as different would flag a change that never happened.
+    """
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip().lower() == b.strip().lower()
+    return bool(a == b)
+
+
 def _resolve(
     state: AgentState,
     entities: ExtractedEntities,
@@ -617,25 +629,64 @@ Report what the user has stated. Use null for anything they have not."""
     # same question comes back — because `parse_place` caps an answer at three words on
     # purpose, so a bare "shimla" was recovered and a sentence containing it was not.
     #
-    # Only fills fields still EMPTY after the model's turn, so the model stays the
-    # primary reader and this can never overwrite something the rider corrected. Every
-    # value is anchored on an unmistakable marker — see the two readers in `slots`.
+    # Every value here is anchored on an unmistakable marker — see the two readers in
+    # `slots`. A marker-anchored value fills an EMPTY slot, and it also CORRECTS a slot
+    # that already holds one when the rider changes their mind — see `corrected` below.
+    corrected: dict[str, Any] = {}
     if latest_text:
         reader = slots.read_rental_details if is_rental else slots.read_trip_details
-        from_sentence = {
-            field: value
-            for field, value in reader(latest_text).items()
-            if merged.get(field) in (None, "", [], {})
-        }
-        if from_sentence:
-            merged.update(from_sentence)
+        filled: dict[str, Any] = {}
+        for field, value in reader(latest_text).items():
+            current = merged.get(field)
+            if current in (None, "", [], {}):
+                # Nothing there yet — fill it, exactly as before.
+                filled[field] = value
+            elif not _same_value(value, current) and _same_value(
+                current, existing_entities.get(field)
+            ):
+                # The rider has just RESTATED this slot as something different, and the
+                # model left the previous turn's value standing (`merged[field]` still
+                # equals what was already confirmed). This is the reported bug: every
+                # detail is in, the booking is on screen, and "mujhe dharamshala jaana
+                # hai" changes the destination — but the old "Kangra" survived and the
+                # booking never moved. The whole cascade (route, fare, weather, handoff)
+                # is rebuilt from the entities each turn, so correcting the slot here is
+                # all it takes for the updated booking to ship.
+                #
+                # Guarded to the case where the model did NOT change it: reading a whole
+                # sentence is the model's strength, so a value IT already corrected wins
+                # and these regexes never fight it. Only a value the model kept is
+                # overwritten, on the same marker that would have filled an empty slot.
+                corrected[field] = value
+
+        changes = {**filled, **corrected}
+        if changes:
+            merged.update(changes)
             log.info(
                 "sentence_read_in_code",
                 flow="rental" if is_rental else "trip",
-                fields=sorted(from_sentence),
+                filled=sorted(filled),
+                corrected=sorted(corrected),
                 llm_ok=llm_ok,
                 session_id=state.session_id,
             )
+
+        # A changed pickup re-decides who the rider is, exactly as a recovered or
+        # extracted origin does above: "actually, start from Delhi" turns a resident's
+        # ride into a visitor's transfer. Skipped for a rental, where the pickup never
+        # sets the persona (`classify_visitor_type` returns RENTAL regardless).
+        if "origin" in corrected and not is_rental:
+            corrected_in_hp = await geo.place_in_himachal(merged["origin"])
+            visitor_type = await classify_visitor_type(
+                merged.get("origin"),
+                corrected_in_hp,
+                home_city=merged.get("home_city"),
+                current=visitor_type,
+            ) or visitor_type
+            if visitor_type:
+                merged["visitor_type"] = visitor_type
+                if visitor_type == LOCAL and corrected_in_hp and not merged.get("home_city"):
+                    merged["home_city"] = merged.get("origin")
 
     # ── "Stop asking and just do it" ──────────────────────────────────────────
     if result_dict.get("user_wants_to_proceed_now") or (
@@ -689,7 +740,11 @@ Report what the user has stated. Use null for anything they have not."""
     # cleared `last_asked_field`, which reset the streak, which let it start asking
     # again on the very next message. The user got interrogated, then a plan, then
     # interrogated again. Only real progress — a slot that gained a value — resets it.
-    if _known_slots(entities) - known_before:
+    # A correction is progress too, even though it fills no NEW slot: the rider handed
+    # us a real, different value. Without `or corrected`, a turn that only changes an
+    # already-known detail would count as no progress and inch the agent towards giving
+    # up on a rider who is actively engaged.
+    if (_known_slots(entities) - known_before) or corrected:
         entities.no_progress_turns = 0
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1

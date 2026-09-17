@@ -264,6 +264,132 @@ class TestARentalSentenceIsUnderstood:
         ).isoformat()
 
 
+# ── 1c. "I changed my mind and it ignored me" ─────────────────────────────────
+#
+# The reported screenshot: a local ride is fully specified and the booking is on
+# screen — "Dadh se Kangra". The rider then types "Mujhe dharamshala jaana hai" and
+# gets the SAME Dadh→Kangra booking back, because the changed destination never
+# reached the entities. Corrections used to depend entirely on the extraction model
+# overwriting a value it had already reported; when it kept the old one instead, the
+# deterministic sentence reader saw the slot was "already filled" and refused to touch
+# it. These conversations stub the model to KEEP the old value (the reported miss), so
+# the code-level corrector is the only thing that can catch the change.
+
+class TestChangingYourMindUpdatesTheBooking:
+
+    @pytest.mark.asyncio
+    async def test_a_new_destination_after_the_booking_replaces_the_old_one(self):
+        """The exact screenshot: everything is in, then a different place is named."""
+        chat = Conversation(persona="local", intent="plan_trip")
+        await chat.say(
+            "Dadh se Kangra, 2 log, kal",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+        assert chat.turns[-1].produced
+        assert chat.entities.destination == "Kangra"
+
+        # The model MISSES the change and reports the old destination again.
+        turn = await chat.say(
+            "Mujhe dharamshala jaana hai",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+
+        assert turn.produced, "asked a question instead of re-quoting the new trip"
+        assert chat.entities.destination == "Dharamshala", (
+            "the changed destination never reached the entities, so the booking "
+            "would ship the old one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_change_lands_even_when_vertex_is_down(self):
+        """With the extractor unavailable the correction must still be read in code."""
+        chat = Conversation(persona="local", intent="plan_trip")
+        await chat.say(
+            "Dadh se Kangra, 2 log, kal",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+        turn = await chat.say("Mujhe dharamshala jaana hai", None)
+
+        assert turn.produced
+        assert chat.entities.destination == "Dharamshala"
+
+    @pytest.mark.asyncio
+    async def test_the_model_correcting_it_still_works(self):
+        """The primary path is untouched: when the model DOES report the new value it
+        is applied, and the code net agrees rather than fighting it."""
+        chat = Conversation(persona="local", intent="plan_trip")
+        await chat.say(
+            "Dadh se Kangra, 2 log, kal",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+        turn = await chat.say(
+            "Mujhe dharamshala jaana hai",
+            extraction(destination="Dharamshala", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+
+        assert turn.produced
+        assert chat.entities.destination == "Dharamshala"
+
+    @pytest.mark.asyncio
+    async def test_changing_the_group_size_after_the_plan_is_honoured(self):
+        """Any input parameter, not just the destination: a revised headcount picks a
+        different cab, so it must overwrite the one the plan was built on."""
+        chat = Conversation(persona="outstation", intent="plan_trip")
+        await chat.say(
+            "Delhi to Manali, 4 days, 3 of us, next week",
+            extraction(destination="Manali", origin="Delhi", duration_days=4,
+                       group_size=3, travel_dates="next week", origin_in_himachal=False),
+        )
+        assert chat.turns[-1].produced
+        turn = await chat.say(
+            "actually we are 5 people now",
+            extraction(destination="Manali", origin="Delhi", duration_days=4,
+                       group_size=3, travel_dates="next week", origin_in_himachal=False),
+        )
+
+        assert turn.produced
+        assert chat.entities.group_size == 5
+
+    @pytest.mark.asyncio
+    async def test_a_restated_same_value_is_not_treated_as_a_change(self):
+        """Saying the destination again, unchanged, must not disturb anything or reset
+        the give-up counter — only a genuinely different value is a correction."""
+        chat = Conversation(persona="local", intent="plan_trip")
+        await chat.say(
+            "Kangra jaana hai, Dadh se, 2 log, kal",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+        turn = await chat.say(
+            "haan Kangra jaana hai",
+            extraction(destination="Kangra", origin="Dadh", group_size=2,
+                       travel_dates="kal", origin_in_himachal=True),
+        )
+
+        assert turn.produced
+        assert chat.entities.destination == "Kangra"
+
+    @pytest.mark.asyncio
+    async def test_a_changed_rental_pickup_replaces_the_old_one(self):
+        """The rental twin: a car is booked from one town, the rider moves the pickup."""
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        await chat.say(
+            "8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
+        )
+        assert chat.entities.origin == "Shimla"
+        turn = await chat.say("actually pick me up from Kullu", NOTHING)
+
+        assert chat.entities.origin == "Kullu", "the pickup change was ignored"
+        # The duration, date, time and headcount are untouched by a pickup change.
+        assert chat.entities.rental_hours == 8
+        assert turn.result["entities"].pickup_time == "09:00"
+
+
 # ── 2. "It never generates" ───────────────────────────────────────────────────
 
 class TestTheAgentAlwaysGetsToAnAnswer:

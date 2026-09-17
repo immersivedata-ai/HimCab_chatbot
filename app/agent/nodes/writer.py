@@ -36,6 +36,7 @@ This is the most visible node — its output IS the user experience.
 
 import asyncio
 import json
+import re
 from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -1134,6 +1135,11 @@ def _build_system_prompt(state: AgentState) -> str:
             "Be concise: short bullet points, one line each. No long paragraphs or filler.",
             f"Give a day-by-day itinerary for all {duration_days} days (3-5 bullets per day: "
             "morning / afternoon / evening).",
+            "Write each activity as ONE plain, human sentence. NEVER print the JSON's field "
+            "names in the prose — no 'type:', 'place:', 'time:', 'description:' or "
+            "'recommended_mode'/'Recommended Mode' labels, and no sub-bullets echoing them. "
+            "Those exist ONLY inside the ```json block at the very end; in the text they are "
+            "clutter the rider cannot use.",
             "Recommend places from REAL-TIME DATA when it lists any; otherwise use well-known "
             "spots at the destination and do not invent venue details. Add 1-2 food ideas per day.",
             weather_step,
@@ -1304,7 +1310,6 @@ def _extract_structured_itinerary(text: str) -> dict | None:
                         continue
         
         # Fallback: attempt to find raw JSON without backticks
-        import re
         match = re.search(r'\{\s*"destination"', text)
         if match:
             start_idx = match.start()
@@ -1319,8 +1324,56 @@ def _extract_structured_itinerary(text: str) -> dict | None:
     return None
 
 
+# ── Structured plumbing the model sometimes leaks into the prose ──────────────
+# The itinerary JSON carries a `type` on every activity ("travel", "sightseeing",
+# "dining", …) and a `recommended_mode` on the journey. Those belong in the JSON the
+# app parses, NEVER in the sentences the rider reads. Asked to write both the prose and
+# the JSON, the model sometimes echoes them as stray bullets under each activity:
+#
+#     • Evening: Visit the Hadimba Devi Temple, a pagoda-style temple...
+#       ◦ type: sightseeing
+#
+# and prints "Recommended Mode: Cab" — which, for a cab service, says nothing at all.
+# They are schema labels, not information, and the rider sees only clutter. We remove
+# them in code for the same reason the fare and the forecast are stamped in code rather
+# than trusted to the prompt (`_apply_real_fare`, `_apply_weather`) and for the same
+# reason `guardrails` reads the finished text back: a rule the model breaks under
+# pressure to be thorough is not a rule.
+
+#: Any bullet or numbered-list marker, plus indentation, at the head of a line.
+_LEADING_BULLET_RE = re.compile(r"^\s*(?:[-*•◦·▪▫○●‣⁃]+|\d+[.)])?\s*")
+#: An activity `type` echoed as its own line. Matched only when the WHOLE line is
+#: "type: <one token>" — which is what a leak looks like ("type: sightseeing",
+#: "type: check-in") and what a real prose sentence never does, since a sentence has
+#: spaces. So a legitimate line that merely starts with the word "type" is left alone,
+#: while every schema value (and off-vocabulary ones the coercer would map to `other`)
+#: is caught.
+_TYPE_LEAK_RE = re.compile(r"^type\s*[:=]\s*[\"']?[\w-]+[\"']?\s*$", re.IGNORECASE)
+#: The journey's recommended travel mode. Always "cab" for a cab service, so the line
+#: is noise whatever its value — dropped regardless of what follows the colon.
+_MODE_LEAK_RE = re.compile(r"^recommended[_ ]?mode\s*[:=]", re.IGNORECASE)
+
+
+def _strip_leaked_metadata(text: str) -> str:
+    """Drop any line that is nothing but a leaked itinerary JSON field (see note above).
+
+    Whole lines only: a leak arrives on its own bullet, so removing the line removes the
+    leak and leaves the activity sentence above it untouched.
+    """
+    kept = [
+        line
+        for line in text.splitlines()
+        if not (
+            _TYPE_LEAK_RE.match(body := _LEADING_BULLET_RE.sub("", line).strip())
+            or _MODE_LEAK_RE.match(body)
+        )
+    ]
+    return "\n".join(kept).strip()
+
+
 def _clean_response_text(text: str) -> str:
-    """Strip the JSON block from the human-readable response text."""
+    """The human-readable reply: the JSON block removed, and any structured itinerary
+    fields the model leaked into the prose stripped out (see `_strip_leaked_metadata`)."""
     clean = text
     if "```json" in clean:
         clean = clean.split("```json")[0].strip()
@@ -1329,14 +1382,13 @@ def _clean_response_text(text: str) -> str:
         parts = clean.rsplit("```", 2)
         if len(parts) >= 3:
             clean = parts[0].strip()
-            
+
     # Strip raw JSON if no backticks were used
-    import re
     match = re.search(r'\{\s*"destination"', clean)
     if match:
         clean = clean[:match.start()].strip()
-        
-    return clean
+
+    return _strip_leaked_metadata(clean)
 
 
 async def _generate_streaming(llm, messages, token_queue) -> str:

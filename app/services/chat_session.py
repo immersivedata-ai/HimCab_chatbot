@@ -118,6 +118,79 @@ def welcome_message(
     return WELCOME_MESSAGES.get(persona, WELCOME_MESSAGES[OUTSTATION])
 
 
+# ── The flow chooser (the in-chat replacement for the persona dropdown) ───────
+# Before a rider picks a service, the assistant offers the three as selectable boxes
+# rather than the app deciding for them from a dropdown or the screen they opened. Each
+# box names the persona a tap starts, so a selection maps straight onto the same flow
+# that /start already opens — the chooser adds a way to CHOOSE, not a fourth flow.
+#
+# Kept here beside WELCOME_MESSAGES, and bilingual for the same reason: the chooser copy
+# and the greeting copy are the same kind of thing and should move together. The chooser
+# has no persona yet, so the caller says which language to render (default English).
+
+CHOOSER_MESSAGE: dict[str, str] = {
+    "en": "Welcome to Him Cab! 🙏 What can I help you with today?",
+    "hi": "नमस्ते! Him Cab में आपका स्वागत है 🙏 आज मैं आपकी कैसे मदद कर सकता हूँ?",
+}
+
+#: The selectable services, in display order (the same order as the Persona enum, so it
+#: matches VALID_PERSONAS and the rest of the system). `id` is the persona a tap starts.
+_FLOWS: tuple[dict, ...] = (
+    {
+        "id": LOCAL,
+        "title": {"en": "Local ride", "hi": "लोकल सवारी"},
+        "subtitle": {
+            "en": "I live in Himachal — book a cab",
+            "hi": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
+        },
+    },
+    {
+        "id": OUTSTATION,
+        "title": {"en": "Plan a trip", "hi": "यात्रा की योजना"},
+        "subtitle": {
+            "en": "Visiting Himachal — a day-by-day plan",
+            "hi": "हिमाचल घूमने आ रहे हैं — दिन-प्रतिदिन योजना",
+        },
+    },
+    {
+        "id": RENTAL,
+        "title": {"en": "Rent by the hour", "hi": "घंटे के हिसाब से किराया"},
+        "subtitle": {
+            "en": "A car and driver for a few hours",
+            "hi": "कुछ घंटों के लिए गाड़ी और ड्राइवर",
+        },
+    },
+)
+
+
+def _flow_text(table: dict[str, str], lang_key: str) -> str:
+    """One localized string, falling back to English for any other language key."""
+    return table.get(lang_key, table["en"])
+
+
+def chooser_message(lang_key: str = "en") -> str:
+    """The neutral opening line shown above the flow boxes."""
+    return _flow_text(CHOOSER_MESSAGE, lang_key)
+
+
+def flow_options(lang_key: str = "en") -> list[dict]:
+    """The selectable service boxes, localized. `persona` is what a tap starts.
+
+    Returned as plain dicts so the same list feeds both the typed `FlowOption` response
+    and the `flow_options` structured-event payload without either owning the other.
+    """
+    return [
+        {
+            "persona": flow["id"],
+            "title": _flow_text(flow["title"], lang_key),
+            "subtitle": _flow_text(flow["subtitle"], lang_key),
+            "base_path": f"/v1/chat/{flow['id']}",
+            "language": DEFAULT_LANGUAGE.get(flow["id"], Language.ENGLISH).value,
+        }
+        for flow in _FLOWS
+    ]
+
+
 # ── Which assistant is this rider talking to ──────────────────────────────────
 
 def resolve_persona(

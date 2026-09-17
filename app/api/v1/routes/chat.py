@@ -79,8 +79,15 @@ SSE events emitted by /stream:
   1. `token`      → raw AI text chunks (for chat bubble animation)
   2. `structured` → a renderable card. Types: itinerary | weather_alert |
                     snowfall_alert | cab_fare | offers | booking_handoff |
-                    rental_packages | request_cancelled. See `StructuredEvent` in
-                    app/schemas/chat.py for each payload shape. Ignore unknown types.
+                    rental_packages | request_cancelled | flow_options. See
+                    `StructuredEvent` in app/schemas/chat.py for each payload shape.
+                    Ignore unknown types.
+
+BEFORE A FLOW IS CHOSEN — the in-chat service picker (replaces the persona dropdown):
+  GET  /v1/chat/flows          → the neutral greeting + selectable flow boxes (no auth)
+  POST /v1/chat/select {flow}  → start the tapped flow; returns a StartChatResponse
+  The boxes carry the persona each one starts; /select is the same as calling that
+  persona's /start, so the rider chooses the flow instead of the screen deciding it.
   3. `done`       → completion; carries the `persona` this turn was served as
   4. `error`      → failure
 
@@ -125,6 +132,9 @@ from app.schemas.chat import (
     ChatHistoryResponse,
     ChatMessageRequest,
     ChatResponse,
+    FlowChooserResponse,
+    FlowOption,
+    FlowSelectionRequest,
     GreetingResponse,
     PersonaRouteResponse,
     ResolvedLocation,
@@ -137,6 +147,8 @@ from app.services.chat_session import (
     LOCAL,
     OUTSTATION,
     RENTAL,
+    chooser_message,
+    flow_options,
     resolve_chat,
     resolve_persona,
     start_chat,
@@ -396,16 +408,18 @@ async def _stream_agent_response(
 
 # ── Shared handlers (persona-agnostic; the routes below just pin the persona) ─
 
-async def _handle_start(
+async def _start_persona(
     rider: RiderIdentity,
-    persona: str,
-    lat: float | None = None,
-    lon: float | None = None,
-    accuracy_m: float | None = None,
+    served: str,
+    location: RiderLocation | None,
 ) -> StartChatResponse:
-    location = await geo.resolve_rider_location(lat, lon, accuracy_m)
-    served = _effective_persona(persona, location, rider.user_id)
+    """Open a fresh conversation for an ALREADY-RESOLVED persona and build the response.
 
+    Shared by `/start` (where the persona comes from the path, refined by GPS) and
+    `/select` (where it comes from the box the rider tapped). Both arrive here with the
+    persona already decided, so the greeting, the session and the rental packages are
+    assembled one way.
+    """
     # The rental greeting asks for a duration, and a duration is matched exactly by the
     # backend — so it must name what is on the rate card, and the client needs the same
     # list to render as taps. One fetch feeds both.
@@ -426,6 +440,18 @@ async def _handle_start(
             else []
         ),
     )
+
+
+async def _handle_start(
+    rider: RiderIdentity,
+    persona: str,
+    lat: float | None = None,
+    lon: float | None = None,
+    accuracy_m: float | None = None,
+) -> StartChatResponse:
+    location = await geo.resolve_rider_location(lat, lon, accuracy_m)
+    served = _effective_persona(persona, location, rider.user_id)
+    return await _start_persona(rider, served, location)
 
 
 async def _handle_stream(
@@ -634,6 +660,73 @@ async def route_by_location(
         reason=reason,
         location=_resolved_location_dto(location),
     )
+
+
+# ── The flow chooser (the in-chat replacement for the persona dropdown) ───────
+
+_FLOWS_DESCRIPTION = """\
+The selectable services to show before a flow is chosen — the replacement for the old
+persona dropdown. Render `message` as the opening assistant bubble and `flows` as
+tappable boxes; `structured_events` carries the same list as a `flow_options` card for
+card-based rendering.
+
+Needs no `Authorization` header and does no I/O — it is a constant, like `/greeting`, so
+it can appear the instant the chat opens. When the rider taps a box, call
+`POST /v1/chat/select` with `flow` = that box's `persona`; the backend starts that flow
+and returns its greeting, exactly as `/start` does.
+
+Pass `?lang=hi` for the Hindi copy; anything else is served in English.
+"""
+
+_SELECT_DESCRIPTION = """\
+The rider tapped a flow box — start that flow and return its greeting.
+
+Body: `{"flow": "local" | "outstation" | "rental", "lat"?, "lon"?, "accuracy_m"?}`. The
+response is a `StartChatResponse`, identical to `POST /v1/chat/{flow}/start` — this is
+the single "the rider chose a service" call, so the app does not have to build a
+per-persona path. Coordinates behave exactly as on `/start`: they set the pickup point,
+and for `local`/`outstation` a fix decides local-vs-visiting (a Delhi fix on a `local`
+selection is served as `outstation`, and the response's `persona` says so). `rental` is
+never re-routed by a fix.
+"""
+
+
+def _flow_chooser(lang_key: str) -> FlowChooserResponse:
+    """Build the neutral chooser from constants — no auth, no I/O (see `/greeting`)."""
+    flows = flow_options(lang_key)
+    return FlowChooserResponse(
+        message=chooser_message(lang_key),
+        language=lang_key,
+        flows=[FlowOption(**flow) for flow in flows],
+        # The same list as a card, so a client can render it through whatever already
+        # handles structured events rather than special-casing this response.
+        structured_events=[{"type": "flow_options", "payload": {"flows": flows}}],
+    )
+
+
+@router.get("/flows", response_model=FlowChooserResponse, description=_FLOWS_DESCRIPTION)
+async def chat_flows(
+    lang: str = Query(
+        default="en",
+        description="Language for the copy: 'en' (default) or 'hi'. Others fall back to English.",
+    ),
+) -> FlowChooserResponse:
+    """The selectable services — the in-chat replacement for the persona dropdown."""
+    return _flow_chooser("hi" if lang == "hi" else "en")
+
+
+@router.post("/select", response_model=StartChatResponse, description=_SELECT_DESCRIPTION)
+async def select_flow(
+    body: FlowSelectionRequest,
+    rider: RiderIdentity = Depends(get_rider),
+) -> StartChatResponse:
+    """Start the flow the rider tapped. Same resolution as `/start`, persona from the box.
+
+    Delegates to the same handler `/start` uses, so an explicit selection is resolved
+    identically: coordinates still refine local-vs-visiting and set the pickup, and the
+    conversation's classification is corrected from the rider's own words thereafter.
+    """
+    return await _handle_start(rider, body.flow, body.lat, body.lon, body.accuracy_m)
 
 
 # ── LOCAL routes (Him Cab in-state riders) ────────────────────────────────────
