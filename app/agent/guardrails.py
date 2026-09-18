@@ -23,6 +23,7 @@ turn actually has. It is deliberately narrow: it only flags things that can be d
 by comparison, never by taste.
 
   invented_coupon       a code the offers endpoint never returned
+  invented_cab          a vehicle the fare endpoint never priced
   unsupported_fare      a rupee figure when no fare was fetched at all
   contradicted_fare     a rupee figure that is not one of the quoted ones
   contradicted_distance a distance that disagrees with the measured route
@@ -85,6 +86,31 @@ _DISTANCE_RE = re.compile(
 
 _DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+#: Cab and vehicle names a reply might state. Taken from the seat-capacity table, so
+#: this is exactly the vocabulary the backend deals in — anything it can price, this can
+#: recognise. Longest first, so "tempo traveller" is matched before "tempo".
+_CAB_WORDS: tuple[str, ...] = ()
+
+
+def _cab_vocabulary() -> tuple[str, ...]:
+    """The cab names worth checking for, longest first.
+
+    Built lazily from `SEATS_BY_CATEGORY` rather than copied, because a category added
+    there is a category the backend has started returning — and a second hand-maintained
+    list would quietly stop matching it.
+    """
+    global _CAB_WORDS
+    if not _CAB_WORDS:
+        from app.integrations.himcab.vehicles import SEATS_BY_CATEGORY
+
+        # Single generic words are excluded: "bus", "auto" and "mini" appear in ordinary
+        # sentences ("the bus stand", "automatically"), and a false positive here would
+        # strip a line the rider needed.
+        names = {n for n in SEATS_BY_CATEGORY if len(n) >= 5 and n not in {"micro", "prime"}}
+        _CAB_WORDS = tuple(sorted(names, key=len, reverse=True))
+    return _CAB_WORDS
+
 
 #: Phrases that mean a day-by-day plan. Only consulted for the transactional flows,
 #: where the reply is a quote and a plan has no business in it.
@@ -183,6 +209,26 @@ def inspect_reply(state, text: str, mode: str, lang_key: str) -> list[Finding]:
                 findings.append(Finding(
                     kind="invented_coupon", severity=CRITICAL, claim=code,
                     supported=", ".join(sorted(supported_codes)) or "no offers returned",
+                    line=line,
+                ))
+
+        # ── Cab categories ────────────────────────────────────────────────────
+        # A vehicle is a claim exactly like a price: naming one implies we checked what
+        # is available and what it seats, and the rider plans around it. The reported
+        # failure was "for your family of 8, we recommend a spacious Innova or a Tempo
+        # Traveller" in a reply where no fare had been fetched at all — so nothing had
+        # been checked and neither vehicle came from anywhere.
+        #
+        # Only checked when the turn has no priced options. With a fare the list IS the
+        # answer and the reply is supposed to name every one of them; the money check
+        # above already covers quoting the wrong figure against them.
+        if not has_fare:
+            lowered_line = line.lower()
+            named = next((c for c in _cab_vocabulary() if c in lowered_line), None)
+            if named:
+                findings.append(Finding(
+                    kind="invented_cab", severity=CRITICAL, claim=named,
+                    supported="no fare was fetched, so no cab was priced for this trip",
                     line=line,
                 ))
 

@@ -59,6 +59,7 @@ from app.domain.itinerary import (
     TravelInfo,
     WeatherForecast,
 )
+from app.integrations.himcab.quote_builder import classify_trip_type
 from app.services.vertex_ai import get_vertex_ai_service
 
 log = get_logger(__name__)
@@ -582,13 +583,25 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
             "options": fare.get("options", []),
         }
 
+    # Unreachable: the guard above returns when there is no route and this is not a
+    # rental, and the rental path has just returned. Spelled out so the reads below are
+    # provably safe rather than safe-by-inspection.
+    if route is None:
+        return None
+
     return {
         "origin": route["origin"],
         "destination": route["destination"],
         "distance_km": route["distance_km"],
         "duration_minutes": route["duration_minutes"],
         "duration_text": route["duration_text"],
-        "trip_type": fare.get("trip_type"),
+        # From the fare when there is one, and from the JOURNEY when there is not.
+        # It is decided by distance either way (`quote_builder.classify_trip_type`), so
+        # a missing fare is no reason to leave it null — and null is expensive here: the
+        # app reads this to choose which booking screen to open, and its outstation
+        # screen refuses anything inside one state and under 200 km. A 514 km Delhi
+        # to Kasol run that arrives without a trip_type opens the wrong form.
+        "trip_type": fare.get("trip_type") or classify_trip_type(route["distance_km"]),
         "passengers": state.entities.group_size,
         "travel_dates": state.entities.travel_dates,
         # The cab we put in front of them, so the booking screen opens on the same one.
@@ -920,10 +933,19 @@ def _build_system_prompt(state: AgentState) -> str:
             "with the exact price shown there, and recommend the flagged one. Follow the "
             "prices exactly as written."
             if has_fares
-            else " No fare is available, so promote Him Cab without stating any price and say "
-                 "the exact fare is confirmed at booking."
+            else " No fare came back, so name NO cab and NO vehicle — not Innova, not "
+                 "Tempo Traveller, not SUV, not a 'spacious' or 'larger' one, and not a "
+                 "suggestion of what would suit the group size. Say only that Him Cab "
+                 "will carry them and that the cab and the exact fare are confirmed on "
+                 "the booking screen."
         )
     )
+    # The old wording here forbade a PRICE and said to "still recommend travelling with
+    # Him Cab" — which the model obliged by recommending vehicles instead: "for your
+    # family of 8, we recommend a spacious Innova or a Tempo Traveller". Neither came
+    # from the backend. A cab category is a claim exactly like a price is: it implies we
+    # checked what is available and what it seats, and the rider plans around it. With
+    # no fare we checked nothing, so there is nothing to name.
     # Coupons: quote the real ones, invent none. The blanket ban this replaces was
     # correct only while there was no source of truth for offers — now that the backend
     # supplies them, staying silent means the rider pays full price with a valid coupon
@@ -1341,7 +1363,7 @@ def _extract_structured_itinerary(text: str) -> dict | None:
 # pressure to be thorough is not a rule.
 
 #: Any bullet or numbered-list marker, plus indentation, at the head of a line.
-_LEADING_BULLET_RE = re.compile(r"^\s*(?:[-*•◦·▪▫○●‣⁃]+|\d+[.)])?\s*")
+_LEADING_BULLET_RE = re.compile(r"^\s*(?:[-*•◦·▪▫○●‣⁃]+|\d+[.)])?\s*")  # noqa: RUF001 - the bullet chars are the point
 #: An activity `type` echoed as its own line. Matched only when the WHOLE line is
 #: "type: <one token>" — which is what a leak looks like ("type: sightseeing",
 #: "type: check-in") and what a real prose sentence never does, since a sentence has
