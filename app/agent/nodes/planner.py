@@ -34,7 +34,7 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from app.agent import sanitize, slots
+from app.agent import modification, sanitize, slots
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -337,6 +337,11 @@ def _build_entities(merged: dict) -> ExtractedEntities:
     `last_asked_field` is deliberately NOT carried over — it is set by `_resolve`
     from this turn's decision, so a stale question can never be used to reinterpret a
     later message.
+
+    `pending_changes` and `awaiting_change_detail` are dropped for the same reason and
+    are re-set only by the modification branch. A proposal that outlived the turn it
+    was made on would be a change the rider never confirmed, applied later against a
+    message that was never about it.
     """
     return ExtractedEntities(
         destination=merged.get("destination"),
@@ -420,6 +425,38 @@ def _resolve(
     }
 
 
+def _ask_about_the_change(
+    state: AgentState,
+    entities: ExtractedEntities,
+    question: str,
+    event: dict,
+    visitor_type: Optional[str],
+) -> dict:
+    """A turn that asks about a modification and does nothing else.
+
+    Bypasses `_resolve` on purpose. `slots.decide` answers "what is still missing?",
+    and during a modification nothing is missing — the rider is changing something
+    they already gave us. Routing this through the slot policy would replace the
+    confirmation with whatever question happened to be next in the table.
+
+    `last_asked_field` is cleared for the same reason: the reply coming back is a yes,
+    a no, or a new value, and reading it as the answer to a slot question is how "nahi"
+    would have become a destination.
+    """
+    entities.last_asked_field = None
+    return {
+        "entities": entities,
+        "needs_clarification": True,
+        "clarification_question": question,
+        "visitor_type": visitor_type,
+        "last_asked_field": None,
+        "assumed_fields": [],
+        "unbookable_rental_hours": None,
+        "structured_events": [event],
+        "node_trace": ["planner"],
+    }
+
+
 async def planner_node(state: AgentState) -> dict:
     """LangGraph Planner Node — extract, merge, classify, then decide."""
     log.info("planner_node_entered", session_id=state.session_id, intent=state.intent)
@@ -448,6 +485,51 @@ async def planner_node(state: AgentState) -> dict:
         if previously_asked:
             greeting_entities.no_progress_turns = state.entities.no_progress_turns + 1
         return _resolve(state, greeting_entities, state.visitor_type, lang_key)
+
+    # ── A change we asked about last turn ─────────────────────────────
+    # Read before the extraction model, not after: "haan" is unmistakable in code, and
+    # sending it to a model to be classified adds a round trip and a way to be wrong
+    # about the one turn where being wrong rewrites a booking screen.
+    pending = dict(state.entities.pending_changes or {})
+    confirmed_changes: dict[str, Any] = {}
+    if pending:
+        verdict = modification.reads_as_confirmation(latest_text)
+        if verdict is True:
+            confirmed_changes = pending
+            log.info(
+                "change_confirmed", fields=sorted(pending), session_id=state.session_id
+            )
+        elif verdict is False:
+            # Declined. Keep every old value, and ask what they DID mean — a rider who
+            # says "no" to our reading has still told us something is wrong, and
+            # dropping it there leaves them exactly where the reported bug left them.
+            declined = state.entities.model_copy(deep=True)
+            declined.pending_changes = {}
+            declined.awaiting_change_detail = True
+            declined.no_progress_turns = 0
+            log.info(
+                "change_declined", fields=sorted(pending), session_id=state.session_id
+            )
+            return _ask_about_the_change(
+                state,
+                declined,
+                modification.kept_message(lang_key)
+                + "\n"
+                + modification.which_detail_question(declined, lang_key),
+                modification.which_detail_event(declined, lang_key),
+                state.visitor_type,
+            )
+        else:
+            # Neither yes nor no. The likeliest reason is that they answered with a
+            # DIFFERENT value ("no, make it Kullu"), which the readers below handle far
+            # better than a yes/no test can. The old proposal is dropped rather than
+            # left hanging, so it cannot be applied by a later turn that was never
+            # about it.
+            log.info(
+                "change_confirmation_unclear",
+                fields=sorted(pending),
+                session_id=state.session_id,
+            )
 
     conversation_text = "\n".join(
         f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
@@ -520,6 +602,13 @@ Report what the user has stated. Use null for anything they have not."""
     for key, val in result_dict.items():
         if key not in control_keys and val not in (None, []):
             merged[key] = val
+
+    # A change the rider confirmed last turn, applied over whatever the model still
+    # believes. It has to land AFTER the merge above: the extraction model re-reports
+    # the whole conversation every turn and will happily re-assert the old value it has
+    # seen five times, which is exactly how the confirmed change used to evaporate.
+    if confirmed_changes:
+        merged.update(confirmed_changes)
 
     if is_rental:
         _strip_trip_fields(merged, state.session_id)
@@ -622,21 +711,34 @@ Report what the user has stated. Use null for anything they have not."""
     # ── Read the reply as a CORRECTION to the question we asked ────────────
     # `read_answer` above only fills an EMPTY slot. A bare reply that changes one that
     # is already filled — "nahi, Kasol" after the destination is in — landed nowhere.
-    # Guarded to the field the assistant itself asked last turn, and to the case where
-    # the model left the old value standing: reading a whole conversation is the
-    # model's strength, so a correction IT already caught wins and this never fights it.
+    # Guarded to the field the assistant itself asked last turn — that is what makes a
+    # bare reply unambiguous. Like the sentence reader below it PROPOSES rather than
+    # writes, because it overwrites a value the rider already gave us.
     if latest_text and previously_asked:
         asked_slot = slots.SLOTS.get(previously_asked)
         stored = existing_entities.get(previously_asked)
-        if asked_slot and _same_value(merged.get(previously_asked), stored):
+        if asked_slot:
+            # Read against `stored`, not against `merged`: the text is what establishes
+            # that a change was asked for, and it says so whether or not the extraction
+            # model also noticed. Reading against `merged` made the behaviour depend on
+            # the model — the same reply confirmed on one turn and applied silently on
+            # the next, for no reason the rider could see.
             new_value = slots.read_correction_to_asked(
-                previously_asked, latest_text, merged.get(previously_asked)
+                previously_asked, latest_text, stored
             )
             if new_value is not None:
-                merged[previously_asked] = new_value
+                # The model's reading of the same reply wins WHAT is proposed when it
+                # moved the field too; the text only had to establish THAT it moved.
+                model_value = merged.get(previously_asked)
+                if model_value is not None and not _same_value(model_value, stored):
+                    new_value = model_value
+                # Proposed, not written. Same rule as the sentence block below: this
+                # overwrites a value the rider already gave, so they get to see our
+                # reading of it before a booking screen is built on it.
+                corrected[previously_asked] = new_value
                 bare_correction = previously_asked
                 log.info(
-                    "bare_answer_corrected",
+                    "bare_answer_correction_proposed",
                     field=previously_asked,
                     session_id=state.session_id,
                 )
@@ -661,36 +763,54 @@ Report what the user has stated. Use null for anything they have not."""
         reader = slots.read_rental_details if is_rental else slots.read_trip_details
         filled: dict[str, Any] = {}
         for field, value in reader(latest_text).items():
-            current = merged.get(field)
-            if current in (None, "", [], {}):
-                # Nothing there yet — fill it, exactly as before.
+            stored = existing_entities.get(field)
+            if stored in (None, "", [], {}):
+                # Nothing there yet — an ANSWER. Fills the blank, takes nothing away,
+                # and needs no confirmation.
                 filled[field] = value
-            elif not _same_value(value, current) and _same_value(
-                current, existing_entities.get(field)
-            ):
-                # The rider has just RESTATED this slot as something different, and the
-                # model left the previous turn's value standing (`merged[field]` still
-                # equals what was already confirmed). This is the reported bug: every
-                # detail is in, the booking is on screen, and "mujhe dharamshala jaana
-                # hai" changes the destination — but the old "Kangra" survived and the
-                # booking never moved. The whole cascade (route, fare, weather, handoff)
-                # is rebuilt from the entities each turn, so correcting the slot here is
-                # all it takes for the updated booking to ship.
+            elif not _same_value(value, stored):
+                # A CHANGE: the rider has restated a slot as something different from
+                # what the session holds. Every detail may already be in and the
+                # booking already on screen; "mujhe dharamshala jaana hai" moves it.
                 #
-                # Guarded to the case where the model did NOT change it: reading a whole
-                # sentence is the model's strength, so a value IT already corrected wins
-                # and these regexes never fight it. Only a value the model kept is
-                # overwritten, on the same marker that would have filled an empty slot.
-                corrected[field] = value
+                # Compared against `stored` — the value as it was BEFORE this turn —
+                # rather than against `merged`, which the extraction model has already
+                # written to. That is what makes the detection uniform: whether the
+                # model caught the change or missed it, the rider sees the same
+                # confirmation. It used to depend on which, so the same sentence was
+                # sometimes applied silently and sometimes not.
+                #
+                # The model's value wins WHAT is proposed when it moved the field too:
+                # reading a whole sentence is its strength, and these regexes cap a
+                # place at three words. The reader's job here is to establish THAT
+                # something changed, which it can do from the text alone — a
+                # model-only disagreement is far more often a re-wording ("kal" ->
+                # "tomorrow") than a change the rider asked for.
+                model_value = merged.get(field)
+                corrected[field] = (
+                    model_value
+                    if model_value is not None and not _same_value(model_value, stored)
+                    else value
+                )
 
-        changes = {**filled, **corrected}
-        if changes:
-            merged.update(changes)
+        # `filled` goes in unconditionally and `corrected` does not. That is the whole
+        # distinction this flow turns on: filling a blank takes nothing away, while
+        # changing a value overwrites something the rider already gave us and is
+        # already looking at. The second one is proposed and confirmed below; see
+        # app/agent/modification.py for why it is worth the extra turn.
+        if filled:
+            merged.update(filled)
+        for field in corrected:
+            # Put back what the session held. The model may have written its own change
+            # into `merged` several steps ago, and leaving it there would apply the very
+            # change we are about to ask about — the confirmation would be theatre.
+            merged[field] = existing_entities.get(field)
+        if filled or corrected:
             log.info(
                 "sentence_read_in_code",
                 flow="rental" if is_rental else "trip",
                 filled=sorted(filled),
-                corrected=sorted(corrected),
+                proposed=sorted(corrected),
                 llm_ok=llm_ok,
                 session_id=state.session_id,
             )
@@ -699,7 +819,7 @@ Report what the user has stated. Use null for anything they have not."""
         # extracted origin does above: "actually, start from Delhi" turns a resident's
         # ride into a visitor's transfer. Skipped for a rental, where the pickup never
         # sets the persona (`classify_visitor_type` returns RENTAL regardless).
-        if ("origin" in corrected or bare_correction == "origin") and not is_rental:
+        if "origin" in filled and not is_rental:
             corrected_in_hp = await geo.place_in_himachal(merged["origin"])
             visitor_type = await classify_visitor_type(
                 merged.get("origin"),
@@ -768,12 +888,81 @@ Report what the user has stated. Use null for anything they have not."""
     # us a real, different value. Without `or corrected`, a turn that only changes an
     # already-known detail would count as no progress and inch the agent towards giving
     # up on a rider who is actively engaged.
-    if (_known_slots(entities) - known_before) or corrected or bare_correction:
+    if (
+        (_known_slots(entities) - known_before)
+        or corrected
+        or bare_correction
+        or confirmed_changes
+    ):
         entities.no_progress_turns = 0
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1
 
+    # ── A change the rider has asked for ───────────────────────────────
+    # `corrected` holds values that would OVERWRITE something already on the session.
+    # Three outcomes, and which one applies is decided in code:
+    #
+    #   They already told us they wanted to change something and we asked what — this
+    #   IS the what, so it goes straight in. Asking "are you sure?" about an answer to
+    #   "what would you like to change?" is how a correction becomes an interrogation.
+    #
+    #   Otherwise we put our reading of it to them before acting on it. The value we
+    #   read is the thing most likely to be wrong, and the reported bug is what a bad
+    #   one looks like once it reaches a booking screen: a ride from "Mujhe Palampur"
+    #   to "Lekar Kasol". Shown as a question, that misparse is obvious to the one
+    #   person who can fix it.
+    #
+    #   And a rider who says they want a change without saying which gets asked which,
+    #   with the current details listed so they can point at one rather than remember.
+    if corrected and state.entities.awaiting_change_detail:
+        for field, value in corrected.items():
+            setattr(entities, field, value)
+        log.info(
+            "change_applied_on_request",
+            fields=sorted(corrected),
+            session_id=state.session_id,
+        )
+    elif corrected:
+        pending_entities = entities.model_copy(deep=True)
+        pending_entities.pending_changes = dict(corrected)
+        log.info(
+            "change_proposed",
+            fields=sorted(corrected),
+            session_id=state.session_id,
+        )
+        return _ask_about_the_change(
+            state,
+            pending_entities,
+            # Against `state.entities` — the values as they stood BEFORE this turn.
+            # `entities` already carries anything newly filled, and a confirmation that
+            # says "destination: Kasol → Kasol" tells the rider nothing.
+            modification.confirm_question(corrected, state.entities, lang_key),
+            modification.confirmation_event(corrected, state.entities, lang_key),
+            visitor_type,
+        )
+    elif latest_text and modification.wants_to_change_something(latest_text):
+        asking = entities.model_copy(deep=True)
+        asking.awaiting_change_detail = True
+        asking.no_progress_turns = 0
+        log.info("change_requested_without_a_field", session_id=state.session_id)
+        return _ask_about_the_change(
+            state,
+            asking,
+            modification.which_detail_question(asking, lang_key),
+            modification.which_detail_event(asking, lang_key),
+            visitor_type,
+        )
+
     result = _resolve(state, entities, visitor_type, lang_key, unbookable_hours)
+
+    # A change that just landed is stated in the reply, so the rider can see it took.
+    # Everything downstream — route, fare, weather, booking handoff — is rebuilt from
+    # the entities each turn, so the reply already reflects the new value; what it has
+    # no way to say on its own is that the value MOVED, and why.
+    if confirmed_changes or (corrected and state.entities.awaiting_change_detail):
+        result["change_note"] = modification.applied_message(
+            confirmed_changes or corrected, lang_key
+        )
 
     log.info(
         "entities_extracted",

@@ -217,23 +217,32 @@ class TestStructuredEventTypesStayInSync:
     the enum doesn't list would fail response validation and 500 the request. This
     catches that drift at test time instead of in production."""
 
-    def test_every_type_the_writer_emits_is_declared(self):
+    def test_every_type_the_agent_emits_is_declared(self):
+        """Scans the whole agent package, not just the writer.
+
+        It used to scan `writer.py` alone, which was true when the writer was the only
+        node that emitted cards. `cancellation`, `modification` and the planner all
+        build their own now, and a type none of them declares 500s the request at
+        response validation — the exact drift this test exists to catch, missed because
+        the search was narrower than the code.
+        """
         import re
         from pathlib import Path
 
         from app.schemas.chat import StructuredEventType
 
-        writer_src = Path("app/agent/nodes/writer.py").read_text(encoding="utf-8")
-        # Anchored on the append call so the activity types inside the prompt's own
-        # JSON template aren't mistaken for event types.
-        emitted = set(re.findall(
-            r'structured_events\.append\(\{\s*"type":\s*"([a-z_]+)"', writer_src
-        ))
+        # Anchored on the `payload` that follows it, so the activity types inside the
+        # writer prompt's own JSON template are not mistaken for event types.
+        pattern = re.compile(r'"type":\s*"([a-z_]+)",\s*(?:#[^\n]*\n\s*)?"payload"')
+        emitted: set[str] = set()
+        for path in sorted(Path("app/agent").rglob("*.py")):
+            emitted |= set(pattern.findall(path.read_text(encoding="utf-8")))
+
         declared = {t.value for t in StructuredEventType}
 
-        assert emitted, "no structured event types found — did the writer move?"
+        assert emitted, "no structured event types found — did the agent package move?"
         assert emitted <= declared, (
-            f"writer emits undeclared event type(s) {sorted(emitted - declared)}; "
+            f"the agent emits undeclared event type(s) {sorted(emitted - declared)}; "
             f"add them to StructuredEventType and document them in docs/api_reference.md"
         )
 

@@ -513,6 +513,19 @@ def _build_journey_section(state: AgentState) -> str:
     )
 
 
+def _with_change_note(state: AgentState, text: str) -> str:
+    """`text`, preceded by the line saying which detail the rider just changed.
+
+    Everything in the reply below it is rebuilt from the entities each turn, so it
+    already SHOWS the new destination or the new date. What it has no way to say is
+    that the value moved, which is the one thing a rider who just asked for a change is
+    looking for. Set by the planner (see `modification.applied_message`), so the
+    wording is a table rather than something the model is asked to remember to mention.
+    """
+    note = state.change_note
+    return f"{note}\n\n{text}" if note else text
+
+
 def _build_booking_handoff(state: AgentState) -> Optional[dict]:
     """The payload the app needs to open its booking screen on this journey.
 
@@ -1517,7 +1530,7 @@ async def writer_node(state: AgentState) -> dict:
     if mode == slots.RIDE_MODE:
         from app.agent.ride_reply import build_ride_reply
 
-        text = build_ride_reply(state, lang_key)
+        text = _with_change_note(state, build_ride_reply(state, lang_key))
         if state.token_stream is not None:
             await state.token_stream.put(text)
             await state.token_stream.put(None)
@@ -1734,6 +1747,7 @@ async def writer_node(state: AgentState) -> dict:
         # so a pattern is visible before it becomes a complaint.
         # Findings are logged inside the guard; the caller only needs the text.
         clean_text, _findings = apply_guardrails(state, clean_text, mode, lang_key)
+        clean_text = _with_change_note(state, clean_text)
 
         return {
             "final_response_text": clean_text,

@@ -96,6 +96,17 @@ class ExtractedEntities(BaseModel):
     #: conversation as a whole, not just per field: past the limit the agent stops
     #: asking and answers with what it has. Resets the moment they engage again.
     no_progress_turns: int = 0
+    #: field -> proposed new value, waiting for the rider to say yes. A detail that
+    #: CHANGES is never applied on the turn it is read: an answer fills a blank, but a
+    #: change overwrites something the rider is already looking at on a booking screen,
+    #: and the value we read is the thing most likely to be wrong. See
+    #: app/agent/modification.py.
+    pending_changes: dict[str, Any] = Field(default_factory=dict)
+    #: Set when the rider has said they want to modify something but not yet what, so
+    #: the next detail they give is applied WITHOUT asking again — they have already
+    #: confirmed the intent, and asking twice is how a correction turns into an
+    #: interrogation.
+    awaiting_change_detail: bool = False
 
 
 class SessionStatus(str, Enum):

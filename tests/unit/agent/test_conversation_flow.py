@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent import sanitize, slots
+from app.agent import modification, sanitize, slots
 from app.agent.graph import route_after_planner, route_after_router
 from app.agent.nodes.planner import PlannerExtraction, planner_node
 from app.agent.state import AgentState
@@ -267,19 +267,36 @@ class TestARentalSentenceIsUnderstood:
 # ── 1c. "I changed my mind and it ignored me" ─────────────────────────────────
 #
 # The reported screenshot: a local ride is fully specified and the booking is on
-# screen — "Dadh se Kangra". The rider then types "Mujhe dharamshala jaana hai" and
-# gets the SAME Dadh→Kangra booking back, because the changed destination never
-# reached the entities. Corrections used to depend entirely on the extraction model
-# overwriting a value it had already reported; when it kept the old one instead, the
-# deterministic sentence reader saw the slot was "already filled" and refused to touch
-# it. These conversations stub the model to KEEP the old value (the reported miss), so
-# the code-level corrector is the only thing that can catch the change.
+# screen — "Dadh se Kangra". The rider then changes a location and gets back a ride
+# from "Mujhe Palampur" to "Lekar Kasol", with a booking screen already built on it.
+#
+# Two things went wrong and both are covered here. The sentence parsed into places
+# that do not exist (fixed in `slots`, covered in tests/test_corrections.py), and a
+# half-understood change went straight to a booking screen without anyone being asked
+# whether it was the right one.
+#
+# So a CHANGE is no longer applied on the turn it is read. It is put back to the rider
+# first — "change the destination from Kangra to Dharamshala?" — and applied when they
+# say yes. An ANSWER that fills a blank still goes straight in: filling takes nothing
+# away, and confirming every answer would turn slot filling into an interrogation.
+#
+# The model is stubbed to KEEP the old value in most of these, which is the reported
+# miss, and to catch it in one — the rider must see the same confirmation either way.
 
-class TestChangingYourMindUpdatesTheBooking:
+#: What the extraction model keeps reporting after the rider has moved on — the
+#: reported miss, and the harder case: the code readers are the only thing that can
+#: see the change.
+STALE = {
+    "destination": "Kangra", "origin": "Dadh", "group_size": 2,
+    "travel_dates": "kal", "origin_in_himachal": True,
+}
 
-    @pytest.mark.asyncio
-    async def test_a_new_destination_after_the_booking_replaces_the_old_one(self):
-        """The exact screenshot: everything is in, then a different place is named."""
+
+class TestAChangeIsConfirmedBeforeItIsApplied:
+
+    @staticmethod
+    async def _booked_ride() -> Conversation:
+        """A local ride with every detail in and the booking screen up."""
         chat = Conversation(persona="local", intent="plan_trip")
         await chat.say(
             "Dadh se Kangra, 2 log, kal",
@@ -288,77 +305,155 @@ class TestChangingYourMindUpdatesTheBooking:
         )
         assert chat.turns[-1].produced
         assert chat.entities.destination == "Kangra"
-
-        # The model MISSES the change and reports the old destination again.
-        turn = await chat.say(
-            "Mujhe dharamshala jaana hai",
-            extraction(destination="Kangra", origin="Dadh", group_size=2,
-                       travel_dates="kal", origin_in_himachal=True),
-        )
-
-        assert turn.produced, "asked a question instead of re-quoting the new trip"
-        assert chat.entities.destination == "Dharamshala", (
-            "the changed destination never reached the entities, so the booking "
-            "would ship the old one"
-        )
+        return chat
 
     @pytest.mark.asyncio
-    async def test_the_change_lands_even_when_vertex_is_down(self):
-        """With the extractor unavailable the correction must still be read in code."""
-        chat = Conversation(persona="local", intent="plan_trip")
-        await chat.say(
-            "Dadh se Kangra, 2 log, kal",
-            extraction(destination="Kangra", origin="Dadh", group_size=2,
-                       travel_dates="kal", origin_in_himachal=True),
-        )
-        turn = await chat.say("Mujhe dharamshala jaana hai", None)
+    async def test_the_change_is_put_back_to_the_rider_before_it_is_acted_on(self):
+        """The screenshot, handled: a question, not a booking screen."""
+        chat = await self._booked_ride()
+        turn = await chat.say("Mujhe dharamshala jaana hai", extraction(**STALE))
 
-        assert turn.produced
+        assert turn.asked, "went straight to a booking screen on an unconfirmed change"
+        assert chat.entities.pending_changes == {"destination": "Dharamshala"}
+        assert chat.entities.destination == "Kangra", (
+            "the change was applied while it was still being asked about"
+        )
+        # Both sides are named, because the value WE read is the thing most likely to
+        # be wrong and the rider is the only one who can see that.
+        assert "Kangra" in turn.question and "Dharamshala" in turn.question
+
+    @pytest.mark.asyncio
+    async def test_the_app_is_sent_the_change_as_a_card(self):
+        chat = await self._booked_ride()
+        turn = await chat.say("Mujhe dharamshala jaana hai", extraction(**STALE))
+
+        events = turn.result["structured_events"]
+        assert [e["type"] for e in events] == ["change_confirmation"]
+        assert events[0]["payload"]["changes"] == [
+            {
+                "field": "destination",
+                # This chat is Hinglish, so the card is labelled in Hindi — read from
+                # the same table the text uses, so the two cannot drift apart.
+                "label": modification.label_for("destination", "hi"),
+                "current": "Kangra",
+                "proposed": "Dharamshala",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_yes_applies_it_and_says_so(self):
+        chat = await self._booked_ride()
+        await chat.say("Mujhe dharamshala jaana hai", extraction(**STALE))
+        # The model STILL reports the old destination on the confirming turn — it has
+        # seen "Kangra" five times. The confirmed change has to outrank it.
+        turn = await chat.say("haan", extraction(**STALE))
+
+        assert turn.produced, "asked again instead of re-quoting the new trip"
         assert chat.entities.destination == "Dharamshala"
+        assert chat.entities.pending_changes == {}
+        assert "Dharamshala" in (turn.result.get("change_note") or "")
 
     @pytest.mark.asyncio
-    async def test_the_model_correcting_it_still_works(self):
-        """The primary path is untouched: when the model DOES report the new value it
-        is applied, and the code net agrees rather than fighting it."""
-        chat = Conversation(persona="local", intent="plan_trip")
-        await chat.say(
-            "Dadh se Kangra, 2 log, kal",
-            extraction(destination="Kangra", origin="Dadh", group_size=2,
-                       travel_dates="kal", origin_in_himachal=True),
-        )
+    async def test_no_keeps_the_old_value_and_asks_what_they_did_mean(self):
+        """A "no" is not the end of it. They still told us something is wrong."""
+        chat = await self._booked_ride()
+        await chat.say("Mujhe dharamshala jaana hai", extraction(**STALE))
+        turn = await chat.say("nahi", extraction(**STALE))
+
+        assert turn.asked
+        assert chat.entities.destination == "Kangra"
+        assert chat.entities.pending_changes == {}
+        assert chat.entities.awaiting_change_detail is True
+        # The details are listed back, so they can point at one instead of
+        # remembering what they said and in what words.
+        assert "Kangra" in turn.question and "Dadh" in turn.question
+
+    @pytest.mark.asyncio
+    async def test_a_different_value_instead_of_yes_or_no_becomes_the_new_proposal(self):
+        """"no, make it Kullu" is not a no. It is a different change."""
+        chat = await self._booked_ride()
+        await chat.say("Mujhe dharamshala jaana hai", extraction(**STALE))
+        turn = await chat.say("nahi, mujhe kullu jaana hai", extraction(**STALE))
+
+        assert turn.asked
+        assert chat.entities.pending_changes == {"destination": "Kullu"}
+        assert chat.entities.destination == "Kangra"
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_is_the_same_when_the_model_catches_it(self):
+        """Behaviour must not depend on whether the extractor happened to notice.
+
+        It used to: a change the model reported was applied silently, and the identical
+        sentence was confirmed only when the model missed it. Same rider, same words,
+        two different experiences.
+        """
+        chat = await self._booked_ride()
         turn = await chat.say(
             "Mujhe dharamshala jaana hai",
             extraction(destination="Dharamshala", origin="Dadh", group_size=2,
                        travel_dates="kal", origin_in_himachal=True),
         )
 
+        assert turn.asked
+        assert chat.entities.pending_changes == {"destination": "Dharamshala"}
+        assert chat.entities.destination == "Kangra"
+
+    @pytest.mark.asyncio
+    async def test_it_still_works_when_vertex_is_down(self):
+        """No model anywhere in this path — detection, wording and reading the yes."""
+        chat = await self._booked_ride()
+        turn = await chat.say("Mujhe dharamshala jaana hai", None)
+        assert turn.asked
+        assert chat.entities.pending_changes == {"destination": "Dharamshala"}
+
+        turn = await chat.say("haan", None)
         assert turn.produced
         assert chat.entities.destination == "Dharamshala"
 
     @pytest.mark.asyncio
-    async def test_changing_the_group_size_after_the_plan_is_honoured(self):
+    async def test_changing_the_group_size_takes_the_same_route(self):
         """Any input parameter, not just the destination: a revised headcount picks a
-        different cab, so it must overwrite the one the plan was built on."""
+        different cab, so it must not move without being confirmed either."""
         chat = Conversation(persona="outstation", intent="plan_trip")
-        await chat.say(
-            "Delhi to Manali, 4 days, 3 of us, next week",
-            extraction(destination="Manali", origin="Delhi", duration_days=4,
-                       group_size=3, travel_dates="next week", origin_in_himachal=False),
-        )
+        stale = {
+            "destination": "Manali", "origin": "Delhi", "duration_days": 4,
+            "group_size": 3, "travel_dates": "next week", "origin_in_himachal": False,
+        }
+        await chat.say("Delhi to Manali, 4 days, 3 of us, next week", extraction(**stale))
         assert chat.turns[-1].produced
-        turn = await chat.say(
-            "actually we are 5 people now",
-            extraction(destination="Manali", origin="Delhi", duration_days=4,
-                       group_size=3, travel_dates="next week", origin_in_himachal=False),
-        )
 
+        turn = await chat.say("actually we are 5 people now", extraction(**stale))
+        assert turn.asked
+        assert chat.entities.pending_changes == {"group_size": 5}
+        assert chat.entities.group_size == 3
+
+        turn = await chat.say("yes", extraction(**stale))
         assert turn.produced
         assert chat.entities.group_size == 5
 
     @pytest.mark.asyncio
+    async def test_a_changed_rental_pickup_takes_the_same_route(self):
+        """The rental twin: a car is booked from one town, the rider moves the pickup."""
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        await chat.say("8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING)
+        assert chat.entities.origin == "Shimla"
+
+        turn = await chat.say("actually pick me up from Kullu", NOTHING)
+        assert turn.asked
+        assert chat.entities.pending_changes == {"origin": "Kullu"}
+        assert chat.entities.origin == "Shimla"
+
+        turn = await chat.say("haan", NOTHING)
+        assert chat.entities.origin == "Kullu"
+        # The duration, date, time and headcount are untouched by a pickup change.
+        assert chat.entities.rental_hours == 8
+        assert turn.result["entities"].pickup_time == "09:00"
+
+    @pytest.mark.asyncio
     async def test_a_restated_same_value_is_not_treated_as_a_change(self):
         """Saying the destination again, unchanged, must not disturb anything or reset
-        the give-up counter — only a genuinely different value is a correction."""
+        the give-up counter — and above all must not ask for a confirmation of
+        nothing, which is how this mechanism would become unbearable."""
         chat = Conversation(persona="local", intent="plan_trip")
         await chat.say(
             "Kangra jaana hai, Dadh se, 2 log, kal",
@@ -373,21 +468,76 @@ class TestChangingYourMindUpdatesTheBooking:
 
         assert turn.produced
         assert chat.entities.destination == "Kangra"
+        assert chat.entities.pending_changes == {}
 
     @pytest.mark.asyncio
-    async def test_a_changed_rental_pickup_replaces_the_old_one(self):
-        """The rental twin: a car is booked from one town, the rider moves the pickup."""
-        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        await chat.say(
-            "8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
-        )
-        assert chat.entities.origin == "Shimla"
-        turn = await chat.say("actually pick me up from Kullu", NOTHING)
+    async def test_filling_a_blank_is_never_confirmed(self):
+        """The cost control on all of this. Slot filling must not grow a yes/no step:
+        an answer to a question we asked takes nothing away, so there is nothing to
+        confirm, and a rider supplying details must never be asked to approve each."""
+        chat = Conversation(persona="outstation", intent="plan_trip")
+        turn = await chat.say("Manali", extraction(destination="Manali"))
 
-        assert chat.entities.origin == "Kullu", "the pickup change was ignored"
-        # The duration, date, time and headcount are untouched by a pickup change.
-        assert chat.entities.rental_hours == 8
-        assert turn.result["entities"].pickup_time == "09:00"
+        assert chat.entities.destination == "Manali"
+        assert chat.entities.pending_changes == {}
+        assert turn.result.get("change_note") is None
+
+
+# ── 1d. "I want to change something" — no field named ─────────────────────────
+#
+# The other half of the request. A rider who says they want to modify a detail and
+# does not say which cannot be answered with "yes or no?", so they are asked WHICH,
+# with everything we hold listed back. Answering that question applies directly: they
+# have already said they want a change, and asking again is the interrogation this
+# whole flow is trying not to become.
+
+class TestAChangeRequestWithNoFieldNamed:
+
+    async def _booked_ride(self) -> Conversation:
+        chat = Conversation(persona="local", intent="plan_trip")
+        await chat.say("Dadh se Kangra, 2 log, kal", extraction(**STALE))
+        assert chat.turns[-1].produced
+        return chat
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        ["I want to change something", "mujhe kuch badalna hai", "wait, that's wrong",
+         "ek minute", "galat ho gaya"],
+    )
+    async def test_it_asks_which_detail(self, message):
+        chat = await self._booked_ride()
+        turn = await chat.say(message, extraction(**STALE))
+
+        assert turn.asked
+        assert chat.entities.awaiting_change_detail is True
+        # Listed back, so the answer is a matter of pointing.
+        assert "Kangra" in turn.question and "Dadh" in turn.question
+        events = turn.result["structured_events"]
+        assert [e["type"] for e in events] == ["change_options"]
+
+    @pytest.mark.asyncio
+    async def test_the_answer_to_it_is_applied_without_asking_again(self):
+        chat = await self._booked_ride()
+        await chat.say("mujhe kuch badalna hai", extraction(**STALE))
+        turn = await chat.say("dharamshala jaana hai", extraction(**STALE))
+
+        assert turn.produced, "asked for a confirmation it had already been given"
+        assert chat.entities.destination == "Dharamshala"
+        assert chat.entities.pending_changes == {}
+        assert "Dharamshala" in (turn.result.get("change_note") or "")
+
+    @pytest.mark.asyncio
+    async def test_asking_whether_you_can_change_something_is_not_a_change_request(self):
+        """A question about the policy, answered as one. Same trap `cancellation`
+        guards against: "can I cancel later?" must not cancel anything."""
+        chat = await self._booked_ride()
+        turn = await chat.say("can I change the date later?", extraction(**STALE))
+
+        assert chat.entities.awaiting_change_detail is False
+        # An ordinary turn emits none: the planner only attaches one when it is asking
+        # about a modification.
+        assert turn.result.get("structured_events", []) == []
 
 
 # ── 2. "It never generates" ───────────────────────────────────────────────────

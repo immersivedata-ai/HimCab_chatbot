@@ -94,6 +94,12 @@ class StructuredEventType(str, Enum):
     #: for the old persona dropdown. Payload: {flows: [FlowOption]}. Tapping one is
     #: POST /v1/chat/select with `flow` = the box's `persona`.
     FLOW_OPTIONS = "flow_options"
+    #: The rider is changing a detail they already gave, and is being asked to confirm
+    #: it before anything moves. Payload: {changes: [{field, label, current, proposed}]}.
+    CHANGE_CONFIRMATION = "change_confirmation"
+    #: The rider asked to change something without saying what. Payload:
+    #: {fields: [{field, label, current}]} — the details we hold, to pick from.
+    CHANGE_OPTIONS = "change_options"
 
 
 class StructuredEvent(BaseModel):
@@ -164,6 +170,23 @@ class StructuredEvent(BaseModel):
                            known; absent when the pickup was never established.
                            Nothing is reserved — the app owns the booking, and the
                            reply never asks the rider to confirm.
+      - `change_confirmation`→ the rider changed a detail they had already given, and is
+                           being asked to confirm it BEFORE it is applied:
+                           {changes: [{field, label, current, proposed}]}. Render the
+                           pairs with a Yes and a No; Yes is the word "yes"/"haan" sent
+                           as an ordinary message, No likewise. Nothing has changed yet
+                           when this arrives — any `booking_handoff` already on screen
+                           is still the OLD journey and must not be updated until the
+                           rider confirms. Both sides are sent because the `proposed`
+                           value is our reading of their sentence and showing it is how
+                           a misparse gets caught before a car is sent on it.
+      - `change_options` → the rider asked to change something without saying what:
+                           {fields: [{field, label, current}]}, the details we hold.
+                           Render them as tappable rows; tapping one should send the
+                           field and its new value as an ordinary message ("destination
+                           Kasol"). A detail given in reply to THIS card is applied
+                           directly — no `change_confirmation` follows, because the
+                           rider has already said they want a change.
       - `flow_options`   → the selectable services shown before a flow is chosen, the
                            in-chat replacement for the persona dropdown:
                            {flows: [{persona, title, subtitle, base_path, language}]}.

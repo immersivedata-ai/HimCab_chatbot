@@ -215,6 +215,11 @@ class TestThePlannerActsOnTheChange:
     returning the STALE values — which is the realistic failure, because the model
     re-reports what it already believes about the conversation. If the correction only
     worked when the model caught it, it would not be a fix at all.
+
+    A detected change is PROPOSED rather than applied — see app/agent/modification.py
+    and the confirm-then-apply conversations in
+    tests/unit/agent/test_conversation_flow.py. What these assert is the detection
+    reaching the planner intact; that it is then put to the rider is asserted there.
     """
 
     @staticmethod
@@ -252,8 +257,13 @@ class TestThePlannerActsOnTheChange:
             # The model insists on the old trip.
             PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
-        assert result["entities"].destination == "Kasol"
-        assert result["entities"].origin == "Palampur"
+        assert result["entities"].pending_changes == {
+            "destination": "Kasol",
+            "origin": "Palampur",
+        }
+        # Not applied while it is being asked about.
+        assert result["entities"].destination == "Manali"
+        assert result["entities"].origin == "Kullu"
 
     @pytest.mark.asyncio
     async def test_a_bare_reply_moves_the_field_that_was_asked(self):
@@ -268,15 +278,16 @@ class TestThePlannerActsOnTheChange:
             stored,
             PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
-        assert result["entities"].destination == "Kasol"
+        assert result["entities"].pending_changes == {"destination": "Kasol"}
 
     @pytest.mark.asyncio
-    async def test_the_model_wins_when_it_caught_the_change_itself(self):
-        """Reading a whole conversation is the model's strength.
+    async def test_the_model_wins_on_what_is_proposed(self):
+        """The text settles THAT a value changed; the model settles WHAT it changed to.
 
-        These readers only step in for a value the model LEFT ALONE, so the two can
-        never fight over the same slot — which is what keeps a regex from overruling a
-        correction it understood better.
+        Reading a whole conversation is the model's strength, and `parse_place` caps a
+        name at three words on purpose. So the two never fight: the readers establish
+        the change from the text alone, and a model that read the same reply better
+        supplies the value that goes in front of the rider.
         """
         from app.agent.nodes.planner import PlannerExtraction
 
@@ -290,7 +301,7 @@ class TestThePlannerActsOnTheChange:
             # The model already moved it, and somewhere better than a bare parse could.
             PlannerExtraction(destination="Kasol Village", origin="Kullu", confidence=0.9),
         )
-        assert result["entities"].destination == "Kasol Village"
+        assert result["entities"].pending_changes == {"destination": "Kasol Village"}
 
     @pytest.mark.asyncio
     async def test_a_correction_counts_as_progress(self):

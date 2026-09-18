@@ -977,6 +977,46 @@
         `;
         col.appendChild(card);
 
+      } else if (type === "change_confirmation" || type === "change_options") {
+        // A detail the rider is changing mid-conversation. `change_confirmation` names
+        // BOTH sides of each field and waits for a yes — nothing has moved yet when
+        // this arrives. `change_options` lists what we hold, for them to pick from.
+        // Rendered as taps because that is how the app should do it; the reply text
+        // carries the same question for any client that draws no cards.
+        const confirming = type === "change_confirmation";
+        const rows = (confirming ? payload.changes : payload.fields) || [];
+        const card = document.createElement("div");
+        card.className = "event-card";
+        card.innerHTML = `
+          <div class="event-card-header">
+            <span class="event-card-icon">✏️</span>
+            <span class="event-card-title">${confirming ? "Confirm this change" : "What would you like to change?"}</span>
+          </div>
+          <div class="event-card-body">
+            ${rows.map(r => `<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0">
+              <span style="opacity:.7">${r.label}</span>
+              <strong>${confirming ? `${r.current} → ${r.proposed}` : r.current}</strong>
+            </div>`).join("")}
+          </div>
+        `;
+        if (confirming) {
+          const actions = document.createElement("div");
+          actions.className = "event-card-body";
+          actions.style.display = "flex";
+          actions.style.gap = "8px";
+          [["Yes, update", "haan"], ["No, keep it", "nahi"]].forEach(([label, reply]) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.style.cssText =
+              "flex:1;padding:8px;border-radius:8px;border:1px solid #c9d2e0;cursor:pointer";
+            button.onclick = () => sendMessage(reply);
+            actions.appendChild(button);
+          });
+          card.appendChild(actions);
+        }
+        col.appendChild(card);
+
       } else if (type !== "") {
         // Generic fallback card
         const card = document.createElement("div");

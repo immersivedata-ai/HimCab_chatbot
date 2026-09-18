@@ -755,6 +755,45 @@
         if (structured.length) {
           const parentCol = bubble.parentElement;
           structured.forEach(ev => {
+            const payload = ev.payload || {};
+            // A detail the rider is changing mid-conversation. Nothing has moved yet
+            // when a `change_confirmation` arrives — it is waiting on a yes — so this
+            // renders the pairs and the two replies as taps rather than as JSON.
+            if (ev.type === "change_confirmation" || ev.type === "change_options") {
+              const confirming = ev.type === "change_confirmation";
+              const rows = (confirming ? payload.changes : payload.fields) || [];
+              const card = document.createElement("div");
+              card.className = "structured-card";
+              const title = document.createElement("div");
+              title.className = "structured-card-title";
+              title.textContent = confirming
+                ? "Confirm this change" : "What would you like to change?";
+              card.appendChild(title);
+              rows.forEach(row => {
+                const line = document.createElement("div");
+                line.className = "structured-card-body";
+                line.textContent = confirming
+                  ? `${row.label}: ${row.current} → ${row.proposed}`
+                  : `${row.label}: ${row.current}`;
+                card.appendChild(line);
+              });
+              if (confirming) {
+                const actions = document.createElement("div");
+                actions.style.cssText = "display:flex;gap:8px;margin-top:8px";
+                [["Yes, update", "haan"], ["No, keep it", "nahi"]].forEach(([label, reply]) => {
+                  const button = document.createElement("button");
+                  button.type = "button";
+                  button.textContent = label;
+                  button.style.cssText =
+                    "flex:1;padding:8px;border-radius:8px;border:1px solid #c9d2e0;cursor:pointer";
+                  button.onclick = () => sendMessage(reply);
+                  actions.appendChild(button);
+                });
+                card.appendChild(actions);
+              }
+              parentCol.appendChild(card);
+              return;
+            }
             const card = document.createElement("div");
             card.className = "structured-card";
             const title = document.createElement("div");

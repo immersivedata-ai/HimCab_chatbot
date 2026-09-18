@@ -45,6 +45,11 @@ class AgentState(BaseModel):
     visitor_type: Optional[str] = None    # "outstation" | "local" — classified by Router/Planner
     needs_clarification: bool = False     # True if Planner needs more info
     clarification_question: Optional[str] = None
+    #: One line saying which detail just changed, set by the planner when a rider
+    #: confirms a modification. Prepended to the reply by the writer: everything
+    #: downstream is rebuilt from the entities, so the reply already SHOWS the new
+    #: value, but nothing in it says the value moved or why.
+    change_note: Optional[str] = None
     last_asked_field: Optional[str] = None  # Which entity field was asked last turn — prevents re-asking
 
     # ── What the Planner could NOT confirm (from app/agent/slots.py) ──────────
