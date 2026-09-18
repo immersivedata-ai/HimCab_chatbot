@@ -122,6 +122,12 @@ _NOT_A_PLACE = {
     # against the device's fix instead. Same failure as "cancel" above, same fix.
     "here", "there", "loc", "position", "spot", "yahan", "yahin",
     "idhar", "yaha", "yhan", "wahan", "jagah", "यहाँ", "यहीं", "इधर",
+    # Agreeing. Same failure as "cancel" and "here": "thik hai" is two ordinary words,
+    # so it passed this parser and the rider who had just said "fine" had their
+    # destination set to the town of Thik Hai. The bare ones ("ok", "haan", "yes") are
+    # already in `_NON_ANSWERS` above; these are the phrasings that were not.
+    "thik", "theek", "sahi", "achha", "accha", "acha", "okey", "yeah", "yep",
+    "fine", "good", "great", "ठीक", "सही",
 }
 
 _QUESTION_HINTS = ("?", "kya ", "kaise", "kahan ", "kaunsa", "what ", "which ", "how ", "why ")
@@ -551,13 +557,13 @@ _SENTENCE_FROM_RES = (
         re.compile(
             r"\b(?:from|starting\s+(?:at|from)|pick\s*me\s*up\s*(?:from|at|in)?"
             r"|pick\s*up\s*(?:from|at|in)|pickup\s*(?:from|at|in)?)\s+"
-            r"([a-z][a-z' ]{2,39})",
+            r"([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
             re.IGNORECASE,
         ),
         "after",
     ),
     (
-        re.compile(r"\b([a-z][a-z' ]{2,39})\s+se\b", re.IGNORECASE),
+        re.compile(r"\b([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})\s+se\b", re.IGNORECASE),
         "before",
     ),
 )
@@ -571,6 +577,10 @@ _PLACE_STOP_WORDS = {
     "baje", "बजे", "hours", "hour", "hrs", "ghante", "ghanta", "day",
     "chahiye", "chahta", "chahti", "hai", "hain", "ko", "ke", "ka", "mein", "liye",
     "car", "cab", "gaadi", "gadi", "taxi", "rent", "rental", "hire", "want", "need",
+    # Adverbs that sit right before a corrected place. Trimmed rather than rejected:
+    # "ab kasol jana hai" is a genuine destination with "now" in front of it, and
+    # rejecting the pair loses the destination instead of the adverb.
+    "ab", "abhi", "just", "only", "still", "phir", "dubara", "wapas",
 }
 
 
@@ -603,29 +613,30 @@ def _place_beside_marker(text: str, patterns, stop_words: set) -> Optional[str]:
     yield the place "Mei Shimla".
 
     Patterns are tried in order and the first that yields a place `parse_place` accepts
-    wins, so a specific marker gets its turn before a general one.
+    wins, so a specific marker gets its turn before a general one. EVERY occurrence of a
+    pattern is tried, not just the first: in "I want to go from Delhi to Kasol" the
+    earliest "to" is "to go", which the gate rightly rejects — and stopping there lost
+    "to Kasol" and the destination with it.
     """
     for pattern, side in patterns:
-        match = pattern.search(text)
-        if not match:
-            continue
-        candidate = match.group(1).split()
-        if side == "before":
-            candidate = candidate[::-1]
-        words: list[str] = []
-        for word in candidate:
-            if word.lower() in stop_words:
-                break
-            words.append(word)
-            if len(words) == 3:
-                break
-        if side == "before":
-            words = words[::-1]
-        # `parse_place` is the gate, so every rejection this module already makes —
-        # request words, the rental vocabulary, date words — applies here too.
-        place = parse_place(" ".join(words)) if words else None
-        if place:
-            return place
+        for match in pattern.finditer(text):
+            candidate = match.group(1).split()
+            if side == "before":
+                candidate = candidate[::-1]
+            words: list[str] = []
+            for word in candidate:
+                if word.lower() in stop_words:
+                    break
+                words.append(word)
+                if len(words) == 3:
+                    break
+            if side == "before":
+                words = words[::-1]
+            # `parse_place` is the gate, so every rejection this module already makes —
+            # request words, the rental vocabulary, date words — applies here too.
+            place = parse_place(" ".join(words)) if words else None
+            if place:
+                return place
     return None
 
 
@@ -672,7 +683,34 @@ _TRIP_PLACE_STOP_WORDS = _PLACE_STOP_WORDS | {
     # gate, and loses the DESTINATION rather than just the date sitting after it.
     "next", "this", "coming", "week", "weekend", "month", "days", "din", "dino",
     "nights", "agle", "agla", "agli", "hafte", "hafta", "mahine", "mahina", "baad",
+    # Connectors that sit BETWEEN two places. "palampur se lekar kasol jana hai" is
+    # "from Palampur through to Kasol", and without "lekar" the destination scan
+    # collected it into the name and answered "Lekar Kasol".
+    "lekar", "leke", "hoke", "hokar", "hote", "hue", "via", "through", "towards", "toward",
+    "upto", "till", "until", "then", "aur", "phir",
+    # Changing your mind. These sit immediately before the corrected place, so without
+    # them "actually Manali" reads as the place "Actually Manali" -- which differs from
+    # the stored "Manali" and reports a change the rider never made.
+    "actually", "instead", "rather", "sorry", "meant", "mean", "correction", "scratch",
+    "change", "changed", "changing", "update", "updated", "make", "made", "nahi",
+    "nahin", "nhi", "galat", "badal", "badlo", "badalna", "karo", "kar", "do", "dijiye",
 }
+
+#: A place named as the PICKUP but carrying a marker the destination rules also claim.
+#: "change the pickup to Shimla" and "pickup ko Shimla kar do" both put the place after
+#: a `to`/`ko`, so the bare "to X" rule read Shimla as the far end of the trip and moved
+#: the wrong end of it. Scanned before the destination, and it wins the place it finds.
+_PICKUP_MARKER_RES = (
+    (
+        re.compile(
+            r"\b(?:pick\s*up|pickup|boarding|origin)\s*"
+            r"(?:location|point|spot|place|city|address)?\s*"
+            r"(?:ko|to|as|is|at|=|:)?\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+)
 
 #: Where a DESTINATION sits relative to its marker. Ordered most specific first: the
 #: first pattern that yields a place `parse_place` accepts wins, so "I want to go to
@@ -682,21 +720,21 @@ _SENTENCE_TO_RES = (
     (
         re.compile(
             r"\b(?:go(?:ing)?|head(?:ing|ed)?|fly(?:ing)?|driv(?:e|ing)"
-            r"|travel(?:ling|ing)?|reach(?:ing)?)\s+to\s+([a-z][a-z' ]{2,39})",
+            r"|travel(?:ling|ing)?|reach(?:ing)?)\s+to\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
             re.IGNORECASE,
         ),
         "after",
     ),
     (
         re.compile(
-            r"\b(?:trip|tour|holiday|vacation|journey|getaway)\s+to\s+([a-z][a-z' ]{2,39})",
+            r"\b(?:trip|tour|holiday|vacation|journey|getaway)\s+to\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
             re.IGNORECASE,
         ),
         "after",
     ),
     (
         re.compile(
-            r"\b(?:visit(?:ing)?|explor(?:e|ing)|see)\s+([a-z][a-z' ]{2,39})",
+            r"\b(?:visit(?:ing)?|explor(?:e|ing)|see)\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
             re.IGNORECASE,
         ),
         "after",
@@ -704,7 +742,7 @@ _SENTENCE_TO_RES = (
     # Hindi and Hinglish — the place PRECEDES the marker.
     (
         re.compile(
-            r"\b([a-z][a-z' ]{2,39})\s+(?:jana|jaana|jaunga|jaungi|jaenge|jayenge"
+            r"\b([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})\s+(?:jana|jaana|jaunga|jaungi|jaenge|jayenge"
             r"|ghumna|ghoomna|ghoom|dekhna|chalna|chalenge|chalein)\b",
             re.IGNORECASE,
         ),
@@ -713,18 +751,18 @@ _SENTENCE_TO_RES = (
     (
         # "manali ja rahe hain" — the present continuous, and the commonest way a
         # Hinglish sentence says where somebody is headed.
-        re.compile(r"\b([a-z][a-z' ]{2,39})\s+ja\s+rah[aeiou]\b", re.IGNORECASE),
+        re.compile(r"\b([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})\s+ja\s+rah[aeiou]\b", re.IGNORECASE),
         "before",
     ),
     (
-        re.compile(r"\b([a-z][a-z' ]{2,39})\s+tak\b", re.IGNORECASE),
+        re.compile(r"\b([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})\s+tak\b", re.IGNORECASE),
         "before",
     ),
     # Last resort. Deliberately last: a bare "to" also matches "to go", which
     # `parse_place` then rejects as request vocabulary, so the specific rules above
     # get their turn first.
     (
-        re.compile(r"\bto\s+([a-z][a-z' ]{2,39})", re.IGNORECASE),
+        re.compile(r"\bto\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})", re.IGNORECASE),
         "after",
     ),
 )
@@ -758,14 +796,28 @@ def read_trip_details(text: str) -> dict[str, Any]:
     low = stripped.lower()
     found: dict[str, Any] = {}
 
+    # The pickup claims its place first -- see `_PICKUP_MARKER_RES`. Without this,
+    # "change the pickup to Shimla" moved the DESTINATION to Shimla.
+    named_pickup = _place_beside_marker(
+        stripped, _PICKUP_MARKER_RES, _TRIP_PLACE_STOP_WORDS
+    )
+
     destination = _place_beside_marker(stripped, _SENTENCE_TO_RES, _TRIP_PLACE_STOP_WORDS)
-    if destination:
+    if destination and destination != named_pickup:
         found["destination"] = destination
+    else:
+        destination = None
 
     # "shimla se manali jana hai" — the same sentence carries both ends. `se`/`from` is
     # the origin marker and is a stop word for the destination scan, so the two cannot
     # read each other's place.
-    origin = _place_from_sentence(stripped)
+    # The TRIP stop words, not the pickup ones. `_place_from_sentence` is the rental
+    # pickup scan and knows nothing of "mujhe" — so "mujhe palampur se ... jana hai"
+    # collected backwards from `se` and produced the place "Mujhe Palampur", which then
+    # went into the reply heading verbatim.
+    origin = named_pickup or _place_beside_marker(
+        stripped, _SENTENCE_FROM_RES, _TRIP_PLACE_STOP_WORDS
+    )
     if origin and origin != destination:
         found["origin"] = origin
 
@@ -851,7 +903,12 @@ def read_rental_details(text: str) -> dict[str, Any]:
                 found["group_size"] = size
             break
 
-    place = _place_from_sentence(text.strip())
+    # `_PICKUP_MARKER_RES` first, for the same reason as in `read_trip_details`: it
+    # reads "change the pickup to Manali", where the place follows a `to` that the
+    # plain pickup patterns do not cover.
+    place = _place_beside_marker(
+        text.strip(), _PICKUP_MARKER_RES, _PLACE_STOP_WORDS
+    ) or _place_from_sentence(text.strip())
     if place:
         found["origin"] = place
 
@@ -901,6 +958,102 @@ def parse_return_preference(text: str) -> Optional[str]:
 
 def _in_range(value: int, lo: int, hi: int) -> Optional[int]:
     return value if lo <= value <= hi else None
+
+
+
+# ── Changing your mind ──────────────────────────────────────────────
+#
+# "the rider gave their pickup and drop, then changed their mind to update the location"
+# — and the assistant carried on with the old one.
+#
+# The obvious design is a second classifier: ask a model whether this turn is a
+# destination change, a date change, a pickup change. It is also the wrong one. It puts
+# a network round trip on EVERY turn to decide something the system can already see, it
+# can be wrong, and it stops working when Vertex is down.
+#
+# A change is not a classification. It is a COMPARISON. Every slot the rider has
+# answered is already stored on the session, and the readers above already pull values
+# out of a sentence with no model at all. So a change is simply: this turn states a
+# value for a slot that already holds a DIFFERENT one. That is a dict lookup — tens of
+# microseconds, no tokens, no failure mode — exactly as `looks_like_cancellation` is a
+# lookup rather than an "is this a cancellation?" call.
+#
+# Two shapes of correction, handled in two places:
+#
+#   A sentence — "ab kasol jana hai", "change the pickup to Shimla". The readers above
+#   anchor every value on an unmistakable marker, so the marker IS the signal that the
+#   rider means to replace rather than merely mention; a place named without one
+#   ("what's the weather in Shimla?") yields nothing and can overwrite nothing. The
+#   planner compares what they read against what is stored. See `planner._resolve`.
+#
+#   A bare reply — "actually Kasol", "nahi, Kasol", or just "Kasol". No marker to
+#   anchor on, so it is only unambiguous while the assistant's own question is in
+#   flight. That is `read_correction_to_asked`, below.
+
+#: Phrasings that introduce a replacement and are not part of the answer itself.
+#: Stripped from a bare reply before it is parsed: left in, "actually make it Kasol" is
+#: four words, `parse_place` rejects it for length, and the correction is lost.
+_CORRECTION_PREFIXES = (
+    "sorry i meant", "sorry i mean", "scratch that", "changed my mind",
+    "i meant", "i mean", "change it to", "change to", "change the", "change",
+    "update it to", "update to", "update", "make it", "lets make it", "let's make it",
+    "correction", "actually", "instead", "rather", "sorry", "nope", "no",
+    "nahi", "nahin", "nhi", "galat", "badal do", "badal", "badlo", "arre", "oh",
+)
+
+
+def strip_correction_prefix(text: str) -> str:
+    """`text` with any leading "actually" / "make it" / "nahi" phrasing removed.
+
+    Applied repeatedly, because riders stack them: "actually, no, make it Kasol".
+    """
+    out = text.strip()
+    while True:
+        low = out.lower()
+        for prefix in _CORRECTION_PREFIXES:
+            if low.startswith(prefix) and (
+                len(low) == len(prefix) or not low[len(prefix)].isalnum()
+            ):
+                out = out[len(prefix) :].lstrip(" ,.!-:—")
+                break
+        else:
+            return out
+
+
+def read_correction_to_asked(
+    asked_field: Optional[str], text: str, current: Any
+) -> Any:
+    """The new value for `asked_field` when a bare reply changes it, else None.
+
+    `read_answer` deliberately refuses a field that already holds a value — it is a
+    net for a MISSED answer, and letting it fire on a filled slot would let any stray
+    word overwrite a confirmed detail. But that refusal is also why "nahi, Kasol"
+    landed nowhere once a destination was in.
+
+    The narrow case where a bare reply is unambiguous is this one: the assistant asked
+    this exact field last turn. `last_asked_field` is rewritten by `_resolve` every
+    turn and is None when nothing was asked, so the window is one turn wide. Within it,
+    `SLOTS[asked_field].parse` is typed to that field — a reply it cannot read yields
+    nothing and changes nothing.
+    """
+    if not asked_field or asked_field not in SLOTS or not text or not text.strip():
+        return None
+    if current in (None, "", [], {}):
+        return None  # Nothing to correct; filling an empty slot is `read_answer`'s job.
+
+    bare = strip_correction_prefix(text)
+    if not bare:
+        return None
+
+    stated = SLOTS[asked_field].parse(bare)
+    if stated is None:
+        return None
+    if isinstance(stated, str) and isinstance(current, str):
+        if stated.strip().casefold() == current.strip().casefold():
+            return None  # Restating what we hold is not a change.
+    elif stated == current:
+        return None
+    return stated
 
 
 # ── Slot definitions ──────────────────────────────────────────────────────────

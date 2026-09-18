@@ -596,6 +596,9 @@ Report what the user has stated. Use null for anything they have not."""
     # ── Read the reply as an answer to the question we asked ──────────────────
     # Strictly scoped: only the fields that question covered, only if the reply has
     # the right shape. A safety net for a missed one-word answer, not an interpreter.
+    corrected: dict[str, Any] = {}
+    bare_correction: Optional[str] = None
+
     recovered = slots.read_answer(previously_asked, latest_text, merged, visitor_type) if latest_text else None
     if recovered:
         log.info("short_answer_recovered", field=recovered, session_id=state.session_id)
@@ -616,6 +619,28 @@ Report what the user has stated. Use null for anything they have not."""
                 if visitor_type == LOCAL and recovered_in_hp and not merged.get("home_city"):
                     merged["home_city"] = merged.get("origin")
 
+    # ── Read the reply as a CORRECTION to the question we asked ────────────
+    # `read_answer` above only fills an EMPTY slot. A bare reply that changes one that
+    # is already filled — "nahi, Kasol" after the destination is in — landed nowhere.
+    # Guarded to the field the assistant itself asked last turn, and to the case where
+    # the model left the old value standing: reading a whole conversation is the
+    # model's strength, so a correction IT already caught wins and this never fights it.
+    if latest_text and previously_asked:
+        asked_slot = slots.SLOTS.get(previously_asked)
+        stored = existing_entities.get(previously_asked)
+        if asked_slot and _same_value(merged.get(previously_asked), stored):
+            new_value = slots.read_correction_to_asked(
+                previously_asked, latest_text, merged.get(previously_asked)
+            )
+            if new_value is not None:
+                merged[previously_asked] = new_value
+                bare_correction = previously_asked
+                log.info(
+                    "bare_answer_corrected",
+                    field=previously_asked,
+                    session_id=state.session_id,
+                )
+
     # ── Read the whole sentence, in code ──────────────────────────────────────
     # `read_answer` above handles a BARE reply to the question in flight ("manali").
     # This handles the other thing riders actually type — a sentence — which used to
@@ -632,7 +657,6 @@ Report what the user has stated. Use null for anything they have not."""
     # Every value here is anchored on an unmistakable marker — see the two readers in
     # `slots`. A marker-anchored value fills an EMPTY slot, and it also CORRECTS a slot
     # that already holds one when the rider changes their mind — see `corrected` below.
-    corrected: dict[str, Any] = {}
     if latest_text:
         reader = slots.read_rental_details if is_rental else slots.read_trip_details
         filled: dict[str, Any] = {}
@@ -675,7 +699,7 @@ Report what the user has stated. Use null for anything they have not."""
         # extracted origin does above: "actually, start from Delhi" turns a resident's
         # ride into a visitor's transfer. Skipped for a rental, where the pickup never
         # sets the persona (`classify_visitor_type` returns RENTAL regardless).
-        if "origin" in corrected and not is_rental:
+        if ("origin" in corrected or bare_correction == "origin") and not is_rental:
             corrected_in_hp = await geo.place_in_himachal(merged["origin"])
             visitor_type = await classify_visitor_type(
                 merged.get("origin"),
@@ -744,7 +768,7 @@ Report what the user has stated. Use null for anything they have not."""
     # us a real, different value. Without `or corrected`, a turn that only changes an
     # already-known detail would count as no progress and inch the agent towards giving
     # up on a rider who is actively engaged.
-    if (_known_slots(entities) - known_before) or corrected:
+    if (_known_slots(entities) - known_before) or corrected or bare_correction:
         entities.no_progress_turns = 0
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1

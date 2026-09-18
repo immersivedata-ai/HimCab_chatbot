@@ -53,7 +53,11 @@ def _answers_the_question(asked_field: str, text: str) -> bool:
     if slot is None or not text or not text.strip():
         return False
     try:
-        return slot.parse(text.strip()) is not None
+        # The same strip the planner applies before it reads a correction. Without it
+        # the two DO disagree: "nahi, Kasol" is a correction the planner will act on,
+        # but the bare parser reads four words and rejects it, so the turn is routed
+        # as something other than an answer to the question still on screen.
+        return slot.parse(slots.strip_correction_prefix(text)) is not None
     except Exception:  # a parser must never take down the turn
         return False
 
