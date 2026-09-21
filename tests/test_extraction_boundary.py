@@ -42,6 +42,7 @@ from app.agent.nodes.planner import (
     _VertexExtraction,
 )
 from app.domain.itinerary import BudgetRange, GroupType
+from tests.conftest import stub_vertex
 
 
 class TestTheWireSchemaIsSomethingVertexCanAccept:
@@ -215,13 +216,13 @@ class TestABlankExtractionIsRetriedNotCrashed:
     async def test_a_none_on_the_first_call_is_retried(self):
         """One blank must not cost the rider the turn. The whole reported failure was
         this case going unretried and unnoticed."""
-        from tests.conftest import wire_extraction
+        from tests.conftest import stub_vertex, wire_extraction
 
         planner_node, state, ctx, llm = self._planner_with(
             [None, wire_extraction(destination="Kasol", origin_in_himachal=True)]
         )
         with ctx as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         assert result["entities"].destination == "Kasol"
@@ -234,7 +235,7 @@ class TestABlankExtractionIsRetriedNotCrashed:
         and sent everyone looking for a bug in the planner rather than in the schema."""
         planner_node, state, ctx, llm = self._planner_with([None, None])
         with ctx as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         # The deterministic reader still gets the destination out of the sentence, which
@@ -243,20 +244,24 @@ class TestABlankExtractionIsRetriedNotCrashed:
         assert result["entities"] is not None
 
     @pytest.mark.asyncio
-    async def test_json_mode_is_what_is_asked_for(self):
-        """The mode is half the fix; flat scalars alone still failed 19 times in 25."""
-        from tests.conftest import wire_extraction
+    async def test_json_mode_and_the_wire_model_are_what_is_asked_for(self):
+        """The mode is half the fix; flat scalars alone still failed 19 times in 25.
+
+        Asserted on the SERVICE call, because `structured()` is where the two halves are
+        put together — and where the standby model is composed behind them.
+        """
+        from tests.conftest import stub_vertex, wire_extraction
 
         planner_node, state, ctx, llm = self._planner_with(
             [wire_extraction(destination="Kasol")]
         )
         with ctx as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             await planner_node(state)
 
-        _args, kwargs = llm.with_structured_output.call_args
+        args, kwargs = svc.return_value.structured.call_args
+        assert args[0] is _VertexExtraction
         assert kwargs.get("method") == "json_mode"
-        assert llm.with_structured_output.call_args[0][0] is _VertexExtraction
 
 
 class TestAnEmptyBubbleIsNeverShipped:

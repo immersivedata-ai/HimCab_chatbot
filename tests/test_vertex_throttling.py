@@ -33,6 +33,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.domain.conversation import ExtractedEntities
+from tests.conftest import stub_vertex
 
 
 def _429() -> ResourceExhausted:
@@ -52,11 +53,17 @@ class TestTheClientIsConfiguredToBeAGoodCitizen:
 
         return get_vertex_ai_service()
 
-    def test_langchains_invisible_retry_is_bounded(self, service):
-        """The default is 6. Six retries into an exhausted pool is six more requests
-        that will also fail, and the only sign is a warning nobody is watching."""
-        for model in (service.gemini_flash, service.gemini_flash_structured):
-            assert model.max_retries == settings.vertex_max_retries
+    def test_langchains_invisible_retry_is_never_left_at_the_default(self, service):
+        """The default is 6, and the only sign of it is a warning nobody is watching.
+        Six retries into an exhausted pool is six more requests that will also fail.
+
+        The exact number differs by role — the primary does not retry at all when a
+        standby exists, see `TestTheStandbyModel` — but NOTHING here may sit at 6.
+        """
+        models = [service.gemini_flash, service.gemini_flash_structured]
+        models += [m for m in (service.fallback_flash, service.fallback_structured) if m]
+        for model in models:
+            assert model.max_retries <= settings.vertex_max_retries
             assert model.max_retries < 6
 
     def test_both_clients_are_paced(self, service):
@@ -141,7 +148,7 @@ class TestAThrottledPlannerDegradesWithoutReAsking:
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(side_effect=_429())
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             await planner_node(self._state())
 
         assert llm.with_structured_output.return_value.ainvoke.await_count == 1
@@ -155,7 +162,7 @@ class TestAThrottledPlannerDegradesWithoutReAsking:
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(side_effect=_429())
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(self._state())
 
         assert result["entities"].destination == "Kasol"
@@ -165,14 +172,14 @@ class TestAThrottledPlannerDegradesWithoutReAsking:
         """Throttling is not the only reason a call comes back empty, and the retry that
         exists for the other reason must survive this change."""
         from app.agent.nodes.planner import planner_node
-        from tests.conftest import wire_extraction
+        from tests.conftest import stub_vertex, wire_extraction
 
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
             side_effect=[None, wire_extraction(destination="Kasol")]
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             await planner_node(self._state())
 
         assert llm.with_structured_output.return_value.ainvoke.await_count == 2
@@ -189,7 +196,7 @@ class TestAThrottledPlannerDegradesWithoutReAsking:
                 side_effect=[None, None]
             )
             with patch.object(planner_mod, "get_vertex_ai_service") as svc:
-                svc.return_value.get_flash_model.return_value = llm
+                stub_vertex(svc, llm)
                 await planner_mod.planner_node(self._state())
 
         backoff.assert_awaited()
@@ -235,7 +242,7 @@ class TestAThrottledWriterSaysSo:
         llm = MagicMock()
         llm.ainvoke = AsyncMock(side_effect=_429())
         with patch("app.agent.nodes.writer.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await writer_node(self._state(message))
 
         assert marker in result["final_response_text"]
@@ -251,9 +258,72 @@ class TestAThrottledWriterSaysSo:
         llm = MagicMock()
         llm.ainvoke = AsyncMock(side_effect=_429())
         with patch("app.agent.nodes.writer.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await writer_node(self._state())
 
         assert result.get("structured_itinerary") is None
         for invented in ("₹", "Day 1"):
             assert invented not in result["final_response_text"]
+
+
+class TestTheStandbyModel:
+    """Quota on Vertex is PER MODEL, and the pools are not the same size.
+
+    Measured on this project during the outage, same region, same minute:
+    `gemini-2.5-flash-lite` returned 429 on 8 of 8 calls while `gemini-2.5-flash`
+    answered 8 of 8. A cheap model with no capacity is not cheaper than a dearer one
+    that works — it is an outage.
+    """
+
+    @pytest.fixture(scope="class")
+    def service(self):
+        from app.services.vertex_ai import get_vertex_ai_service
+
+        return get_vertex_ai_service()
+
+    def test_there_is_one(self, service):
+        assert service.fallback_name
+        assert service.fallback_name != settings.gemini_flash_model
+
+    def test_the_primary_does_not_climb_a_retry_ladder_first(self, service):
+        """Retrying and failing over are two answers to the same question, and paying
+        for both is the worst of each. With `max_retries=2` on the primary, one planner
+        call against an exhausted pool took 24 SECONDS to reach the standby — three
+        calls a turn, past the per-call timeout for the slower ones. Now ~9s."""
+        assert service.primary_model(streaming=False).max_retries == 0
+
+    def test_the_standby_still_retries(self, service):
+        """By then there is nowhere else to go, so a short ladder is worth walking."""
+        assert service.fallback_structured.max_retries == settings.vertex_max_retries
+
+    def test_only_a_429_fails_over(self, service):
+        """A fallback that catches everything hides real faults: a bad schema would be
+        retried against a second model, fail there too, cost twice as much, and report
+        the error from the wrong place."""
+        runnable = service.get_flash_model(streaming=False)
+        assert runnable.exceptions_to_handle == (ResourceExhausted,)
+
+    def test_the_structured_path_has_one_too(self, service):
+        """The planner's path. `with_structured_output` is a method on `ChatVertexAI`
+        and not on the wrapper, so the two have to be composed in this order — easy to
+        get backwards, and backwards means no standby at all."""
+        from app.agent.nodes.planner import _VertexExtraction
+
+        runnable = service.structured(_VertexExtraction)
+        assert runnable.exceptions_to_handle == (ResourceExhausted,)
+
+    def test_it_can_be_turned_off(self, monkeypatch):
+        """One env var, because the right answer changes with what the pools are doing
+        and nobody should need a deploy to find out."""
+        import app.services.vertex_ai as vx
+
+        monkeypatch.setattr(settings, "gemini_fallback_model", "")
+        monkeypatch.setattr(vx, "_vertex_ai_service", None)
+        service = vx.get_vertex_ai_service()
+        try:
+            assert service.fallback_name == ""
+            assert service.fallback_structured is None
+            # No standby means the primary must go back to retrying for itself.
+            assert service.primary_model(streaming=False).max_retries == settings.vertex_max_retries
+        finally:
+            monkeypatch.setattr(vx, "_vertex_ai_service", None)

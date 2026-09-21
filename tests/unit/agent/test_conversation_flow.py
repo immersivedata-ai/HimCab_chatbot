@@ -32,7 +32,7 @@ from app.agent.nodes.planner import planner_node
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.domain.conversation import ExtractedEntities
-from tests.conftest import wire_extraction
+from tests.conftest import stub_vertex, wire_extraction
 
 # ── Harness ───────────────────────────────────────────────────────────────────
 
@@ -96,7 +96,7 @@ class Conversation:
             visitor_type=self.visitor_type,
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = _stub_extractor(extraction)
+            stub_vertex(svc, _stub_extractor(extraction))
             result = await planner_node(state)
 
         self.entities = result["entities"]

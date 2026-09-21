@@ -34,6 +34,7 @@ from datetime import date, timedelta
 import pytest
 
 from app.agent import sanitize, slots
+from tests.conftest import stub_vertex
 
 #: A Monday, so a weekday-adjacent bug shows up as a weekday rather than by luck.
 TODAY = date(2026, 9, 21)
@@ -288,7 +289,7 @@ class TestWhatTheRiderActuallySees:
             return_value=wire_extraction(**extraction)
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         after = AgentState(

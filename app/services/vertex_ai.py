@@ -11,7 +11,9 @@ Provides async wrappers for:
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+from google.api_core.exceptions import ResourceExhausted
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -61,13 +63,25 @@ class VertexAIService:
         # Flash only. The Pro model was instantiated on every startup and never called:
         # the router and planner do classification and extraction, and the writer is
         # latency-critical — Flash is the right tier for all three.
-        shared = {
+        # WITH a standby configured, the primary does not retry at all.
+        #
+        # Retrying and failing over are two answers to the same question, and paying for
+        # both is the worst of each. Measured against a genuinely exhausted primary:
+        # `max_retries=2` spent 24 SECONDS climbing the backoff ladder before handing
+        # over — three calls a turn, so over a minute of a rider watching a spinner, and
+        # past the 45s per-call timeout for the slower ones. The standby is the retry,
+        # and it is a retry against a pool that actually has room.
+        #
+        # The standby itself keeps `vertex_max_retries`: by then there is nowhere else
+        # to go, so a short ladder is worth walking.
+        retries = 0 if (settings.gemini_fallback_model or "").strip() else settings.vertex_max_retries
+        shared: dict[str, Any] = {
             "model_name": settings.gemini_flash_model,
             "project": settings.gcp_project_id,
             "location": settings.vertex_ai_location,
             "max_output_tokens": 4096,
             "rate_limiter": limiter,
-            "max_retries": settings.vertex_max_retries,
+            "max_retries": retries,
         }
 
         # Gemini Flash — used in Writer node (speed + streaming)
@@ -78,18 +92,79 @@ class VertexAIService:
             temperature=0.4, streaming=False, **shared
         )
 
+        # The standby. Quota on Vertex is PER MODEL, and the pools are not the same
+        # size: measured on this project while production was down, flash-lite returned
+        # 429 on 8 of 8 calls while flash answered 8 of 8, same region, same minute. The
+        # cheap model stays primary and this is used only when its pool is empty, so the
+        # dearer one is billed for the calls that would otherwise have been an outage.
+        self.fallback_name: str = (settings.gemini_fallback_model or "").strip()
+        self.fallback_flash: Optional[ChatVertexAI] = None
+        self.fallback_structured: Optional[ChatVertexAI] = None
+        if self.fallback_name and self.fallback_name != settings.gemini_flash_model:
+            standby: dict[str, Any] = {
+                **shared,
+                "model_name": self.fallback_name,
+                "max_retries": settings.vertex_max_retries,
+            }
+            self.fallback_flash = ChatVertexAI(
+                temperature=0.8, streaming=True, **standby
+            )
+            self.fallback_structured = ChatVertexAI(
+                temperature=0.4, streaming=False, **standby
+            )
+        else:
+            self.fallback_name = ""
+
         log.info(
             "vertex_ai_initialized",
             flash_model=settings.gemini_flash_model,
+            fallback_model=self.fallback_name or None,
             location=settings.vertex_ai_location,
-            max_retries=settings.vertex_max_retries,
+            primary_max_retries=retries,
+            standby_max_retries=settings.vertex_max_retries,
             requests_per_second=settings.vertex_requests_per_second,
             max_in_flight=settings.vertex_max_in_flight,
         )
 
-    def get_flash_model(self, streaming: bool = True) -> ChatVertexAI:
-        """Return Gemini Flash for fast streaming responses."""
+    def get_flash_model(self, streaming: bool = True):
+        """The model to generate with — the standby already attached.
+
+        Returns a Runnable, not a bare `ChatVertexAI`: `with_fallbacks` wraps it. That
+        is invisible to `ainvoke`/`astream`, which is all the router and writer use, but
+        it does mean `.with_structured_output(...)` is NOT available on the result —
+        that method belongs to `ChatVertexAI`. The planner needs it, so it calls
+        `structured()` instead, which composes the two in the order that works.
+        """
+        return self._standby(
+            self.gemini_flash if streaming else self.gemini_flash_structured,
+            self.fallback_flash if streaming else self.fallback_structured,
+        )
+
+    def primary_model(self, streaming: bool = True) -> ChatVertexAI:
+        """The bare client, no standby. For callers that need `ChatVertexAI` itself."""
         return self.gemini_flash if streaming else self.gemini_flash_structured
+
+    def _standby(self, primary, fallback):
+        """`primary`, backed by `fallback` when the pool is empty.
+
+        ONLY `ResourceExhausted` is handled. A fallback that catches everything hides
+        real faults — a bad schema would be retried against a second model and fail
+        there too, at twice the cost and with the error reported from the wrong place.
+        """
+        if fallback is None:
+            return primary
+        return primary.with_fallbacks(
+            [fallback], exceptions_to_handle=(ResourceExhausted,)
+        )
+
+    def structured(self, schema, *, method: Literal["json_mode"] = "json_mode"):
+        """A structured-output runnable that survives the primary model being full."""
+        return self._standby(
+            self.gemini_flash_structured.with_structured_output(schema, method=method),
+            None if self.fallback_structured is None
+            else self.fallback_structured.with_structured_output(schema, method=method),
+        )
+
 
     async def count_tokens(self, text: str) -> int:
         """Estimate token count for a given text string."""

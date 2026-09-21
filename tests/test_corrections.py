@@ -23,6 +23,7 @@ from app.agent import slots
 from app.agent.nodes.router import _answers_the_question
 from app.agent.state import AgentState
 from app.domain.conversation import ExtractedEntities
+from tests.conftest import stub_vertex
 
 
 class TestASentenceThatChangesASlot:
@@ -240,7 +241,7 @@ class TestThePlannerActsOnTheChange:
             messages=[HumanMessage(content=message)],
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = self._stale_model(extraction)
+            stub_vertex(svc, self._stale_model(extraction))
             return await planner_node(state)
 
     @pytest.mark.asyncio

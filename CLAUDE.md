@@ -167,6 +167,28 @@ So, on every Vertex call:
 All of these are per-process. With `--max-instances=10` the fleet rate is ten times the
 per-instance rate; a true global cap belongs at the gateway or in the instance ceiling.
 
+### Quota is per MODEL, and the pools differ enormously
+
+Measured during the outage, same project, same region, same minute:
+
+| model | result |
+|---|---|
+| `gemini-2.5-flash-lite` | 429 on 8 of 8 |
+| `gemini-2.5-flash` | OK on 8 of 8 |
+| `gemini-2.0-flash`, `-lite` | 404, not available here |
+
+**A cheap model with no capacity is not cheaper than a dearer one that works — it is an
+outage.** So there is a standby: `gemini_fallback_model`, attached by
+`vertex_ai.get_flash_model()` and `structured()`, tripped only by `ResourceExhausted`.
+The cheap model stays primary and resumes the moment its pool recovers; the dearer one
+is billed only for calls that would otherwise have failed.
+
+With a standby configured **the primary does not retry at all**. Retrying and failing
+over are two answers to the same question and paying for both is the worst of each: at
+`max_retries=2` one call spent **24 seconds** climbing the ladder before handing over.
+Now ~9s. If the primary is down for a long stretch, set `GEMINI_FLASH_MODEL` to the
+model that works and skip the failed attempt entirely — that is a one-line env change.
+
 Tested and rejected: `location="global"` returns 501/404 with this SDK version. Another
 region may have capacity when `us-central1` does not — that is a deploy-time change
 (`VERTEX_AI_LOCATION`), not a code one.

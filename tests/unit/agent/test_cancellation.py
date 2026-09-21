@@ -32,6 +32,7 @@ from app.agent.state import AgentState
 from app.core.enums import CancelScope, Intent, ResponseMode
 from app.domain.conversation import ExtractedEntities
 from app.services.chat_session import RENTAL
+from tests.conftest import stub_vertex
 
 
 def _state(message: str, **kwargs) -> AgentState:
@@ -86,7 +87,7 @@ class TestACancellationIsRecognised:
             content='{"intent": "cancel_request", "language": "en", "confidence": 0.9}'
         ))
         with patch("app.agent.nodes.router.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await router_node(_state("you know what, scrap the whole thing"))
 
         assert result["intent"] == Intent.CANCEL_REQUEST
@@ -171,7 +172,7 @@ class TestWhatIsNotACancellation:
             content='{"intent": "clarification", "language": "en", "confidence": 0.9}'
         ))
         with patch("app.agent.nodes.router.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await router_node(_state("no, make it 5 hours instead"))
 
         assert result["intent"] != Intent.CANCEL_REQUEST

@@ -32,6 +32,20 @@ class Settings(BaseSettings):
     gemini_flash_model: str
     llm_call_timeout_seconds: float = 45.0    # hard cap so a stalled Vertex AI call can't hang a request forever
 
+    #: A SECOND model, used only when the first has no capacity left.
+    #:
+    #: Quota on Vertex is per model, and the two pools are not the same size. Measured
+    #: on this project while production was down: `gemini-2.5-flash-lite` returned 429
+    #: on 8 of 8 calls while `gemini-2.5-flash` answered 8 of 8, in the same region, in
+    #: the same minute. A cheap model with no capacity is not cheaper than a dearer one
+    #: that works — it is an outage.
+    #:
+    #: Preferred over simply switching `gemini_flash_model`, because this self-heals:
+    #: the cheap model stays primary and is used the moment its pool recovers, and the
+    #: dearer one is billed only for the calls that would otherwise have failed.
+    #: Set to "" to disable the fallback entirely.
+    gemini_fallback_model: str = "gemini-2.5-flash"
+
     # ── Staying inside Vertex's shared quota ──────────────────────────────────
     #
     # Gemini on Vertex runs on DYNAMIC SHARED QUOTA: capacity is a pool, a 429

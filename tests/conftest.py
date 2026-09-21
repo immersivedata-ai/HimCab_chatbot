@@ -254,3 +254,26 @@ def wire_extraction(**facts):
         else:
             wire[name] = value
     return _VertexExtraction(**wire)
+
+
+def stub_vertex(svc, llm):
+    """Wire a mocked `get_vertex_ai_service` so every path returns `llm`.
+
+    The service exposes three ways to reach a model and they are not interchangeable:
+
+      * `get_flash_model()` — a Runnable with the standby model already attached, used
+        by the router and writer. It is NOT a `ChatVertexAI`, so it has no
+        `.with_structured_output`.
+      * `structured(schema)` — the planner's path: the structured runnable, standby
+        composed behind it in the one order that works.
+      * `primary_model()` — the bare client, no standby.
+
+    A test that stubs only the first leaves the planner talking to a bare `MagicMock`,
+    whose `ainvoke` is not awaitable — which surfaces as `object MagicMock can't be used
+    in 'await' expression` inside an `except` block, i.e. as a silently degraded turn
+    rather than a failed assertion. Hence one helper, used everywhere.
+    """
+    svc.return_value.get_flash_model.return_value = llm
+    svc.return_value.primary_model.return_value = llm
+    svc.return_value.structured.return_value = llm.with_structured_output.return_value
+    return llm

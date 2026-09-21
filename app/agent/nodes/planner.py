@@ -708,11 +708,10 @@ Report what the user has stated. Use null for anything they have not."""
         # rather than `PlannerExtraction` — both are required together, and the note on
         # that class says why. In short: the default combination returned None on about
         # half of all calls and this one has not returned None yet.
-        llm = (
-            get_vertex_ai_service()
-            .get_flash_model(streaming=False)
-            .with_structured_output(_VertexExtraction, method="json_mode")
-        )
+        # `structured` rather than `get_flash_model(...).with_structured_output(...)`:
+        # same runnable, with the standby model behind it for when the primary's quota
+        # pool is empty. See `vertex_ai.structured`.
+        llm = get_vertex_ai_service().structured(_VertexExtraction, method="json_mode")
         messages = [
             SystemMessage(content=PLANNER_SYSTEM_PROMPT),
             HumanMessage(content=prompt),

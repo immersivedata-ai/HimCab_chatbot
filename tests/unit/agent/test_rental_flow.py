@@ -46,7 +46,7 @@ from app.integrations.himcab.rental_service import (
     distinct_packages,
 )
 from app.services.chat_session import RENTAL, resolve_persona, welcome_message
-from tests.conftest import wire_extraction
+from tests.conftest import stub_vertex, wire_extraction
 
 # What the rate card returns: a chart per category, so hours repeat across cabs. The
 # 12-hour chart is deliberately present and deliberately never offered — the backend
@@ -274,7 +274,7 @@ class TestTheRentalConversation:
             return_value=wire_extraction()
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         assert result["needs_clarification"] is True
@@ -1162,7 +1162,7 @@ class TestAnUnlistedDurationIsReAsked:
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc, \
              patch("app.integrations.himcab.rental_service.get_rental_service",
                    return_value=rental):
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             return await planner_node(state)
 
     @pytest.mark.asyncio
@@ -1710,7 +1710,7 @@ class TestASentenceIsReadInCode:
             return_value=wire_extraction(travel_dates="I am planning to travel today")
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         assert result["entities"].travel_dates == sanitize.today_ist().isoformat()
@@ -1737,7 +1737,7 @@ class TestASentenceIsReadInCode:
             return_value=wire_extraction()
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         entities = result["entities"]
@@ -1775,7 +1775,7 @@ class TestASentenceIsReadInCode:
             return_value=wire_extraction(rental_hours=4)
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         assert result["entities"].rental_hours == 4
@@ -1798,7 +1798,7 @@ class TestASentenceIsReadInCode:
             )
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
-            svc.return_value.get_flash_model.return_value = llm
+            stub_vertex(svc, llm)
             result = await planner_node(state)
 
         assert result["entities"].destination is None

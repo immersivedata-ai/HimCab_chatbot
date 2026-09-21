@@ -22,6 +22,7 @@ from app.agent.graph import get_agent_graph
 from app.agent.state import AgentState
 from app.domain.conversation import ExtractedEntities
 from app.domain.user import UserProfile
+from tests.conftest import stub_vertex
 
 ITINERARY_REPLY = """Assuming a 3-day trip — tell me if you'd like a different length.
 
@@ -138,11 +139,9 @@ class AgentHarness:
              patch("app.agent.nodes.persist.get_user_profile_service", lambda: profile_svc), \
              patch("app.agent.nodes.tool_executor.get_weather_service", lambda: weather_svc), \
              patch("app.agent.nodes.tool_executor.get_fare_service", lambda: fare_svc):
-            router_svc.return_value.get_flash_model.return_value = self._router_llm(
-                intent, language
-            )
-            planner_svc.return_value.get_flash_model.return_value = self._planner_llm(extraction)
-            writer_svc.return_value.get_flash_model.return_value = self._writer_llm(reply)
+            stub_vertex(router_svc, self._router_llm(intent, language))
+            stub_vertex(planner_svc, self._planner_llm(extraction))
+            stub_vertex(writer_svc, self._writer_llm(reply))
             return await get_agent_graph().ainvoke(state)
 
 

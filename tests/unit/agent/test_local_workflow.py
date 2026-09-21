@@ -15,6 +15,7 @@ from app.agent.nodes.router import router_node
 from app.agent.state import AgentState
 from app.domain.conversation import ExtractedEntities
 from app.domain.user import PastTrip, UserProfile
+from tests.conftest import stub_vertex
 
 
 def _mock_llm_response(json_str: str):
@@ -132,7 +133,7 @@ class TestPlannerLocalFlow:
         )
 
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
+            stub_vertex(mock_svc, _mock_structured_llm(planner_response))
             result = await planner_node(state)
 
         assert result["needs_clarification"] is False
@@ -172,7 +173,7 @@ class TestPlannerLocalFlow:
         )
 
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
+            stub_vertex(mock_svc, _mock_structured_llm(planner_response))
             result = await planner_node(state)
 
         assert result["needs_clarification"] is False
@@ -207,7 +208,7 @@ class TestPlannerLocalFlow:
         )
 
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as mock_svc:
-            mock_svc.return_value.get_flash_model.return_value = _mock_structured_llm(planner_response)
+            stub_vertex(mock_svc, _mock_structured_llm(planner_response))
             result = await planner_node(state)
 
         assert result["needs_clarification"] is True
