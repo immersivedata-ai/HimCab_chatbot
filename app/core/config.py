@@ -32,6 +32,40 @@ class Settings(BaseSettings):
     gemini_flash_model: str
     llm_call_timeout_seconds: float = 45.0    # hard cap so a stalled Vertex AI call can't hang a request forever
 
+    # ── Staying inside Vertex's shared quota ──────────────────────────────────
+    #
+    # Gemini on Vertex runs on DYNAMIC SHARED QUOTA: capacity is a pool, a 429
+    # `ResourceExhausted` means the pool is busy, and there is no quota increase to
+    # request — that is the documented answer. The only levers on this side are sending
+    # fewer requests and spreading them out. These three are those levers.
+    #
+    # Production hit sustained 429s. The arithmetic behind them: 3 model calls per turn,
+    # up to 800 concurrent turns (10 instances x 80 concurrency), and LangChain silently
+    # retrying each call six times — a pathological turn was 30 requests, and nothing
+    # anywhere bounded the total.
+
+    #: LangChain's own retry, which is invisible: `ChatVertexAI` defaults to 6 and the
+    #: only sign is a `Retrying ... ResourceExhausted` warning. Six retries into an
+    #: exhausted pool is six more requests that will also fail, so this is deliberately
+    #: low. Backoff is still exponential; we are shortening the ladder, not removing it.
+    vertex_max_retries: int = 2
+
+    #: Token-bucket pacing applied to every model call, PER PROCESS. With
+    #: `--max-instances=10` the fleet rate is ten times this, so treat it as a per-
+    #: instance brake rather than a global guarantee — a true global cap belongs at the
+    #: gateway, or in the instance ceiling. Same caveat as the rider rate limiter in
+    #: `local_cache.py`.
+    vertex_requests_per_second: float = 4.0
+    #: How much of a burst the bucket will absorb before pacing bites. A chat turn fires
+    #: its calls back to back, so a bucket smaller than one turn would add latency to
+    #: every single turn for no benefit.
+    vertex_burst_size: float = 8.0
+
+    #: Hard ceiling on concurrent in-flight Vertex calls per process. The rate limiter
+    #: paces STARTS; this bounds how many can be outstanding at once when the service is
+    #: slow, which is exactly when a burst turns into a thundering herd.
+    vertex_max_in_flight: int = 8
+
     # ── Firebase ──────────────────────────────────────────────────────────────
     firebase_project_id: str
     firebase_service_account_path: str = ""  # Optional on Cloud Run (uses ADC)

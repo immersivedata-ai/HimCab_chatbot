@@ -28,9 +28,11 @@ Three guarantees this node makes, each covering a reported failure:
 
 import asyncio
 import json
+import random
 from datetime import UTC, datetime
 from typing import Any, Literal, Optional
 
+from google.api_core.exceptions import ResourceExhausted
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
@@ -44,7 +46,7 @@ from app.domain.conversation import ExtractedEntities
 from app.domain.itinerary import BudgetRange, GroupType
 from app.integrations.himcab import available_packages, offered_hours
 from app.services import geo
-from app.services.vertex_ai import get_vertex_ai_service
+from app.services.vertex_ai import call_model, get_vertex_ai_service
 
 log = get_logger(__name__)
 
@@ -59,6 +61,18 @@ RENTAL = slots.RENTAL
 #: How many times a blank extraction is retried before the turn degrades to the
 #: deterministic readers. Two, because a rider is waiting on every one of these.
 _EXTRACTION_ATTEMPTS = 2
+
+
+async def _backoff(attempt: int) -> None:
+    """Wait before re-asking, a little longer each time and never the same twice.
+
+    This retry used to fire instantly. That is fine for the case it was written for — a
+    model that answered in the wrong shape — and wrong for the case that actually
+    happens under load, where every client re-asks at the same moment and the second
+    attempt lands in the same congestion as the first. The jitter is the point: without
+    it, backoff merely synchronises everyone onto the same slower clock.
+    """
+    await asyncio.sleep(0.25 * (2 ** attempt) * (1 + random.random()))
 
 # Bare greetings, recognised so "hi" costs no LLM call. Matched on the whole
 # message after punctuation is stripped — never on a substring, so "hi, plan
@@ -217,21 +231,42 @@ _WIRE_BLANKS = {"", "null", "none", "n/a", "na", "unknown", "not stated", "-"}
 # every other turn and a writer left to fill the silence.
 #
 # So `_VertexExtraction` is flat scalars with sentinel defaults — no `anyOf`, no
-# `$defs` — and is used with `json_mode`. That combination returned a valid object on
-# 25 of 25 calls. `to_extraction` puts the `None`s back, so nothing downstream knows.
+# `$defs` — and is used with `json_mode`. `to_extraction` puts the `None`s back, so
+# nothing downstream knows.
+#
+# THE SENTINEL IS NOT THE SAME FOR EVERY TYPE, and the reason is a second Vertex rule
+# found the hard way. A plain string field may default to "", but an ENUM MEMBER MAY
+# NOT BE EMPTY:
+#
+#     400 GenerateContentRequest.generation_config.response_schema
+#         .properties[origin_in_himachal].enum[0]: cannot be empty
+#
+# The first version of this class used "" as the sentinel inside `Literal` too. Vertex
+# rejected the schema, LangChain retried it — `max_retries` was 6 at the time — and a
+# four-turn conversation logged 39 to 45 of those 400s, about six and a half rejected
+# requests for every extraction that eventually got through. On Dynamic Shared Quota
+# that is not just waste; it is six times the request volume into a pool that answers
+# 429 when it is busy, which is exactly what production then started returning.
+#
+# So enum sentinels are the WORD "unknown", and `_WIRE_BLANKS` maps it back to None
+# along with the other ways a model says "nothing". `test_extraction_boundary.py`
+# asserts no enum value is empty, beside the `anyOf` guard — same class of defect, and
+# neither is visible without asking the schema.
 #
 # KEEP THE DOCSTRING BELOW SHORT. Pydantic sends it to Vertex as the schema description,
 # so every word here would be re-sent on every extraction call.
 class _VertexExtraction(BaseModel):
-    """Trip facts as flat scalars. Empty string and 0 mean "the user did not say"."""
+    """Trip facts as flat scalars. "", 0 and "unknown" mean "the user did not say"."""
 
     destination: str = ""
     origin: str = ""
     duration_days: int = 0
     travel_dates: str = ""
-    group_type: Literal["", "solo", "couple", "family", "friends", "corporate"] = ""
+    group_type: Literal[
+        "unknown", "solo", "couple", "family", "friends", "corporate"
+    ] = "unknown"
     group_size: int = 0
-    budget_range: Literal["", "budget", "moderate", "luxury"] = ""
+    budget_range: Literal["unknown", "budget", "moderate", "luxury"] = "unknown"
     interests: list[str] = Field(default_factory=list)
     special_requirements: list[str] = Field(default_factory=list)
     return_journey_preference: str = ""
@@ -241,7 +276,7 @@ class _VertexExtraction(BaseModel):
     cab_category: str = ""
     #: Three-state, as a string. A bare `bool` cannot say "no origin yet", and
     #: `Optional[bool]` would reintroduce the `anyOf` this class exists to avoid.
-    origin_in_himachal: Literal["", "yes", "no"] = ""
+    origin_in_himachal: Literal["unknown", "yes", "no"] = "unknown"
     user_wants_to_proceed_now: bool = False
     confidence: float = 0.5
 
@@ -257,14 +292,20 @@ class _VertexExtraction(BaseModel):
             # lasts zero days and no cab carries zero people — so nothing real is lost.
             return value if value and value > 0 else None
 
+        # `text` already treats "unknown" as blank, so the enum sentinel goes through
+        # the same door as every other way the model says nothing.
+        chosen = text(self.group_type)
+        budget = text(self.budget_range)
+        himachal = text(self.origin_in_himachal)
+
         return PlannerExtraction(
             destination=text(self.destination),
             origin=text(self.origin),
             duration_days=count(self.duration_days),
             travel_dates=text(self.travel_dates),
-            group_type=GroupType(self.group_type) if self.group_type else None,
+            group_type=GroupType(chosen) if chosen else None,
             group_size=count(self.group_size),
-            budget_range=BudgetRange(self.budget_range) if self.budget_range else None,
+            budget_range=BudgetRange(budget) if budget else None,
             interests=[i for i in self.interests if text(i)],
             special_requirements=[s for s in self.special_requirements if text(s)],
             return_journey_preference=text(self.return_journey_preference),
@@ -272,10 +313,7 @@ class _VertexExtraction(BaseModel):
             rental_hours=count(self.rental_hours),
             pickup_time=text(self.pickup_time),
             cab_category=text(self.cab_category),
-            origin_in_himachal=(
-                None if not self.origin_in_himachal
-                else self.origin_in_himachal == "yes"
-            ),
+            origin_in_himachal=None if himachal is None else himachal == "yes",
             user_wants_to_proceed_now=self.user_wants_to_proceed_now,
             confidence=self.confidence,
         )
@@ -683,7 +721,8 @@ Report what the user has stated. Use null for anything they have not."""
         raw_result = None
         for attempt in range(_EXTRACTION_ATTEMPTS):
             raw_result = await asyncio.wait_for(
-                llm.ainvoke(messages), timeout=settings.llm_call_timeout_seconds
+                call_model(llm.ainvoke(messages)),
+                timeout=settings.llm_call_timeout_seconds,
             )
             if raw_result is not None:
                 break
@@ -697,6 +736,8 @@ Report what the user has stated. Use null for anything they have not."""
                 attempt=attempt + 1,
                 session_id=state.session_id,
             )
+            if attempt + 1 < _EXTRACTION_ATTEMPTS:
+                await _backoff(attempt)
 
         if raw_result is None:
             raise ValueError(
@@ -714,6 +755,25 @@ Report what the user has stated. Use null for anything they have not."""
 
         result_dict = raw_result.to_extraction().model_dump()
         llm_ok = True
+
+    except ResourceExhausted as e:
+        # THROTTLED, not broken. Logged under its own name because the two need
+        # different responses and used to be indistinguishable: a rising
+        # `planner_extraction_failed` rate means the schema and the model have drifted
+        # apart, a rising `vertex_throttled` means the quota pool is full and no amount
+        # of staring at this file will help.
+        #
+        # Nothing is retried here. LangChain has already retried with backoff by the
+        # time this is raised, and a further re-ask would be one more request into a
+        # pool that has just said it has no room.
+        log.warning(
+            "vertex_throttled",
+            node="planner",
+            error=str(e)[:200],
+            session_id=state.session_id,
+        )
+        result_dict = {}
+        llm_ok = False
 
     except Exception as e:
         # Degrade, don't derail: keep what we know, read the reply in code, and let

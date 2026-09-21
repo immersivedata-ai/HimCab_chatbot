@@ -31,7 +31,7 @@ from app.core.config import settings
 from app.core.enums import Intent, Persona
 from app.core.logging import get_logger
 from app.prompts.builder import build_router_prompt
-from app.services.vertex_ai import get_vertex_ai_service
+from app.services.vertex_ai import call_model, get_vertex_ai_service
 
 log = get_logger(__name__)
 
@@ -128,10 +128,10 @@ async def router_node(state: AgentState) -> dict:
     try:
         llm = get_vertex_ai_service().get_flash_model(streaming=False)
         response = await asyncio.wait_for(
-            llm.ainvoke([
+            call_model(llm.ainvoke([
                 SystemMessage(content=ROUTER_SYSTEM_PROMPT),
                 HumanMessage(content=f"User message: {latest_message}"),
-            ]),
+            ])),
             timeout=settings.llm_call_timeout_seconds,
         )
 

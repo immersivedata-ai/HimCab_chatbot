@@ -39,6 +39,7 @@ import json
 import re
 from typing import Optional
 
+from google.api_core.exceptions import ResourceExhausted
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agent import sanitize, slots
@@ -60,7 +61,7 @@ from app.domain.itinerary import (
     WeatherForecast,
 )
 from app.integrations.himcab.quote_builder import classify_trip_type
-from app.services.vertex_ai import get_vertex_ai_service
+from app.services.vertex_ai import call_model, get_vertex_ai_service
 
 log = get_logger(__name__)
 
@@ -1430,6 +1431,15 @@ def _strip_leaked_metadata(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+#: Said when Vertex answers 429 — the shared capacity pool is full. Distinct from the
+#: blank-reply fallback below because the advice is different: this one WILL work if
+#: they try again in a moment, and saying so is more use than an apology.
+_BUSY_REPLY = {
+    "hi": "अभी थोड़ी भीड़ है — एक मिनट बाद फिर भेजिए, मैं तुरंत आपकी यात्रा तैयार कर दूँगा।",
+    "en": "We're a bit busy right now — send that again in a moment and "
+          "I'll put your trip together straight away.",
+}
+
 #: Said when the model produced nothing usable. Deliberately a QUESTION rather than an
 #: apology: the turn still has to go somewhere, and "sorry, something went wrong" leaves
 #: the rider staring at a dead conversation with no idea what to type next.
@@ -1632,13 +1642,13 @@ async def writer_node(state: AgentState) -> dict:
             # Live token-by-token generation for the SSE endpoint.
             llm = get_vertex_ai_service().get_flash_model(streaming=True)
             full_response = await asyncio.wait_for(
-                _generate_streaming(llm, messages, token_queue),
+                call_model(_generate_streaming(llm, messages, token_queue)),
                 timeout=settings.llm_call_timeout_seconds,
             )
         else:
             llm = get_vertex_ai_service().get_flash_model(streaming=False)
             response = await asyncio.wait_for(
-                llm.ainvoke(messages),
+                call_model(llm.ainvoke(messages)),
                 timeout=settings.llm_call_timeout_seconds,
             )
             full_response = response.content
@@ -1648,18 +1658,28 @@ async def writer_node(state: AgentState) -> dict:
         # for JSON the prompt explicitly asked the model not to write.
         itinerary_dict = _extract_structured_itinerary(full_response) if wants_itinerary else None
 
-        # Retry: if structured extraction failed, ask the model to output just JSON
+        # Retry: if structured extraction failed, ask the model to output just JSON.
+        #
+        # This is a SECOND full generation of an itinerary-sized prompt — the most
+        # expensive retry in the system. When it is the 429 that stopped us, it is
+        # skipped: re-asking a pool that has just said it is full buys nothing and costs
+        # everyone else in the queue. The reply still ships, without the structured card.
         if itinerary_dict is None and wants_itinerary:
             log.info("structured_extraction_retry", session_id=state.session_id)
             retry_messages = [*messages, AIMessage(content=full_response), HumanMessage(content="Please output ONLY the structured JSON itinerary from your response above. " "No explanation, just the JSON wrapped in ```json ... ```")]
             try:
                 retry_response = await asyncio.wait_for(
-                    llm.ainvoke(retry_messages),
+                    call_model(llm.ainvoke(retry_messages)),
                     timeout=settings.llm_call_timeout_seconds,
                 )
                 itinerary_dict = _extract_structured_itinerary(retry_response.content)
                 if itinerary_dict:
                     log.info("structured_extraction_retry_success", session_id=state.session_id)
+            except ResourceExhausted as retry_err:
+                log.warning(
+                    "vertex_throttled", node="writer_json_retry",
+                    error=str(retry_err)[:200], session_id=state.session_id,
+                )
             except Exception as retry_err:
                 log.warning("structured_extraction_retry_failed", error=str(retry_err), error_type=type(retry_err).__name__)
 
@@ -1830,6 +1850,23 @@ async def writer_node(state: AgentState) -> dict:
             "structured_itinerary": validated_itinerary,
             "structured_events": structured_events,
             "messages": [AIMessage(content=clean_text)],
+            "node_trace": ["writer"],
+        }
+
+    except ResourceExhausted as e:
+        # The model is out of capacity, not confused. Said in the rider's language and
+        # said honestly — this is a transient failure they should retry, and the one
+        # thing it must not do is hand them a confident answer assembled from nothing,
+        # which is how a throttled turn used to look from the outside.
+        log.warning(
+            "vertex_throttled", node="writer", error=str(e)[:200],
+            session_id=state.session_id,
+        )
+        busy = _BUSY_REPLY.get(lang_key, _BUSY_REPLY["en"])
+        return {
+            "final_response_text": busy,
+            "structured_events": [],
+            "messages": [AIMessage(content=busy)],
             "node_trace": ["writer"],
         }
 

@@ -64,6 +64,31 @@ class TestTheWireSchemaIsSomethingVertexCanAccept:
         usual way one appears — hence `Literal` below rather than the domain enums."""
         assert not _VertexExtraction.model_json_schema().get("$defs")
 
+    def test_no_enum_value_is_the_empty_string(self):
+        """The second Vertex rule, and the one that reached production.
+
+        A plain string field may default to "", but an ENUM MEMBER MAY NOT BE EMPTY:
+
+            400 ...response_schema.properties[origin_in_himachal].enum[0]: cannot be empty
+
+        The first version of the wire model used "" as the sentinel inside `Literal`
+        too. Vertex rejected the whole schema, LangChain retried it, and a four-turn
+        conversation logged 39-45 of those 400s — roughly six and a half wasted requests
+        per extraction that got through. On Dynamic Shared Quota that is six times the
+        volume into a pool that answers 429 when it is busy, and production started
+        doing exactly that.
+
+        Unlike the `anyOf` case this one DOES raise, so it is loud once it reaches
+        Vertex — but it reaches Vertex only at runtime, and LangChain's retry buries it
+        in a warning. Asking the schema is how it fails in CI instead.
+        """
+        for name, prop in _VertexExtraction.model_json_schema()["properties"].items():
+            assert "" not in (prop.get("enum") or []), (
+                f"{name} has an empty enum value; Vertex rejects the whole request "
+                f"with 'enum[0]: cannot be empty'. Use a word like 'unknown' and map "
+                f"it back in to_extraction()."
+            )
+
     def test_every_field_is_a_flat_scalar_or_a_list_of_strings(self):
         allowed = {"string", "integer", "number", "boolean", "array"}
         for name, prop in _VertexExtraction.model_json_schema()["properties"].items():
@@ -86,13 +111,20 @@ class TestTheChoicesMatchTheDomain:
         literal = set(
             _VertexExtraction.model_json_schema()["properties"]["group_type"]["enum"]
         )
-        assert literal == {""} | {g.value for g in GroupType}
+        assert literal == {"unknown"} | {g.value for g in GroupType}
 
     def test_budget_range_offers_exactly_the_domain_values(self):
         literal = set(
             _VertexExtraction.model_json_schema()["properties"]["budget_range"]["enum"]
         )
-        assert literal == {""} | {b.value for b in BudgetRange}
+        assert literal == {"unknown"} | {b.value for b in BudgetRange}
+
+    def test_the_sentinel_is_not_a_real_choice(self):
+        """"unknown" has to mean "not stated" and nothing else. If a domain enum ever
+        gained a member called `unknown`, the sentinel would silently become a value the
+        rider could be assigned."""
+        assert "unknown" not in {g.value for g in GroupType}
+        assert "unknown" not in {b.value for b in BudgetRange}
 
 
 class TestSentinelsBecomeNoneAgain:
@@ -139,7 +171,9 @@ class TestSentinelsBecomeNoneAgain:
         out-of-state visitor and switch their whole flow."""
         assert _VertexExtraction(origin_in_himachal="yes").to_extraction().origin_in_himachal is True
         assert _VertexExtraction(origin_in_himachal="no").to_extraction().origin_in_himachal is False
-        assert _VertexExtraction(origin_in_himachal="").to_extraction().origin_in_himachal is None
+        assert _VertexExtraction(origin_in_himachal="unknown").to_extraction().origin_in_himachal is None
+        # The default, which is what arrives when the model omits the field entirely.
+        assert _VertexExtraction().to_extraction().origin_in_himachal is None
 
     def test_zero_is_read_as_unstated_not_as_zero(self):
         """0 is the sentinel and also a nonsense answer — no trip lasts zero days, no

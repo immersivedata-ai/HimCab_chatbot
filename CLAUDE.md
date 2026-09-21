@@ -83,10 +83,25 @@ Measured on one real conversation, 25 calls per configuration:
 Nested definitions (`$defs`, which pydantic emits for `Enum` fields) are dropped the
 same way, with a warning nobody reads.
 
+### And never use `""` as an enum member
+
+A string field may default to `""`. An **enum member may not be empty**:
+
+```
+400 ...response_schema.properties[origin_in_himachal].enum[0]: cannot be empty
+```
+
+The first version of the wire model used `""` as the sentinel inside `Literal` too.
+Vertex rejected the whole schema, LangChain retried it, and a four-turn conversation
+logged **39-45 of those 400s — about 6.5 wasted requests per extraction that got
+through**. On shared quota that is not just waste, it is 6x the volume into a pool that
+answers 429 when it is busy. Enum sentinels are the word `"unknown"`, mapped back by
+`_WIRE_BLANKS`.
+
 **So:**
 
-- the wire model is flat scalars with sentinel defaults (`""`, `0`) — see
-  `planner._VertexExtraction`
+- the wire model is flat scalars with sentinel defaults — `""` and `0` for strings and
+  counts, the word `"unknown"` for enums — see `planner._VertexExtraction`
 - it is called with `method="json_mode"`
 - a `to_extraction()` converts sentinels back to `None` so the rest of the code is
   unaffected
@@ -120,6 +135,41 @@ It was an empty extraction every other turn.
 alarmed, or it will degrade forever in silence.**
 
 ---
+
+## 3b. Vertex runs on shared quota — do not amplify a 429
+
+Gemini on Vertex uses **Dynamic Shared Quota**. A 429 `ResourceExhausted` means the
+shared pool is busy. **You cannot request a quota increase for a DSQ model** — that is
+the documented answer, not a workaround. The levers are: fewer requests, spread out;
+Provisioned Throughput; or waiting.
+
+Production hit sustained 429s. The arithmetic: 3 model calls per turn, up to 800
+concurrent turns (10 instances x 80 concurrency), and LangChain silently retrying each
+call **six times** by default. A pathological turn was 30 requests, and nothing bounded
+the total.
+
+So, on every Vertex call:
+
+- **Everything goes through `vertex_ai.call_model()`**, which holds a process-wide
+  semaphore (`vertex_max_in_flight`). Not a decorator, so it cannot be forgotten.
+- **`max_retries` is set explicitly** on both clients. Never leave it at the default.
+- **Both clients share ONE `InMemoryRateLimiter`.** Quota is per project and model, not
+  per Python object; two independently-paced clients just take turns exceeding it.
+- **A 429 is caught as `ResourceExhausted` and never retried by us.** LangChain has
+  already retried with backoff by then. It is logged as `vertex_throttled`, distinct
+  from `planner_extraction_failed` — one means the pool is full, the other means the
+  schema drifted, and they used to be the same log line.
+- **Our own retries back off with jitter.** Without jitter, backoff just synchronises
+  every client onto a slower clock.
+- **A throttled turn tells the rider to try again.** It does not invent an answer out of
+  an empty extraction, which is how a capacity problem got reported as hallucination.
+
+All of these are per-process. With `--max-instances=10` the fleet rate is ten times the
+per-instance rate; a true global cap belongs at the gateway or in the instance ceiling.
+
+Tested and rejected: `location="global"` returns 501/404 with this SDK version. Another
+region may have capacity when `us-central1` does not — that is a deploy-time change
+(`VERTEX_AI_LOCATION`), not a code one.
 
 ## 4. Non-negotiable invariants
 
@@ -239,10 +289,13 @@ Honest list. Do not rediscover these.
   field is the one in flight.
 - **The writer sometimes returns JSON with no prose** on `general_query` turns. The
   blank-reply guard catches it and apologises, which is honest but not good.
-- **Trip booking handoffs carry the rider's words, not a date.** `writer.py:584`
-  passes `entities.travel_dates` straight through; the ISO conversion is rental-only.
-  A local ride's booking screen gets `"3 din baad"`.
 - **`cancellation.py` has the Devanagari tokenising bug** described in §5.
+- **The deploy passes 17 env vars; `.env` has 30.** `OPENWEATHER_API_KEY` is among the
+  missing, which is why deployed replies carry no weather line. Check
+  `deploy.ps1:57` against `.env` before blaming the code for a missing feature.
+- **No cab options without a rider JWT.** The fare gate requires one, `dev-test-token`
+  maps to `jwt=None`, and no fare means no cabs to choose from. The three test clients
+  now say so on screen.
 
 ---
 
