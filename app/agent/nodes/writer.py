@@ -1406,6 +1406,22 @@ def _strip_leaked_metadata(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+#: Said when the model produced nothing usable. Deliberately a QUESTION rather than an
+#: apology: the turn still has to go somewhere, and "sorry, something went wrong" leaves
+#: the rider staring at a dead conversation with no idea what to type next.
+_BLANK_REPLY_FALLBACK = {
+    "hi": "माफ़ करें, मैं वह ठीक से तैयार नहीं कर पाया। "
+          "क्या आप अपनी यात्रा की जानकारी एक बार फिर बता सकते हैं?",
+    "en": "Sorry — I could not put that together properly. "
+          "Could you tell me your trip details once more?",
+}
+
+
+def _blank_reply_fallback(state, lang_key: str) -> str:
+    """Something to say when the generated reply cleaned away to nothing."""
+    return _BLANK_REPLY_FALLBACK.get(lang_key, _BLANK_REPLY_FALLBACK["en"])
+
+
 def _clean_response_text(text: str) -> str:
     """The human-readable reply: the JSON block removed, and any structured itinerary
     fields the model leaked into the prose stripped out (see `_strip_leaked_metadata`)."""
@@ -1418,12 +1434,27 @@ def _clean_response_text(text: str) -> str:
         if len(parts) >= 3:
             clean = parts[0].strip()
 
-    # Strip raw JSON if no backticks were used
-    match = re.search(r'\{\s*"destination"', clean)
+    # Strip raw JSON if no backticks were used.
+    #
+    # Anchored on ANY opening brace followed by a quoted key, not on `{"destination"`
+    # alone. The narrow version left the rider looking at a single "{" when the model
+    # opened its object with some other field — the brace survived, the rest was cut,
+    # and a stray brace is not an empty reply so nothing downstream noticed.
+    match = re.search(r'\{\s*"', clean)
     if match:
         clean = clean[:match.start()].strip()
 
     return _strip_leaked_metadata(clean)
+
+
+#: Any letter, in any script. A reply with none of these is punctuation and whitespace —
+#: a leftover brace, a stray fence — never something a rider can read.
+_HAS_A_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def _is_unreadable(text: str) -> bool:
+    """True when what survived cleaning is not a reply at all."""
+    return not _HAS_A_LETTER.search(text or "")
 
 
 async def _generate_streaming(llm, messages, token_queue) -> str:
@@ -1610,6 +1641,27 @@ async def writer_node(state: AgentState) -> dict:
 
         # Clean the text response (remove JSON block)
         clean_text = _clean_response_text(full_response)
+
+        # A reply that cleaned away to NOTHING ships as an empty bubble, and an empty
+        # bubble is the worst thing this node can produce: the rider cannot tell it
+        # from a crash, and there is nothing to reply to. It happens when the model
+        # answers with the JSON block ALONE — `_clean_response_text` removes everything
+        # from the fence onwards, and if the fence was the first thing in the reply,
+        # everything is everything.
+        #
+        # Seen in production on a local ride: the writer logged `response_length=119`
+        # and the rider got a blank message. `writer_completed` measures the text
+        # BEFORE this cleaning, so the logs showed a reply that was sent and the screen
+        # showed nothing — which is why it was reported as the assistant "breaking"
+        # rather than as anything to do with JSON.
+        if _is_unreadable(clean_text) and full_response.strip():
+            log.error(
+                "writer_reply_cleaned_to_nothing",
+                raw_length=len(full_response),
+                mode=mode,
+                session_id=state.session_id,
+            )
+            clean_text = _blank_reply_fallback(state, lang_key)
 
         # ── Validate the itinerary BEFORE building events ──────────────────────
         # The validated model is the single source of truth for both delivery

@@ -108,7 +108,8 @@ class TestPlannerLocalFlow:
     @pytest.mark.asyncio
     async def test_local_visitor_return_journey_confirmed(self):
         """Once return_journey_preference is known, clarification resolves for locals too."""
-        from app.agent.nodes.planner import PlannerExtraction, planner_node
+        from app.agent.nodes.planner import planner_node
+        from tests.conftest import wire_extraction
 
         state = AgentState(
             session_id="test-local-planner-1",
@@ -118,7 +119,7 @@ class TestPlannerLocalFlow:
                 HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye, is weekend, return cab book kar li hai"),
             ],
         )
-        planner_response = PlannerExtraction(
+        planner_response = wire_extraction(
             destination="Manali",
             origin="Shimla",
             duration_days=2,
@@ -147,7 +148,8 @@ class TestPlannerLocalFlow:
         trip detail still got interrogated instead of an itinerary. It is now carried
         in `open_questions` and asked in the itinerary's closing line instead.
         """
-        from app.agent.nodes.planner import PlannerExtraction, planner_node
+        from app.agent.nodes.planner import planner_node
+        from tests.conftest import wire_extraction
 
         state = AgentState(
             session_id="test-local-planner-1b",
@@ -157,7 +159,7 @@ class TestPlannerLocalFlow:
                 HumanMessage(content="Shimla se Manali jaana hai 2 din ke liye, is weekend"),
             ],
         )
-        planner_response = PlannerExtraction(
+        planner_response = wire_extraction(
             destination="Manali",
             origin="Shimla",
             duration_days=2,
@@ -181,7 +183,8 @@ class TestPlannerLocalFlow:
     @pytest.mark.asyncio
     async def test_local_visitor_asks_home_city(self):
         """Planner should ask local visitor their home city when unknown."""
-        from app.agent.nodes.planner import PlannerExtraction, planner_node
+        from app.agent.nodes.planner import planner_node
+        from tests.conftest import wire_extraction
 
         state = AgentState(
             session_id="test-local-planner-2",
@@ -191,7 +194,7 @@ class TestPlannerLocalFlow:
                 HumanMessage(content="Kasol jaana hai weekend pe"),
             ],
         )
-        planner_response = PlannerExtraction(
+        planner_response = wire_extraction(
             destination="Kasol",
             origin=None,
             duration_days=2,

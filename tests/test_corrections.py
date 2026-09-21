@@ -245,7 +245,7 @@ class TestThePlannerActsOnTheChange:
 
     @pytest.mark.asyncio
     async def test_a_sentence_moves_the_destination(self):
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         stored = ExtractedEntities(
             visitor_type="local", origin="Kullu", destination="Manali",
@@ -255,7 +255,7 @@ class TestThePlannerActsOnTheChange:
             "mujhe palampur se lekar kasol jana hai",
             stored,
             # The model insists on the old trip.
-            PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
+            wire_extraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
         assert result["entities"].pending_changes == {
             "destination": "Kasol",
@@ -267,7 +267,7 @@ class TestThePlannerActsOnTheChange:
 
     @pytest.mark.asyncio
     async def test_a_bare_reply_moves_the_field_that_was_asked(self):
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         stored = ExtractedEntities(
             visitor_type="local", origin="Kullu", destination="Manali",
@@ -276,7 +276,7 @@ class TestThePlannerActsOnTheChange:
         result = await self._plan(
             "nahi, Kasol",
             stored,
-            PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
+            wire_extraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
         assert result["entities"].pending_changes == {"destination": "Kasol"}
 
@@ -289,7 +289,7 @@ class TestThePlannerActsOnTheChange:
         the change from the text alone, and a model that read the same reply better
         supplies the value that goes in front of the rider.
         """
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         stored = ExtractedEntities(
             visitor_type="local", origin="Kullu", destination="Manali",
@@ -299,7 +299,7 @@ class TestThePlannerActsOnTheChange:
             "nahi, Kasol",
             stored,
             # The model already moved it, and somewhere better than a bare parse could.
-            PlannerExtraction(destination="Kasol Village", origin="Kullu", confidence=0.9),
+            wire_extraction(destination="Kasol Village", origin="Kullu", confidence=0.9),
         )
         assert result["entities"].pending_changes == {"destination": "Kasol Village"}
 
@@ -311,7 +311,7 @@ class TestThePlannerActsOnTheChange:
         correction fills no NEW slot, so it used to increment the counter and push a
         thoroughly engaged rider towards being cut off.
         """
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         stored = ExtractedEntities(
             visitor_type="local", origin="Kullu", destination="Manali",
@@ -321,14 +321,14 @@ class TestThePlannerActsOnTheChange:
         result = await self._plan(
             "nahi, Kasol",
             stored,
-            PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
+            wire_extraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
         assert result["entities"].no_progress_turns == 0
 
     @pytest.mark.asyncio
     async def test_a_passing_mention_leaves_the_trip_alone(self):
         """The safety half of the same mechanism, driven end to end."""
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         stored = ExtractedEntities(
             visitor_type="local", origin="Kullu", destination="Manali",
@@ -337,7 +337,7 @@ class TestThePlannerActsOnTheChange:
         result = await self._plan(
             "what is the weather in Kasol",
             stored,
-            PlannerExtraction(destination="Manali", origin="Kullu", confidence=0.9),
+            wire_extraction(destination="Manali", origin="Kullu", confidence=0.9),
         )
         assert result["entities"].destination == "Manali"
         assert result["entities"].origin == "Kullu"

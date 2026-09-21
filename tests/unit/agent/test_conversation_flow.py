@@ -28,10 +28,11 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent import modification, sanitize, slots
 from app.agent.graph import route_after_planner, route_after_router
-from app.agent.nodes.planner import PlannerExtraction, planner_node
+from app.agent.nodes.planner import planner_node
 from app.agent.state import AgentState
 from app.core.config import settings
 from app.domain.conversation import ExtractedEntities
+from tests.conftest import wire_extraction
 
 # ── Harness ───────────────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ def _stub_extractor(extraction):
     if extraction is None:
         target.ainvoke = AsyncMock(side_effect=RuntimeError("vertex unavailable"))
     else:
-        target.ainvoke = AsyncMock(return_value=PlannerExtraction(**extraction))
+        target.ainvoke = AsyncMock(return_value=wire_extraction(**extraction))
     return llm
 
 

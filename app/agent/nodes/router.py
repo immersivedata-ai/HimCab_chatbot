@@ -28,7 +28,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.cancellation import looks_like_cancellation
 from app.agent.state import AgentState
 from app.core.config import settings
-from app.core.enums import Intent
+from app.core.enums import Intent, Persona
 from app.core.logging import get_logger
 from app.prompts.builder import build_router_prompt
 from app.services.vertex_ai import get_vertex_ai_service
@@ -38,7 +38,7 @@ log = get_logger(__name__)
 ROUTER_SYSTEM_PROMPT = build_router_prompt()
 
 
-def _answers_the_question(asked_field: str, text: str) -> bool:
+def _answers_the_question(asked_field: str, text: str, *, is_rental: bool = False) -> bool:
     """True when `text` reads as an answer to the question we just asked.
 
     Asked of the SAME strict parser the planner will use on the next node, so the two
@@ -57,7 +57,21 @@ def _answers_the_question(asked_field: str, text: str) -> bool:
         # the two DO disagree: "nahi, Kasol" is a correction the planner will act on,
         # but the bare parser reads four words and rejects it, so the turn is routed
         # as something other than an answer to the question still on screen.
-        return slot.parse(slots.strip_correction_prefix(text)) is not None
+        if slot.parse(slots.strip_correction_prefix(text)) is not None:
+            return True
+
+        # A SENTENCE answers the question too, and asking only the bare parser meant it
+        # did not count. `parse_place` caps an answer at three words on purpose, so
+        # "mei himachal mei shimla mei rehta hu" — a rider answering "which city do you
+        # live in?" — parsed as nothing, kept the classifier's `general_query`, and took
+        # the whole turn down a path with no fare and no booking screen. The rider had
+        # answered the question exactly.
+        #
+        # The planner reads that sentence perfectly well (`read_trip_details`), so the
+        # two nodes disagreed about whether the rider had answered — the precise thing
+        # this function exists to prevent. Same readers on both sides now.
+        read = slots.read_rental_details if is_rental else slots.read_trip_details
+        return read(text).get(asked_field) is not None
     except Exception:  # a parser must never take down the turn
         return False
 
@@ -160,7 +174,13 @@ async def router_node(state: AgentState) -> dict:
         # planner will use, so the two cannot disagree. A real topic switch ("actually,
         # what's the weather there?") does not parse as an answer and keeps its intent.
         asked = state.entities.last_asked_field
-        if asked and intent != Intent.CLARIFICATION and _answers_the_question(asked, latest_message):
+        if (
+            asked
+            and intent != Intent.CLARIFICATION
+            and _answers_the_question(
+                asked, latest_message, is_rental=state.visitor_type == Persona.RENTAL
+            )
+        ):
             log.info(
                 "intent_reclassified_as_answer",
                 asked_about=asked,

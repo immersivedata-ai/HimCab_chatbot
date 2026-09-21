@@ -31,7 +31,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent import sanitize, slots
 from app.agent.graph import route_after_planner
-from app.agent.nodes.planner import PlannerExtraction, planner_node
+from app.agent.nodes.planner import planner_node
 from app.agent.nodes.tool_executor import tool_executor_node
 from app.agent.state import AgentState
 from app.core.config import settings
@@ -46,6 +46,7 @@ from app.integrations.himcab.rental_service import (
     distinct_packages,
 )
 from app.services.chat_session import RENTAL, resolve_persona, welcome_message
+from tests.conftest import wire_extraction
 
 # What the rate card returns: a chart per category, so hours repeat across cabs. The
 # 12-hour chart is deliberately present and deliberately never offered — the backend
@@ -270,7 +271,7 @@ class TestTheRentalConversation:
         state = self._state()
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction()
+            return_value=wire_extraction()
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm
@@ -1150,7 +1151,7 @@ class TestAnUnlistedDurationIsReAsked:
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction()
+            return_value=wire_extraction()
         )
         rental = RentalService()
         rental._get = AsyncMock(return_value=rate_card or {"data": []})
@@ -1702,7 +1703,7 @@ class TestASentenceIsReadInCode:
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(travel_dates="I am planning to travel today")
+            return_value=wire_extraction(travel_dates="I am planning to travel today")
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm
@@ -1729,7 +1730,7 @@ class TestASentenceIsReadInCode:
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction()
+            return_value=wire_extraction()
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm
@@ -1767,7 +1768,7 @@ class TestASentenceIsReadInCode:
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(rental_hours=4)
+            return_value=wire_extraction(rental_hours=4)
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm
@@ -1788,7 +1789,7 @@ class TestASentenceIsReadInCode:
         )
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(
+            return_value=wire_extraction(
                 rental_hours=8, destination="Manali", duration_days=2
             )
         )

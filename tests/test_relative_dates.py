@@ -268,9 +268,10 @@ class TestWhatTheRiderActuallySees:
         from langchain_core.messages import AIMessage, HumanMessage
 
         from app.agent.graph import clarify_node, route_after_planner
-        from app.agent.nodes.planner import PlannerExtraction, planner_node
+        from app.agent.nodes.planner import planner_node
         from app.agent.state import AgentState
         from app.domain.conversation import ExtractedEntities
+        from tests.conftest import wire_extraction
 
         entities = entities or ExtractedEntities(
             visitor_type=persona, origin="Dadh", destination="Kangra",
@@ -284,7 +285,7 @@ class TestWhatTheRiderActuallySees:
                            messages=messages, entities=entities, visitor_type=persona)
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(**extraction)
+            return_value=wire_extraction(**extraction)
         )
         with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
             svc.return_value.get_flash_model.return_value = llm

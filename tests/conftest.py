@@ -223,3 +223,34 @@ def sample_weather_data():
         ],
         "alerts": [],
     }
+
+
+# ── The extraction boundary ──────────────────────────────────────────────────
+
+def wire_extraction(**facts):
+    """What `with_structured_output(...).ainvoke(...)` actually returns.
+
+    Use this, never `PlannerExtraction`, when stubbing the extraction model.
+
+    The distinction is not pedantry — it is the reason a serious bug survived a green
+    suite. Vertex cannot represent the `anyOf` that `Optional[...]` produces, so the
+    planner sends `_VertexExtraction` (flat scalars, sentinel defaults) and converts.
+    Tests stubbed the boundary with `PlannerExtraction`, a shape the real system never
+    returns, so they exercised a conversion that did not exist and passed happily while
+    extraction failed on about half of all live calls.
+
+    Takes the node-model values a test wants to express — `origin_in_himachal=True`,
+    `group_size=2`, `travel_dates=None` — and produces the wire shape that carries them.
+    """
+    from app.agent.nodes.planner import _VertexExtraction
+
+    tri = {True: "yes", False: "no", None: ""}
+    wire: dict = {}
+    for name, value in facts.items():
+        if value is None:
+            continue
+        if name == "origin_in_himachal":
+            wire[name] = tri[value]
+        else:
+            wire[name] = value
+    return _VertexExtraction(**wire)

@@ -29,7 +29,7 @@ Three guarantees this node makes, each covering a reported failure:
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -55,6 +55,10 @@ OUTSTATION = slots.OUTSTATION
 #: Hiring a car by the hour. Not a kind of person, so `classify_visitor_type` never
 #: reclassifies it — see the note there.
 RENTAL = slots.RENTAL
+
+#: How many times a blank extraction is retried before the turn degrades to the
+#: deterministic readers. Two, because a rider is waiting on every one of these.
+_EXTRACTION_ATTEMPTS = 2
 
 # Bare greetings, recognised so "hi" costs no LLM call. Matched on the whole
 # message after punctuation is stripped — never on a substring, so "hi, plan
@@ -142,6 +146,9 @@ class PlannerExtraction(BaseModel):
     Note there is no `needs_clarification`/`clarification_question` here any more:
     those were asked for, then discarded by the node, and the model spent tokens
     producing questions nobody read.
+
+    This is the model the NODE works in, with `None` meaning "not stated". It is not
+    the shape sent to Vertex — see `_VertexExtraction` for why it cannot be.
     """
 
     destination: Optional[str] = None
@@ -182,6 +189,96 @@ class PlannerExtraction(BaseModel):
         description="True if the user asked to stop being asked questions and just get the plan.",
     )
     confidence: float = 0.5
+
+
+#: Values the model writes when it means "not stated". It is told to use "" and
+#: sometimes writes the word instead; both are the absence of an answer, and letting
+#: either through would put the string "null" in a destination field.
+_WIRE_BLANKS = {"", "null", "none", "n/a", "na", "unknown", "not stated", "-"}
+
+
+# ── Why there are two extraction models ───────────────────────────────────────
+#
+# THIS EXISTS BECAUSE OF ONE INCOMPATIBILITY, and the cost of not having it was the
+# whole extraction layer silently failing about half the time.
+#
+# `Optional[str]` compiles to `anyOf: [{"type": "string"}, {"type": "null"}]`, and
+# Vertex's `Schema` proto has no `anyOf`. In `json_mode` it says so outright —
+# `ValueError: Unknown field for Schema: anyOf`. In the default `function_calling` mode
+# it says nothing at all: the schema is mangled on the way through, the model returns no
+# tool call, and `with_structured_output` hands back `None`. Measured over 25 calls on a
+# real conversation, that was 12 to 19 failures. Every one logged a single
+# `planner_extraction_failed` line and degraded exactly as designed, which is why it
+# survived so long — the node kept working, on the deterministic readers alone.
+#
+# What a rider saw was an assistant that followed short answers and lost the plot on
+# whole sentences, because a sentence is precisely what those readers cannot fully parse
+# and the model was supposed to. Reported as hallucination; it was an empty extraction
+# every other turn and a writer left to fill the silence.
+#
+# So `_VertexExtraction` is flat scalars with sentinel defaults — no `anyOf`, no
+# `$defs` — and is used with `json_mode`. That combination returned a valid object on
+# 25 of 25 calls. `to_extraction` puts the `None`s back, so nothing downstream knows.
+#
+# KEEP THE DOCSTRING BELOW SHORT. Pydantic sends it to Vertex as the schema description,
+# so every word here would be re-sent on every extraction call.
+class _VertexExtraction(BaseModel):
+    """Trip facts as flat scalars. Empty string and 0 mean "the user did not say"."""
+
+    destination: str = ""
+    origin: str = ""
+    duration_days: int = 0
+    travel_dates: str = ""
+    group_type: Literal["", "solo", "couple", "family", "friends", "corporate"] = ""
+    group_size: int = 0
+    budget_range: Literal["", "budget", "moderate", "luxury"] = ""
+    interests: list[str] = Field(default_factory=list)
+    special_requirements: list[str] = Field(default_factory=list)
+    return_journey_preference: str = ""
+    home_city: str = ""
+    rental_hours: int = 0
+    pickup_time: str = ""
+    cab_category: str = ""
+    #: Three-state, as a string. A bare `bool` cannot say "no origin yet", and
+    #: `Optional[bool]` would reintroduce the `anyOf` this class exists to avoid.
+    origin_in_himachal: Literal["", "yes", "no"] = ""
+    user_wants_to_proceed_now: bool = False
+    confidence: float = 0.5
+
+    def to_extraction(self) -> PlannerExtraction:
+        """Back to `None`-means-unstated, which is what the node is written against."""
+
+        def text(value: str) -> Optional[str]:
+            cleaned = (value or "").strip()
+            return None if cleaned.lower() in _WIRE_BLANKS else cleaned
+
+        def count(value: int) -> Optional[int]:
+            # 0 is the sentinel AND a nonsense answer for every count here — no trip
+            # lasts zero days and no cab carries zero people — so nothing real is lost.
+            return value if value and value > 0 else None
+
+        return PlannerExtraction(
+            destination=text(self.destination),
+            origin=text(self.origin),
+            duration_days=count(self.duration_days),
+            travel_dates=text(self.travel_dates),
+            group_type=GroupType(self.group_type) if self.group_type else None,
+            group_size=count(self.group_size),
+            budget_range=BudgetRange(self.budget_range) if self.budget_range else None,
+            interests=[i for i in self.interests if text(i)],
+            special_requirements=[s for s in self.special_requirements if text(s)],
+            return_journey_preference=text(self.return_journey_preference),
+            home_city=text(self.home_city),
+            rental_hours=count(self.rental_hours),
+            pickup_time=text(self.pickup_time),
+            cab_category=text(self.cab_category),
+            origin_in_himachal=(
+                None if not self.origin_in_himachal
+                else self.origin_in_himachal == "yes"
+            ),
+            user_wants_to_proceed_now=self.user_wants_to_proceed_now,
+            confidence=self.confidence,
+        )
 
 
 PLANNER_SYSTEM_PROMPT = """You are an information extractor for a Himachal Pradesh travel service.
@@ -569,23 +666,53 @@ Already extracted (carry these forward; do not null them out):
 Report what the user has stated. Use null for anything they have not."""
 
     try:
+        # `json_mode` rather than the default function calling, and `_VertexExtraction`
+        # rather than `PlannerExtraction` — both are required together, and the note on
+        # that class says why. In short: the default combination returned None on about
+        # half of all calls and this one has not returned None yet.
         llm = (
             get_vertex_ai_service()
             .get_flash_model(streaming=False)
-            .with_structured_output(PlannerExtraction)
+            .with_structured_output(_VertexExtraction, method="json_mode")
         )
-        raw_result = await asyncio.wait_for(
-            llm.ainvoke([
-                SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ]),
-            timeout=settings.llm_call_timeout_seconds,
-        )
-        result_dict = (
-            raw_result.model_dump()
-            if isinstance(raw_result, PlannerExtraction)
-            else dict(raw_result)
-        )
+        messages = [
+            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
+        raw_result = None
+        for attempt in range(_EXTRACTION_ATTEMPTS):
+            raw_result = await asyncio.wait_for(
+                llm.ainvoke(messages), timeout=settings.llm_call_timeout_seconds
+            )
+            if raw_result is not None:
+                break
+            # A None here is the model declining to answer in the required shape. It is
+            # not an error and raises nothing — it used to reach `dict(None)` and come
+            # out as a TypeError, which read in the logs like a bug in this file.
+            # Retried because it is transient; counted because a rising rate means the
+            # schema and the model have drifted apart again.
+            log.warning(
+                "planner_extraction_empty",
+                attempt=attempt + 1,
+                session_id=state.session_id,
+            )
+
+        if raw_result is None:
+            raise ValueError(
+                f"the model returned no parseable object in "
+                f"{_EXTRACTION_ATTEMPTS} attempts"
+            )
+        if not isinstance(raw_result, _VertexExtraction):
+            # LangChain types this return as `dict | BaseModel`. Anything else here is
+            # a version change in how structured output is handed back, and guessing at
+            # it would put whatever arrived straight into the rider's entities.
+            raise TypeError(
+                f"extraction returned {type(raw_result).__name__}, "
+                f"expected _VertexExtraction"
+            )
+
+        result_dict = raw_result.to_extraction().model_dump()
         llm_ok = True
 
     except Exception as e:

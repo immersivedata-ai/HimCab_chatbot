@@ -55,11 +55,11 @@ class AgentHarness:
         return llm
 
     def _planner_llm(self, extraction):
-        from app.agent.nodes.planner import PlannerExtraction
+        from tests.conftest import wire_extraction
 
         llm = MagicMock()
         llm.with_structured_output.return_value.ainvoke = AsyncMock(
-            return_value=PlannerExtraction(**extraction)
+            return_value=wire_extraction(**extraction)
         )
         return llm
 

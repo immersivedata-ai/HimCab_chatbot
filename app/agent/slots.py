@@ -807,6 +807,33 @@ _SENTENCE_GROUP_RES = (
 #: that one left-to-right captured the words in front of the place instead of the place
 #: — "kal subah 6 baje Manali se" gave a pickup of "Baje Manali".
 _SENTENCE_FROM_RES = (
+    # WHERE THEY LIVE. The local flow asks "आप हिमाचल में किस शहर में रहते हैं?" — which
+    # city do you live in — and a rider answers it with a sentence: "mei himachal mei
+    # shimla mei rehta hu", "I live in Shimla". None of the markers below fire on that,
+    # so the answer was read as nothing at all. The turn then had no origin, the fare
+    # gate refused (`has_origin=False`), no booking screen shipped, and the rider who
+    # had answered the question exactly was handed a generic write-up instead.
+    #
+    # Listed FIRST so residence wins over a stray "se" later in the same sentence.
+    (
+        re.compile(
+            r"\b(?:i\s+(?:live|stay|reside)\s+in|i(?:'m|\s+am)\s+from"
+            r"|my\s+home\s+(?:is\s+)?in)\s+"
+            r"([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+    (
+        # "<place> mein rehta/rehti/rehte hun". Only ONE word is captured: the sentence
+        # stacks postpositions ("himachal mei shimla mei rehta hu") and a greedy capture
+        # swallows "himachal mei shimla" as a single place name.
+        re.compile(
+            r"\b([a-z][a-z']*)\s+m(?:e|ei|ain|ein|en)\s+reh(?:ta|ti|te)\b",
+            re.IGNORECASE,
+        ),
+        "before",
+    ),
     (
         re.compile(
             r"\b(?:from|starting\s+(?:at|from)|pick\s*me\s*up\s*(?:from|at|in)?"
