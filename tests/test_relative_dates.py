@@ -375,3 +375,107 @@ class TestWhatTheRiderActuallySees:
             f"{phrase!r} put {booked!r} in the booking screen's date field"
         )
         _date.fromisoformat(booked)   # renderable, which is the whole requirement
+
+
+# ── The booking screen's date field ───────────────────────────────────────────
+
+class TestTheDateThatReachesTheBookingScreen:
+    """Reported on the local flow: the rider answered "aaj" and the booking screen's
+    date field carried the word "aaj".
+
+    The rental flow had been safe since the phrase bug was first fixed, because
+    `sanitize_entities(is_rental=True)` rewrites the stored value. The trip flows
+    deliberately do not — "sometime after Diwali" is worth keeping word for word in the
+    reply — so the trip handoff shipped whatever the rider typed. Both flows now convert
+    at the handoff, which is the one place a date leaves for a form.
+    """
+
+    @staticmethod
+    def _entities(**kw):
+        from app.domain.conversation import ExtractedEntities
+
+        return ExtractedEntities(visitor_type="local", **kw)
+
+    @pytest.mark.parametrize(
+        "phrase,offset",
+        [("aaj", 0), ("today", 0), ("kal", 1), ("tomorrow", 1),
+         ("day after tomorrow", 2), ("3 din baad", 3)],
+    )
+    def test_a_named_day_becomes_a_real_date(self, phrase, offset):
+        from app.agent.nodes.writer import _handoff_date
+
+        expected = (sanitize.today_ist() + timedelta(days=offset)).isoformat()
+        assert _handoff_date(self._entities(travel_dates=phrase)) == expected
+
+    @pytest.mark.parametrize("phrase", ["next week", "sometime after Diwali"])
+    def test_a_phrase_naming_no_single_day_is_passed_through(self, phrase):
+        """Still the rider's own answer, and inventing a date for it would be worse
+        than sending words a form can show as typed."""
+        from app.agent.nodes.writer import _handoff_date
+
+        assert _handoff_date(self._entities(travel_dates=phrase)) == phrase
+
+    def test_a_day_that_has_gone_is_sent_as_nothing(self):
+        """Not as the words either. A form that opens on "yesterday" is worse than one
+        that opens empty and asks."""
+        from app.agent.nodes.writer import _handoff_date
+
+        assert _handoff_date(self._entities(travel_dates="yesterday")) is None
+
+    def test_no_date_stays_no_date(self):
+        from app.agent.nodes.writer import _handoff_date
+
+        assert _handoff_date(self._entities()) is None
+
+
+class TestTheRiderSeesTheDayTheyGave:
+    """The other half of the same report. The local flow ASKS "आप कब यात्रा करना चाहते
+    हैं?" and will not proceed without an answer — and then the day appeared nowhere in
+    the reply. A rider who typed "aaj" saw a ride with no date on it, which is
+    indistinguishable from the answer having been thrown away.
+    """
+
+    @staticmethod
+    def _state(**kw):
+        from app.agent.state import AgentState
+        from app.domain.conversation import ExtractedEntities
+
+        return AgentState(
+            session_id="s", user_id="u", intent="plan_trip", visitor_type="local",
+            entities=ExtractedEntities(visitor_type="local", origin="Shimla",
+                                       destination="Kasol", group_size=4, **kw),
+            route_estimate={"distance_km": 217, "duration_text": "4h 30m"},
+        )
+
+    @pytest.mark.parametrize("lang_key", ["en", "hi"])
+    @pytest.mark.parametrize("phrase", ["aaj", "kal", "3 din baad"])
+    def test_the_day_is_said_back(self, lang_key, phrase):
+        from app.agent.ride_reply import build_ride_reply
+
+        assert phrase in build_ride_reply(self._state(travel_dates=phrase), lang_key)
+
+    @pytest.mark.parametrize("lang_key", ["en", "hi"])
+    def test_it_is_said_in_the_riders_words_not_as_iso(self, lang_key):
+        """The booking screen gets the ISO date; the reply does not. Answering "aaj"
+        with "2026-09-21" reads like a machine that did not understand."""
+        from app.agent.ride_reply import build_ride_reply
+
+        reply = build_ride_reply(self._state(travel_dates="aaj"), lang_key)
+        assert "aaj" in reply
+        assert sanitize.today_ist().isoformat() not in reply
+
+    @pytest.mark.parametrize("lang_key", ["en", "hi"])
+    def test_the_hour_joins_the_day_when_there_is_one(self, lang_key):
+        from app.agent.ride_reply import build_ride_reply
+
+        reply = build_ride_reply(
+            self._state(travel_dates="kal", pickup_time="06:00"), lang_key
+        )
+        assert "kal" in reply and "06:00" in reply
+
+    @pytest.mark.parametrize("lang_key", ["en", "hi"])
+    def test_no_day_means_no_line_rather_than_an_empty_one(self, lang_key):
+        from app.agent.ride_reply import build_ride_reply
+
+        reply = build_ride_reply(self._state(), lang_key)
+        assert "Pickup day" not in reply and "पिकअप दिन" not in reply

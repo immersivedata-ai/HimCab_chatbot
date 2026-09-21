@@ -56,6 +56,18 @@ _TEXT: dict[str, dict[str, str]] = {
         "en": "Drive time: about {duration} ({distance} km)",
         "hi": "ड्राइव समय: लगभग {duration} ({distance} किमी)",
     },
+    #: The day, said back. It was collected — the flow asks "आप कब यात्रा करना चाहते
+    #: हैं?" and will not proceed without an answer — and then appeared nowhere in the
+    #: reply, so a rider who typed "aaj" saw a ride with no date on it and reported the
+    #: day as not working. Anything we ask for has to come back, or asking was theatre.
+    "day": {
+        "en": "Pickup day: {day}",
+        "hi": "पिकअप दिन: {day}",
+    },
+    "day_with_time": {
+        "en": "Pickup: {day} at {time}",
+        "hi": "पिकअप: {day}, {time} बजे",
+    },
     "cab": {
         "en": "{name}{seats}: ₹{fare}",
         "hi": "{name}{seats}: ₹{fare}",
@@ -136,6 +148,22 @@ def build_ride_reply(state, lang_key: str = ReplyLanguage.ENGLISH) -> str:
                 lang_key,
                 duration=route["duration_text"],
                 distance=round(route["distance_km"]),
+            )
+        )
+
+    # ── When ──────────────────────────────────────────────────────────────────
+    # Shown as the rider said it ("aaj", "kal", "3 din baad"), not as the ISO date the
+    # booking screen gets. They are the same day — `sanitize` resolves one from the
+    # other — but a reply that answers "aaj" with "2026-09-21" reads like a machine
+    # that did not understand, which is the opposite of the point of saying it back.
+    day = entities.travel_dates
+    if day:
+        lines.append(
+            "- "
+            + (
+                _t("day_with_time", lang_key, day=day, time=entities.pickup_time)
+                if entities.pickup_time
+                else _t("day", lang_key, day=day)
             )
         )
 

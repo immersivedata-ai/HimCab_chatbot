@@ -41,7 +41,7 @@ from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.agent import slots
+from app.agent import sanitize, slots
 from app.agent.guardrails import apply_guardrails
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
@@ -526,6 +526,30 @@ def _with_change_note(state: AgentState, text: str) -> str:
     return f"{note}\n\n{text}" if note else text
 
 
+#: The booking screen has a DATE field. It cannot render "aaj", "kal" or "3 din baad",
+#: and a rider who typed one of those and then saw the word sitting in a form reported
+#: the day as not working at all.
+#:
+#: The rental flow has resolved this since the phrase bug was first reported, because
+#: `sanitize_entities(is_rental=True)` rewrites the stored value to ISO. The trip flows
+#: deliberately do NOT: "sometime after Diwali" is worth keeping word for word in the
+#: reply, and rewriting it in the entities would lose it everywhere. So the conversion
+#: belongs HERE, at the one place a date leaves for a form — the reply keeps the words,
+#: the handoff gets the date, and neither has to compromise for the other.
+def _handoff_date(entities) -> Optional[str]:
+    """The travel date as a booking screen can use it, or the rider's words if it names
+    no single day."""
+    stated = entities.travel_dates
+    if not stated:
+        return None
+    resolved = sanitize.travel_date(stated, as_iso=True)
+    # `travel_date` returns None for a day already past, which is not a reason to send
+    # the words instead — it is a reason to send nothing and let the screen ask.
+    if resolved is None:
+        return None if sanitize.day_already_gone(stated) else stated
+    return resolved
+
+
 def _build_booking_handoff(state: AgentState) -> Optional[dict]:
     """The payload the app needs to open its booking screen on this journey.
 
@@ -581,7 +605,7 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
             # recommendation. The app's Rent a Car screen should open with that cab
             # already selected; anything else re-asks a question they have answered.
             "category_selected_by_rider": bool(fare.get("selected_by_rider")),
-            "travel_dates": state.entities.travel_dates,
+            "travel_dates": _handoff_date(state.entities),
             # The clock time the quote was priced on, so the booking screen opens on the
             # same one. Sending the day without the hour would let the rider land on a
             # default time and be charged a rate they were never shown.
@@ -616,7 +640,7 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         # to Kasol run that arrives without a trip_type opens the wrong form.
         "trip_type": fare.get("trip_type") or classify_trip_type(route["distance_km"]),
         "passengers": state.entities.group_size,
-        "travel_dates": state.entities.travel_dates,
+        "travel_dates": _handoff_date(state.entities),
         # The cab we put in front of them, so the booking screen opens on the same one.
         "recommended_category_id": fare.get("category_id"),
         "recommended_category_name": fare.get("category_name"),

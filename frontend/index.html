@@ -429,6 +429,18 @@
     </div>
   </header>
 
+  <!-- ── Why there is no price ─────────────────────────────────────────────
+       The backend maps `dev-test-token` to jwt=None on purpose, and the fare gate
+       requires a rider JWT — so on the placeholder token there is no fare, and with
+       no fare there are no cab options to choose from. The rental page has warned
+       about this for a while; these two did not, and a local ride with no cab list
+       and no explanation was reported as the flow being broken. -->
+  <div id="notice" style="display:none;align-items:flex-start;gap:9px;padding:9px 20px;
+       background:#fef3c7;border-bottom:1px solid #fde68a;color:#78350f;
+       font-size:0.76rem;line-height:1.5;flex-shrink:0">
+    <span id="notice-text"></span>
+  </div>
+
   <div id="chat-container">
     <div id="welcome-screen">
       <div class="welcome-logo">
@@ -493,6 +505,26 @@
 
     function scrollToBottom() {
       $chatContainer.scrollTop = $chatContainer.scrollHeight;
+    }
+
+    // ── Why there is no price ───────────────────────────────────────────────
+    //: True while the page is running on the placeholder token. The backend maps it to
+    //: jwt=None on purpose, the fare gate requires a rider JWT, and with no fare there
+    //: are no cab options — the single most common reason this page shows no cabs.
+    const usingDevToken = () => RIDER_TOKEN === "dev-test-token";
+
+    function noticeIfNoFare(events) {
+      const el = document.getElementById("notice");
+      if (!el) return;
+      const priced = (events || []).some(e => e.type === "cab_fare");
+      if (priced || !usingDevToken()) { el.style.display = "none"; return; }
+      document.getElementById("notice-text").innerHTML =
+        "<b>No cab options.</b> This page is using the placeholder " +
+        "<code>dev-test-token</code>, which the backend treats as no rider credential " +
+        "at all — so no fare is requested and there are no cabs to choose from. " +
+        "Open this page as <code>?rider_token=&lt;JWT&gt;</code> with a real Him Cab " +
+        "rider token to see prices.";
+      el.style.display = "flex";
     }
 
     function showError(msg) {
@@ -751,6 +783,8 @@
             }
           }
         }
+
+        noticeIfNoFare(structured);
 
         if (structured.length) {
           const parentCol = bubble.parentElement;

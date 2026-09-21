@@ -937,7 +937,11 @@ class TestThePickupTimeIsAskedFor:
         ))
 
         assert handoff["pickup_time"] == "06:00"
-        assert handoff["travel_dates"] == "kal"
+        # A DATE, not the word. The booking screen has a date field and cannot render
+        # "kal"; `_handoff_date` resolves it here so the reply can still say "kal".
+        assert handoff["travel_dates"] == (
+            sanitize.today_ist() + timedelta(days=1)
+        ).isoformat()
 
     def test_the_reply_is_told_to_state_it_back(self):
         from app.agent.nodes.writer import _build_system_prompt
