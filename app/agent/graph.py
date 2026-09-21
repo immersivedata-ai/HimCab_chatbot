@@ -88,6 +88,19 @@ async def clarify_node(state: AgentState) -> dict:
             else "Alright — putting your trip plan together..."
         )
 
+    # A day that has already gone. The slot policy cannot word this itself — it reads
+    # the entities, and the value was dropped by the validator precisely because it was
+    # unusable — so the re-wording happens here, where the rejected phrase is still on
+    # state. Without it the rider who typed "yesterday" got "when are you planning to
+    # travel?" straight back, which is how this was reported: not as a refusal they
+    # disagreed with, but as the assistant failing to read a date at all.
+    if asked_field == slots.SlotName.TRAVEL_DATES and state.past_travel_date:
+        question = slots.when_question(
+            lang_key,
+            state.entities.asked_counts.get(slots.SlotName.TRAVEL_DATES, 0) - 1,
+            past_day=state.past_travel_date,
+        )
+
     # The packages travel with the question as a structured event as well as in the
     # text, so the app can offer them as taps instead of making the rider type a
     # duration back — the one field where a free-text answer is likely to be unbookable.
@@ -182,6 +195,7 @@ async def cancel_node(state: AgentState) -> dict:
         "awaiting_cab_choice": False,
         "unavailable_cab_category": None,
         "unbookable_rental_hours": None,
+        "past_travel_date": None,
         "structured_events": [cancellation.cancellation_event(scope, cleared)],
         "node_trace": ["cancel"],
     }

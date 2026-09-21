@@ -109,6 +109,13 @@ class AgentState(BaseModel):
     #: `unbookable_rental_hours` — so the reply can say "we don't run a Premium on this
     #: package" and list the ones that were priced, rather than silently booking another.
     unavailable_cab_category: Optional[str] = None
+    #: A day the rider named that has already passed ("yesterday", "day before
+    #: yesterday"), in their own words. Set by the planner alongside a cleared
+    #: `entities.travel_dates`, on the same principle as the two above: the value cannot
+    #: be used, so the slot goes empty and is asked again — but the question NAMES it,
+    #: because a rider who answered precisely and got the identical question back reads
+    #: that as not having been understood at all. That is how this was reported.
+    past_travel_date: Optional[str] = None
     #: True while the reply's job is to ask WHICH CAB. Set by the tool executor once a
     #: fare has come back with options and the rider has not picked one (and cleared once
     #: they have, or once the question has been asked its allotted times). The writer's

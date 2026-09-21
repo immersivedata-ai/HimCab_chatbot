@@ -147,65 +147,31 @@ def place(value: Any) -> Optional[str]:
     return text
 
 
-#: Relative day expressions, mapped to an offset in days from the rider's today.
-#:
-#: `kal` and `parso` each mean a day in BOTH directions in Hindi — kal is yesterday and
-#: tomorrow, parso is the day before yesterday and the day after tomorrow. Which one is
-#: meant comes from the verb tense, which we do not parse. The future reading is taken
-#: because this is a booking: somebody arranging a cab means the coming day, and the
-#: past reading is not something anyone can book anyway.
-_RELATIVE_DAYS: dict[str, int] = {
-    "day before yesterday": -2,
-    "yesterday": -1,
-    "today": 0, "tonight": 0, "tonite": 0, "tdy": 0, "aaj": 0, "aj": 0,
-    "tomorrow": 1, "tommorow": 1, "tomorow": 1, "tomarrow": 1, "tomorrw": 1,
-    "tmrw": 1, "tmr": 1, "tmw": 1, "kal": 1,
-    "day after tomorrow": 2, "day after tmrw": 2, "day after": 2,
-    "parso": 2, "parson": 2, "parsoo": 2,
-}
-
-#: Longest first, so "day after tomorrow" is matched before "tomorrow" — the whole
-#: point. Matching the short one first is a silent off-by-one day: the rider asks for
-#: Thursday and the cab is booked for Wednesday.
-_RELATIVE_DAY_PATTERNS: list[tuple[re.Pattern, int]] = [
-    (
-        re.compile(
-            r"(?<!\w)" + re.escape(phrase).replace(r"\ ", r"\s+") + r"(?!\w)",
-            re.IGNORECASE,
-        ),
-        offset,
-    )
-    for phrase, offset in sorted(_RELATIVE_DAYS.items(), key=lambda kv: -len(kv[0]))
-]
-
-#: The same words in Devanagari, matched by substring because the word-boundary guard
-#: above is written for Latin script. Longest first, for the same reason.
-_DEVANAGARI_DAYS: list[tuple[str, int]] = [
-    ("परसों", 2),   # parson
-    ("आज", 0),                     # aaj
-    ("कल", 1),                     # kal
-]
-
-
 def resolve_relative_day(text: Any, *, today: Optional[date] = None) -> Optional[date]:
     """The calendar date a relative day phrase names, or None if it names none.
 
-    "tomorrow", "day after tomorrow", "parso", "tmrw" — the phrases riders actually
-    type into a date field. Returns a real date so the booking screen has something it
-    can render; a phrase this cannot resolve ("next week", "after Diwali") is not a
-    single day and is deliberately left alone by the callers.
+    "tomorrow", "day after tomorrow", "parso", "tmrw", "3 din baad" — the phrases riders
+    actually type into a date field. Returns a real date so the booking screen has
+    something it can render; a phrase naming no single day ("next week", "after Diwali")
+    is left alone by the callers.
+
+    The phrase table lives in `slots.RELATIVE_DAY_PHRASES`, with the rest of the
+    reading. It used to live here, duplicated against the sentence reader's own list of
+    day words, and the two drifted: "day after tmrw" resolved correctly here and was
+    read as plain "tmrw" over there, so the booking landed a day early. Reading in one
+    place and the CALENDAR in this one is what stops that recurring.
+
+    A date in the PAST comes back as a past date, not as None. Refusing it is
+    `travel_date`'s job, and the two are kept apart so the refusal can name the day the
+    rider actually said instead of pretending not to have understood them.
     """
     cleaned = clean_text(text)
     if cleaned is None:
         return None
-    base = today or today_ist()
-    for pattern, offset in _RELATIVE_DAY_PATTERNS:
-        if pattern.search(cleaned):
-            return base + timedelta(days=offset)
-    for word, offset in _DEVANAGARI_DAYS:
-        if word in cleaned:
-            return base + timedelta(days=offset)
-    return None
+    offset = slots.relative_day_offset(cleaned)
+    if offset is None:
+        return None
+    return (today or today_ist()) + timedelta(days=offset)
 
 
 def travel_date(
@@ -234,11 +200,33 @@ def travel_date(
         log.info(
             "travel_date_in_the_past_dropped", value=cleaned, resolved=str(resolved)
         )
+        # Dropped, but see `day_already_gone` — the caller asks that too, so the
+        # question that goes back can name the day instead of repeating itself.
         return None
     if (resolved - base).days > _MAX_DAYS_AHEAD:
         log.info("travel_date_too_far_ahead_dropped", value=cleaned)
         return None
     return resolved.isoformat() if as_iso else cleaned
+
+
+def day_already_gone(value: Any, *, today: Optional[date] = None) -> Optional[str]:
+    """The rider's own words for a day that has already passed, or None.
+
+    The companion to `travel_date` rejecting one. Dropping the value is right — nobody
+    hires a car for yesterday — but dropping it SILENTLY was not: the slot went empty,
+    the policy asked "when are you planning to travel?", and the rider who had just
+    answered that question got it back word for word with no sign of what was wrong.
+    Reported as the assistant not detecting the date at all, which is exactly what it
+    looks like from the other side.
+
+    Returns the phrase as they typed it, so the question can quote it back.
+    """
+    cleaned = clean_text(value)
+    if cleaned is None:
+        return None
+    base = today or today_ist()
+    resolved = resolve_relative_day(cleaned, today=base)
+    return cleaned if resolved is not None and resolved < base else None
 
 
 def group_size(value: Any) -> Optional[int]:

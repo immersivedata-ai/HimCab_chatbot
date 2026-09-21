@@ -388,15 +388,18 @@ def _resolve(
     visitor_type: Optional[str],
     lang_key: str,
     unbookable_hours: Optional[int] = None,
+    past_travel_date: Optional[str] = None,
 ) -> dict:
     """Apply the slot policy and package the node's return value.
 
     Shared by the LLM path and the LLM-failure path so a Vertex outage changes what
     the agent KNOWS, never how it BEHAVES.
 
-    `unbookable_hours` is a duration the rider asked for that Him Cab does not sell. It
-    travels on state so the question that goes back to them can NAME it — see
-    `graph.clarify_node`.
+    `unbookable_hours` is a duration the rider asked for that Him Cab does not sell, and
+    `past_travel_date` a day they named that has already gone. Both travel on state so
+    the question that goes back to them can NAME what could not be used — see
+    `graph.clarify_node`. A question that just repeats itself is the thing both exist to
+    prevent.
     """
     decision = slots.decide(
         entities,
@@ -421,6 +424,7 @@ def _resolve(
         "last_asked_field": decision.ask_field,
         "assumed_fields": list(decision.assumed),
         "unbookable_rental_hours": unbookable_hours,
+        "past_travel_date": past_travel_date,
         "node_trace": ["planner"],
     }
 
@@ -859,6 +863,10 @@ Report what the user has stated. Use null for anything they have not."""
     #
     # For a rental this is also where "tomorrow" becomes a real date — see
     # `sanitize.travel_date`.
+    # Asked BEFORE the gate, because the gate is what empties the field: afterwards
+    # there is nothing left to tell the rider we could not use.
+    past_day = sanitize.day_already_gone(merged.get("travel_dates"))
+
     merged, rejected = sanitize.sanitize_entities(merged, is_rental=is_rental)
     if rejected:
         log.info(
@@ -866,6 +874,8 @@ Report what the user has stated. Use null for anything they have not."""
             fields=rejected,
             session_id=state.session_id,
         )
+    if past_day:
+        log.info("travel_date_already_gone", value=past_day, session_id=state.session_id)
 
     # ── A duration we do not sell, refused on the turn it arrives ─────────────
     unbookable_hours = (
@@ -953,7 +963,9 @@ Report what the user has stated. Use null for anything they have not."""
             visitor_type,
         )
 
-    result = _resolve(state, entities, visitor_type, lang_key, unbookable_hours)
+    result = _resolve(
+        state, entities, visitor_type, lang_key, unbookable_hours, past_day
+    )
 
     # A change that just landed is stated in the reply, so the rider can see it took.
     # Everything downstream — route, fare, weather, booking handoff — is rebuilt from

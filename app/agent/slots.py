@@ -294,6 +294,229 @@ def parse_group_size(text: str) -> Optional[int]:
     return _in_range(int(m.group(1)), 1, 60) if m else None
 
 
+# ── Relative days ─────────────────────────────────────────────────────────────
+#
+# Every phrase that names ONE day relative to the rider's today, in one table.
+#
+# It used to be three, and they disagreed. `sanitize._RELATIVE_DAYS` could resolve
+# "day after tmrw" to a date; the sentence reader below had a pattern for "day after
+# tomorrow" but none for the abbreviation, so it fell through to the bare-word pattern,
+# matched "tmrw" alone, and the rental was booked for Wednesday when the rider said
+# Thursday. A silent off-by-one on a real cab, produced by nothing but two lists that
+# had drifted apart. So there is now one list, and `test_slots.py` asserts the readers
+# are all built from it.
+#
+# `kal` and `parso` each mean a day in BOTH directions in Hindi — kal is yesterday and
+# tomorrow, parso is the day before yesterday and the day after tomorrow. Which is meant
+# comes from the verb tense, which we do not parse. The future reading is taken because
+# this is a booking: somebody arranging a cab means the coming day.
+#
+# Past days are HERE ON PURPOSE, even though nobody can book one. Leaving "yesterday"
+# out meant it read as no date at all, so the rider got the identical "when are you
+# travelling?" question back and no hint of what was wrong with their answer — which is
+# indistinguishable from not being understood. Recognising it is what lets
+# `sanitize.travel_date` refuse it and `clarify_node` say why.
+RELATIVE_DAY_PHRASES: dict[str, int] = {
+    # Past — recognised so it can be refused by name, never to book against.
+    "day before yesterday": -2,
+    "beeta kal": -1, "bita kal": -1, "pichhla kal": -1, "pichla kal": -1,
+    "yesterday": -1, "ystrday": -1, "yday": -1,
+    # Today. "abhi"/"asap"/"right now" are a day answer, not a clock reading — a rider
+    # who wants a car NOW is booking for today, and `pickup_time` is asked separately.
+    "today": 0, "todya": 0, "tonight": 0, "tonite": 0, "tdy": 0, "2day": 0,
+    "aaj": 0, "aj": 0, "aaj hi": 0, "ajj": 0,
+    # A bare "now" and a bare "jaldi" are NOT here, and must not be: "we are 5 people
+    # now" and "jaldi karo" are not dates, and reading them as one turned an ordinary
+    # correction into a proposed change of travel date. Only the unambiguous forms.
+    "right now": 0, "just now": 0, "abhi": 0, "abhi hi": 0,
+    "asap": 0, "immediately": 0, "turant": 0,
+    # Tomorrow.
+    "tomorrow": 1, "tommorow": 1, "tomorow": 1, "tomarrow": 1, "tomorrw": 1,
+    "tommorrow": 1, "tomm": 1, "tmrw": 1, "tmrow": 1, "tmr": 1, "tmw": 1,
+    "kal": 1, "kl": 1, "agle din": 1,
+    # The day after. Every spelling of "tomorrow" above needs its own entry here, or
+    # the shorter one wins and the booking lands a day early — see the note above.
+    "day after tomorrow": 2, "day after tommorow": 2, "day after tomorow": 2,
+    "day after tomarrow": 2, "day after tommorrow": 2, "day after tmrw": 2,
+    "day after tmr": 2, "day after tmw": 2, "day after kal": 2,
+    "day after next": 2, "next to next day": 2,
+    "parso": 2, "parson": 2, "parsoo": 2, "porso": 2, "parsu": 2,
+    # Three days out. A real word in Hindi and the natural next step after "parso".
+    "narso": 3, "narson": 3, "atparso": 3, "terso": 3,
+}
+
+#: The same phrases in Devanagari. Matched by substring rather than word boundary,
+#: because `\b` is written for Latin script and does not fire between Devanagari and
+#: punctuation. Longest first, for the same reason the Latin table is sorted.
+DEVANAGARI_DAY_PHRASES: dict[str, int] = {
+    "परसों से पहले": -2,
+    "बीता कल": -1, "पिछला कल": -1,
+    "परसों": 2, "नरसों": 3,
+    "आज": 0, "अभी": 0, "तुरंत": 0,
+    "कल": 1,
+}
+
+#: Phrases that name a day ONLY when they are the whole answer, or end it.
+#:
+#: "day after" and "next day" are complete answers to "when?" and also ordinary English
+#: clause fragments — "the day after we reach we go to Kasol" and "next day return" are
+#: not dates, and reading them as one files the wrong travel date off a sentence about
+#: something else. Anchoring costs nothing a rider would notice: somebody answering the
+#: question types the phrase and stops.
+_ANCHORED_DAY_PHRASES: dict[str, int] = {
+    "day after": 2,
+    "next day": 1,
+}
+
+#: Phrases built out of day words that are NOT days. Blanked before anything else runs,
+#: so the words inside them cannot be matched by the tables above: "aaj kal" is the
+#: idiom for "these days" ("aaj kal bahut traffic hai"), not today.
+_DECOY_DAY_RES: tuple[re.Pattern, ...] = (
+    re.compile(r"(?<!\w)aaj\s*kal(?!\w)", re.IGNORECASE),
+    re.compile(r"(?<!\w)aajkal(?!\w)", re.IGNORECASE),
+    re.compile(r"(?<!\w)day\s+after\s+day(?!\w)", re.IGNORECASE),
+    re.compile(r"(?<!\w)din\s+ba\s+din(?!\w)", re.IGNORECASE),
+    re.compile(r"आजकल|आज\s*कल"),
+)
+
+#: Spelled-out counts, for "do din baad" / "three days later". Riders type the word as
+#: often as the digit, and a count we cannot read is a phrase that reaches the booking
+#: screen's date field verbatim — the bug this whole area exists to prevent.
+_COUNT_WORDS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10,
+    "ek": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5,
+    "chhe": 6, "che": 6, "chah": 6, "saat": 7, "aath": 8, "nau": 9, "das": 10,
+    "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6, "सात": 7,
+    "आठ": 8, "नौ": 9, "दस": 10,
+}
+
+_COUNT_ALTERNATION = "|".join(
+    re.escape(word) for word in sorted(_COUNT_WORDS, key=len, reverse=True)
+)
+
+#: "in 3 days", "3 days later", "teen din baad", "3 दिन बाद" — a count plus a marker
+#: that puts it in the FUTURE. The marker is required: without it "3 days" is a trip
+#: length, and reading a duration as a date would book the wrong day from the answer to
+#: a different question entirely.
+_COUNTED_DAY_RES: tuple[re.Pattern, ...] = (
+    re.compile(
+        rf"(?<!\w)(?:in|after|within)\s+(\d{{1,3}}|{_COUNT_ALTERNATION})\s*"
+        rf"(?:days?|din|dino|dinon|दिन)(?!\w)",
+        re.IGNORECASE,
+    ),
+    # `से` ("se") is deliberately NOT a marker here: "3 din se" means "for the last
+    # three days", the opposite direction, and reading it as "in three days" would book
+    # a cab off a sentence complaining about the weather.
+    re.compile(
+        rf"(?<!\w)(\d{{1,3}}|{_COUNT_ALTERNATION})\s*(?:days?|din|dino|dinon|दिन)\s*"
+        rf"(?:later|after|baad|bad|बाद|from\s+now|from\s+today)(?!\w)",
+        re.IGNORECASE,
+    ),
+)
+
+_ANCHORED_DAY_RES: list[tuple[re.Pattern, int]] = [
+    (
+        re.compile(
+            r"(?<!\w)" + re.escape(phrase).replace(r"\ ", r"\s+") + r"\s*[.!?]*\s*$",
+            re.IGNORECASE,
+        ),
+        offset,
+    )
+    for phrase, offset in sorted(
+        _ANCHORED_DAY_PHRASES.items(), key=lambda kv: -len(kv[0])
+    )
+]
+
+#: Longest phrase first, so "day after tomorrow" is matched before "tomorrow" and
+#: "aaj hi" before "aaj". Matching the short one first is the silent off-by-one.
+_RELATIVE_DAY_RES: list[tuple[re.Pattern, int]] = [
+    (
+        re.compile(
+            r"(?<!\w)" + re.escape(phrase).replace(r"\ ", r"\s+") + r"(?!\w)",
+            re.IGNORECASE,
+        ),
+        offset,
+    )
+    for phrase, offset in sorted(
+        RELATIVE_DAY_PHRASES.items(), key=lambda kv: -len(kv[0])
+    )
+]
+
+_DEVANAGARI_DAY_RES: list[tuple[str, int]] = sorted(
+    DEVANAGARI_DAY_PHRASES.items(), key=lambda kv: -len(kv[0])
+)
+
+#: How far out a counted phrase is still a booking. "in 500 days" is a typo or a joke,
+#: and `sanitize` caps the resolved date anyway; this only stops the reader claiming
+#: the phrase names a day when it plainly names nonsense.
+_MAX_COUNTED_DAYS = 365
+
+
+def find_relative_day(text: str) -> Optional[tuple[str, int]]:
+    """The relative-day phrase in `text` and its offset in days, or None.
+
+    Returns the matched TEXT as well as the offset, because two callers need different
+    halves: `sanitize.resolve_relative_day` wants the number so it can produce a real
+    date, and `tidy_when` wants the words so it can reduce "I am planning to travel day
+    after tomorrow" to the part that goes in a date field.
+
+    The offset may be NEGATIVE. This function reads; it does not decide what is
+    bookable. `sanitize.travel_date` owns that, and having the reading separate from
+    the policy is what lets a past date be refused by name instead of silently.
+
+    The EARLIEST phrase in the string wins, and at a given position the longest. Both
+    halves matter: "day after tmrw" must not be read as the "tmrw" inside it, and a
+    sentence that mentions two days means the first one. A compound like "kal se 3 din
+    baad" ("three days after tomorrow") is read as its first phrase rather than summed —
+    rare enough not to be worth the ambiguity of trying, and the rider sees the day we
+    chose in the reply.
+    """
+    if not text or not text.strip():
+        return None
+    low = text.strip().lower()
+    # Blanked, not removed, so every offset below still indexes into the original and
+    # the matched text handed back is the rider's own.
+    for decoy in _DECOY_DAY_RES:
+        low = decoy.sub(lambda m: " " * len(m.group(0)), low)
+
+    best: Optional[tuple[int, str, int]] = None   # (start, matched, offset)
+    for pattern, offset in _ANCHORED_DAY_RES:
+        match = pattern.search(low)
+        if match and (best is None or match.start() < best[0]):
+            best = (match.start(), match.group(0).strip(" .!?"), offset)
+    for pattern, offset in _RELATIVE_DAY_RES:
+        match = pattern.search(low)
+        if match and (best is None or match.start() < best[0]):
+            best = (match.start(), match.group(0), offset)
+            if match.start() == 0:
+                break
+    for phrase, offset in _DEVANAGARI_DAY_RES:
+        index = low.find(phrase)
+        if index != -1 and (best is None or index < best[0]):
+            best = (index, phrase, offset)
+    for pattern in _COUNTED_DAY_RES:
+        match = pattern.search(low)
+        if not match:
+            continue
+        raw = match.group(1)
+        count = int(raw) if raw.isdigit() else _COUNT_WORDS.get(raw.lower(), 0)
+        if not 0 < count <= _MAX_COUNTED_DAYS:
+            continue
+        # At the SAME position a counted phrase wins, being the more specific reading.
+        # Earlier in the string still beats later, like every other reader here.
+        if best is None or match.start() <= best[0]:
+            best = (match.start(), match.group(0), count)
+
+    return (best[1], best[2]) if best else None
+
+
+def relative_day_offset(text: str) -> Optional[int]:
+    """How many days from today `text` names, or None if it names no single day."""
+    found = find_relative_day(text)
+    return found[1] if found else None
+
+
 # Words that mark a reply as being about WHEN. Used both to accept a date and, in
 # `parse_place`, to reject one — the parsers police each other's boundaries so a
 # reply can never be filed against a field it doesn't answer.
@@ -316,6 +539,24 @@ _TIME_WORDS = {
     "tmrw", "tmr", "tmw", "tdy", "tonite", "tonit",
     "कल", "आज", "परसों", "अगले", "अगला", "इस", "हफ्ते", "हफ्ता", "महीने", "महीना",
 }
+
+# Every word of every phrase the resolver knows, so a reply it CAN resolve is never
+# turned away here as "not a date". These two used to be maintained by hand and
+# disagreed: "yesterday" and "abhi" resolved to real days that `parse_when` then
+# refused to accept, so the value never reached the validator that would have explained
+# the problem — the rider just got the same question again.
+_TIME_WORDS |= {
+    word
+    for phrase in (
+        *RELATIVE_DAY_PHRASES, *DEVANAGARI_DAY_PHRASES, *_ANCHORED_DAY_PHRASES
+    )
+    for word in phrase.split()
+}
+#: "baad" carries a counted phrase ("3 din baad"); "din" is its noun. Listed separately
+#: because they are words of no fixed phrase above. "days"/"day" are deliberately NOT
+#: here: "4 days" is a trip LENGTH, and every counted date phrase already clears
+#: `parse_when` on its digit or on "later"/"baad".
+_TIME_WORDS |= {"din", "dino", "dinon", "baad", "bad", "दिन", "बाद"}
 
 #: Full words riders routinely misspell when answering "when?". Only present/future
 #: days — "yesterday" is left out on purpose, so a past day is never silently taken as
@@ -524,7 +765,6 @@ _WEEKDAYS = (
 #: "start", "end" and "mid" — words that appear in sentences about anything ("start
 #: from Shimla") and would otherwise be filed as the travel date.
 _SENTENCE_WHEN_RES = (
-    re.compile(r"\bday\s+after\s+tomorrow\b", re.IGNORECASE),
     re.compile(r"\b(?:\d{1,2})[/-](?:\d{1,2})(?:[/-]\d{2,4})?\b"),
     re.compile(rf"\b\d{{1,2}}\s*(?:st|nd|rd|th)?\s+(?:{_MONTHS})\b", re.IGNORECASE),
     re.compile(rf"\b(?:{_MONTHS})\s+\d{{1,2}}\b", re.IGNORECASE),
@@ -534,12 +774,26 @@ _SENTENCE_WHEN_RES = (
         re.IGNORECASE,
     ),
     re.compile(rf"\b(?:{_WEEKDAYS})\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:today|tonight|tonite|tomorrow|tommorow|tomorow|tomarrow|tmrw|tmr|tmw"
-        r"|aaj|kal|parso|parson|weekend)\b",
-        re.IGNORECASE,
-    ),
+    re.compile(r"\bweekend\b", re.IGNORECASE),
 )
+
+
+def _sentence_when(text: str) -> Optional[str]:
+    """The DAY inside a sentence, as the rider wrote it, or None.
+
+    Relative days are read by `find_relative_day` rather than by a pattern of their own,
+    so this reader and the resolver can never disagree about which words name which day.
+    They did: "day after tmrw" resolved to +2 but was READ here as "tmrw", and the
+    rental was booked a day early.
+
+    Tried first, before the calendar patterns, because a relative phrase is the more
+    specific reading — "day after tomorrow" must not be reduced to a weekday match
+    hiding inside some other word.
+    """
+    found = find_relative_day(text)
+    if found:
+        return found[0]
+    return _first_group(_SENTENCE_WHEN_RES, text)
 
 _SENTENCE_GROUP_RES = (
     re.compile(rf"(\d{{1,2}})\s*{_GROUP_NOUNS}", re.IGNORECASE),
@@ -821,7 +1075,7 @@ def read_trip_details(text: str) -> dict[str, Any]:
     if origin and origin != destination:
         found["origin"] = origin
 
-    when = _first_group(_SENTENCE_WHEN_RES, stripped)
+    when = _sentence_when(stripped)
     if when:
         found["travel_dates"] = when.strip()
 
@@ -860,7 +1114,7 @@ def tidy_when(text: Optional[str]) -> Optional[str]:
     """
     if not text or not text.strip():
         return text
-    found = _first_group(_SENTENCE_WHEN_RES, text.strip())
+    found = _sentence_when(text.strip())
     return found.strip() if found else text.strip()
 
 
@@ -891,7 +1145,7 @@ def read_rental_details(text: str) -> dict[str, Any]:
     if clock:
         found["pickup_time"] = clock
 
-    when = _first_group(_SENTENCE_WHEN_RES, text.strip())
+    when = _sentence_when(text.strip())
     if when:
         found["travel_dates"] = when.strip()
 
@@ -1124,6 +1378,29 @@ _WHEN_Q_RETRY = {
     "hi": "बस दिन बता दें — जैसे आज, कल, या कोई तारीख।",
     "en": "Just the day is enough — today, tomorrow, or a date.",
 }
+#: Asked when the rider named a day that has already passed. It outranks both wordings
+#: above, for the same reason a duration we do not sell outranks them: they gave a
+#: specific answer, we understood it exactly, and the one thing they must not be told is
+#: the original question again. `{day}` is quoted back in their own words so it is clear
+#: WHICH answer could not be used — the difference between "we can't book that" and the
+#: silence that got this reported.
+_WHEN_Q_PAST = {
+    "hi": "“{day}” तो बीत चुका है — किस दिन के लिए बुक करूँ? आज, कल, या कोई तारीख।",
+    "en": "“{day}” has already passed — which day should I book for? "
+          "Today, tomorrow, or a date.",
+}
+
+
+def when_question(lang_key: str, attempt: int = 0, *, past_day: Optional[str] = None) -> str:
+    """The "when?" question, worded for what just happened.
+
+    `past_day` is a day the rider named that has already gone. It wins over the retry
+    wording: a rider who answered precisely is owed a straight answer about THAT answer,
+    not a repeat of the question or a hint about what a date looks like.
+    """
+    if past_day:
+        return _q(_WHEN_Q_PAST, lang_key).format(day=past_day)
+    return _q(_WHEN_Q_RETRY if attempt else _WHEN_Q, lang_key)
 _RENTAL_PICKUP_Q_RETRY = {
     "hi": "बस शहर का नाम बता दें, जहाँ से गाड़ी लेनी है।",
     "en": "Just the name of the city or town the car should come to.",
@@ -1323,9 +1600,10 @@ SLOTS: dict[str, Slot] = {
     ),
     SlotName.TRAVEL_DATES: Slot(
         name=SlotName.TRAVEL_DATES,
-        ask=lambda lang, _vt, attempt: _q(
-            _WHEN_Q_RETRY if attempt else _WHEN_Q, lang
-        ),
+        # `clarify_node` re-words this when the rider named a day that has gone — see
+        # `when_question`. The slot itself cannot: it is handed the entities, and a
+        # value that was dropped is exactly the thing no longer in them.
+        ask=lambda lang, _vt, attempt: when_question(lang, attempt),
         read=lambda e: e.travel_dates,
         parse=parse_when,
         write=_simple_write("travel_dates"),
