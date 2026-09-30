@@ -1975,3 +1975,30 @@ def label_for(field: str, lang_key: str) -> str:
     """Human-readable name of a slot, for messages shown to the user."""
     slot = SLOTS.get(field)
     return slot.label(lang_key) if slot else field
+
+
+# ── Answer pickers ────────────────────────────────────────────────────────────
+
+#: The largest headcount / day count the app's number picker offers. The parsers accept
+#: more (a coach party, a month-long trip) — anyone beyond it can still type the number.
+PICKER_MAX = 20
+
+#: Questions whose answer is ONE date or ONE small number, and the picker the app opens
+#: for each. A tap in the app is sent back as ordinary message text, worded so the slot's
+#: own parser reads it ("25-09-2026" for `parse_when`, "4" for the number parsers) — so a
+#: picked answer and a typed one travel exactly the same path.
+_INPUT_REQUESTS: dict[str, dict[str, Any]] = {
+    SlotName.TRAVEL_DATES: {"kind": "date"},
+    SlotName.GROUP_SIZE: {"kind": "number", "min": 1, "max": PICKER_MAX, "unit": "people"},
+    SlotName.DURATION_DAYS: {"kind": "number", "min": 1, "max": PICKER_MAX, "unit": "days"},
+}
+
+
+def input_request_for(field: Optional[str]) -> Optional[dict[str, Any]]:
+    """The `input_request` payload for the question being asked, or None.
+
+    None for every question whose answer is not a date or a small number — a place, a
+    clock time, a cab — so the app shows no picker and the rider just types.
+    """
+    spec = _INPUT_REQUESTS.get(field) if field else None
+    return {"field": str(field), **spec} if spec else None

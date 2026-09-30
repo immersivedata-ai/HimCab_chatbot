@@ -123,16 +123,22 @@ async def clarify_node(state: AgentState) -> dict:
                 rejected=state.unbookable_rental_hours,
             )
 
+    events: list[dict] = []
+    if packages:
+        events.append({"type": "rental_packages", "payload": {"packages": packages}})
+    # A date or a headcount is one tap in the app (a calendar, a 1-20 number row) rather
+    # than something to type — and a tapped answer always parses, where "25/9" or "four
+    # of us" might not.
+    input_request = slots.input_request_for(asked_field)
+    if input_request:
+        events.append({"type": "input_request", "payload": input_request})
+
     return {
         "final_response_text": question,
         "messages": [AIMessage(content=question)],
         "last_asked_field": asked_field,
         "rental_packages": packages,
-        "structured_events": (
-            [{"type": "rental_packages", "payload": {"packages": packages}}]
-            if packages
-            else []
-        ),
+        "structured_events": events,
         "node_trace": ["clarify"],
     }
 
