@@ -44,23 +44,55 @@ _PREF_BY_BUDGET = {
 _DEFAULT_PREF = ["standard", "economy"]
 
 #: Under this, the journey is a local run rather than an intercity transfer. Above it,
-#: the backend's OUTSTATION rate card is the right one whoever the rider is.
+#: the backend's OUTSTATION rate card is the right one for a VISITOR.
 _LOCAL_TRIP_MAX_KM = 40.0
+
+#: The persona whose ride is priced LOCAL regardless of distance — see `trip_type_for`.
+_LOCAL_VISITOR = "local"
 
 
 def classify_trip_type(distance_km: Optional[float]) -> TripType:
-    """LOCAL or OUTSTATION, decided by the JOURNEY — not by who is travelling.
+    """LOCAL or OUTSTATION for a trip, decided by the JOURNEY's length.
 
-    This used to be `"LOCAL" if visitor_type == "local"`, which is a different
-    question: a Himachal resident driving Shimla → Manali is a 270 km intercity
-    transfer, and pricing it off the LOCAL rate card gives the rider a number that has
-    nothing to do with the trip they asked about.
+    This is the VISITOR / default classification. The LOCAL-resident flow overrides it —
+    see `trip_type_for`, which is the one place the persona question is answered. Kept
+    journey-based here because for a visitor a 270 km transfer is OUTSTATION whatever the
+    threshold debate.
     """
     if distance_km is None:
         return TripType.OUTSTATION
     return (
         TripType.LOCAL if distance_km <= _LOCAL_TRIP_MAX_KM else TripType.OUTSTATION
     )
+
+
+def trip_type_for(
+    visitor_type: Optional[str], distance_km: Optional[float]
+) -> TripType:
+    """The rate card a ride is priced on — the ONE place the fare and the booking handoff
+    both read it, so they can never disagree about which screen and which price a trip gets.
+
+    The LOCAL / resident flow is priced on the LOCAL card ALWAYS — a resident's ride is
+    LOCAL whether it is 5 km or 177 km. This is deliberate, and it MATCHES THE HIM CAB APP,
+    which is the whole point: the app quotes a resident on the flat LOCAL card, and its
+    OUTSTATION booking screen refuses anything inside one state and under 200 km — so a
+    177 km intra-Himachal ride is LOCAL there for booking too. A chat quote that disagreed
+    with the app (₹4,675 against the app's ₹231) is a quote the rider stops trusting, and
+    it opens a booking screen the app then refuses.
+
+    This REVERSES the earlier distance-only rule (`classify_trip_type`), which priced a
+    resident's long trip as OUTSTATION: a more accurate per-km figure, but not the number
+    the rider is actually charged — and matching what the rider is charged is the only
+    thing this quote is for. The measured verification: on the live backend the LOCAL card
+    returns the app's exact figures (Standard ₹231) and is FLAT across distance, while
+    OUTSTATION scales ~₹26/km; the rider pays the former.
+
+    Everyone else is priced by the JOURNEY (`classify_trip_type`): a visitor's 270 km
+    transfer is OUTSTATION.
+    """
+    if (visitor_type or "").strip().lower() == _LOCAL_VISITOR:
+        return TripType.LOCAL
+    return classify_trip_type(distance_km)
 
 
 def build_fare_quote_input(

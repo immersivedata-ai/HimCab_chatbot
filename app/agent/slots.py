@@ -173,6 +173,46 @@ def parse_place(text: str) -> Optional[str]:
     return text.title()
 
 
+#: The framing a rider wraps round a place when answering the pickup or drop question:
+#: "Manali drop kar do", "Shimla se pickup", "pick me up from Solan". `_NOT_A_PLACE`
+#: rejects "pickup" and "drop" outright — right when the WHOLE reply is that vocabulary
+#: ("pickup" alone is not a place), wrong once the question itself says "pickup",
+#: because riders echo the word back and every such answer would be thrown away.
+#: Whole words only, and stripped only after the reply failed to read as it stands, so
+#: a name that contains one of them ("Scandal Point") is never cut short.
+_LOCATION_FRAMING = frozenset({
+    "pickup", "pick", "up", "drop", "dropoff", "location", "from", "at", "to", "me",
+    "us", "please", "pls", "se", "pe", "par", "mein", "tak", "kar", "karo", "kardo",
+    "kr", "kro", "dena", "do", "dijiye", "de", "chahiye", "hai", "karna", "lena", "lo",
+    "पिकअप", "ड्रॉप", "से", "पे", "पर", "में", "तक", "कर", "करो", "दो", "दीजिए", "देना",
+    "है", "चाहिए", "करना",
+})
+
+
+def parse_location(text: str) -> Optional[str]:
+    """A place from a reply to the pickup or drop question, or None.
+
+    `parse_place` first, as it stands; then once more with the pickup/drop framing
+    taken off. Anything that is not a place after that is still rejected — the framing
+    is the only thing this forgives.
+    """
+    words = [w.strip(".,!?") for w in (text or "").split()]
+    words = [w for w in words if w]
+    kept_at = [i for i, w in enumerate(words) if w.lower() not in _LOCATION_FRAMING]
+    # The place words must sit together. "Shimla se Manali" and "pickup Shimla drop
+    # Manali" have a framing word BETWEEN them, so they name two places — read as one
+    # they were "Shimla Se Manali" and "Shimla Manali". The sentence reader reads both
+    # ends of those; this reads neither, and checks it before anything else.
+    if kept_at and kept_at[-1] - kept_at[0] + 1 != len(kept_at):
+        return None
+    direct = parse_place(text)
+    if direct is not None:
+        return direct
+    if not kept_at or len(kept_at) == len(words):
+        return None
+    return parse_place(" ".join(words[i] for i in kept_at))
+
+
 #: Ways a rider says "collect me where I am" rather than naming a place. Matched as
 #: whole words against the normalised reply, so "here" fires and "Herebad" does not.
 _CURRENT_LOCATION_WORDS = frozenset({
@@ -206,11 +246,14 @@ def means_current_location(text: str) -> bool:
     if any(phrase in low for phrase in _CURRENT_LOCATION_PHRASES):
         return True
     tokens = _tokens(low)
-    if not tokens or len(tokens) > 3:
+    if not tokens or len(tokens) > 4:
         return False
     # Every word must be deixis or filler — "here" and "from here" yes, "here in
-    # Shimla" no, because that one names a place and `parse_place` should have it.
-    filler = {"from", "se", "pe", "par", "at", "on", "in", "the", "my", "mere", "meri"}
+    # Shimla" no, because that one names a place and `parse_place` should have it. The
+    # pickup words are filler since the question says "pickup": "yahin se pickup karo"
+    # points at the rider exactly as "yahin" does.
+    filler = {"from", "se", "pe", "par", "at", "on", "in", "the", "my", "mere", "meri",
+              "pickup", "pick", "up", "me", "kar", "karo", "lo", "please"}
     return any(t in _CURRENT_LOCATION_WORDS for t in tokens) and all(
         t in _CURRENT_LOCATION_WORDS or t in filler for t in tokens
     )
@@ -720,6 +763,92 @@ def parse_cab_category(text: str) -> Optional[str]:
     return None
 
 
+#: Words that, ON THEIR OWN, say "the one you suggested is fine". A reply to "which
+#: cab?" made only of these is taking our recommendation. It used to be read as no
+#: answer at all: the rider typed "haan book kar do", got "Sorry, I didn't quite catch
+#: that — just name one of the cabs listed above", and no booking screen until they
+#: typed a cab name back to us — the cab we had just picked for their party size.
+_ACCEPT_STRONG = frozenset({
+    "yes", "yeah", "yep", "ok", "okay", "okk", "fine", "sure", "done", "confirm",
+    "book", "haan", "han", "ha", "haa", "ji", "theek", "thik", "chalega", "sahi",
+    "wahi", "vahi", "recommended", "suggested", "perfect", "good", "ahead",
+    "हाँ", "हां", "ठीक", "चलेगा", "बुक", "वही", "ओके", "सही",
+})
+#: Words that may sit beside those without changing what they mean.
+_ACCEPT_FILLER = frozenset({
+    "it", "that", "this", "one", "the", "please", "pls", "go", "with", "same",
+    "cab", "car", "gaadi", "gadi", "is", "for", "me", "us", "now", "then", "so", "do",
+    "kar", "karo", "kardo", "kr", "kro", "dijiye", "de", "dena", "hai", "h", "ye",
+    "yeh", "wala", "wali", "vala", "vali", "bhi", "ji", "sir", "fir", "phir", "just",
+    "कर", "करो", "दो", "दीजिए", "है", "ये", "यह", "वाला", "वाली", "जी", "गाड़ी",
+})
+#: Devanagari-safe split (§5): `\w` drops the combining marks, so `[^\W\d_]+` would
+#: shred "ठीक है" into single letters and none of the Hindi entries could ever match.
+_ACCEPT_TOKEN_RE = re.compile(r"[\wऀ-ॿ]+")
+
+
+def accepts_recommendation(text: str) -> bool:
+    """True when a reply to "which cab?" means "the one you recommended".
+
+    Deliberately narrow: EVERY word must be agreement or filler, and at least one must
+    be agreement. "haan but sedan" names a cab, and a question is a question — both go
+    to the normal readers, never here.
+    """
+    low = (text or "").strip().lower()
+    if not low or _looks_like_a_question(low):
+        return False
+    tokens = _ACCEPT_TOKEN_RE.findall(low)
+    if not tokens or len(tokens) > 8:
+        return False
+    if any(t not in _ACCEPT_STRONG and t not in _ACCEPT_FILLER for t in tokens):
+        return False
+    return any(t in _ACCEPT_STRONG for t in tokens)
+
+
+#: A rental's drop answered by pointing back at the pickup: "same place", "wahi",
+#: "pickup wali jagah", "wapas yahin", "वहीं". An hourly hire often ends where it
+#: began, and without this each of those replies read as a place we could not parse —
+#: the rider was told we had not understood them, and then the drop was left out.
+_SAME_AS_PICKUP_STRONG = frozenset({
+    "same", "wahi", "vahi", "wohi", "wahin", "vahin", "usi", "pickup", "wapas",
+    "vapas", "back", "return", "here", "yahin", "yahi",
+    "वही", "वहीं", "उसी", "पिकअप", "वापस", "यहीं",
+})
+_SAME_AS_PICKUP_FILLER = frozenset({
+    "place", "location", "jagah", "as", "the", "se", "par", "pe", "hi", "wali", "wala",
+    "vali", "vala", "point", "to", "at", "on", "drop", "kar", "karo", "do", "dena",
+    "dijiye", "please", "me", "us", "is", "it", "spot",
+    "जगह", "वाली", "वाला", "पर", "पे", "से", "ही", "ड्रॉप", "कर", "दो", "दीजिए",
+})
+
+
+def means_same_as_pickup(text: str) -> bool:
+    """True when a reply to the drop question means "where you picked me up".
+
+    Every word must be same-place vocabulary or filler, and one must actually point
+    back — "back to Shimla" names a place and goes to the place reader instead.
+    """
+    low = (text or "").strip().lower()
+    if not low or _looks_like_a_question(low):
+        return False
+    tokens = _ACCEPT_TOKEN_RE.findall(low)
+    if not tokens or len(tokens) > 6:
+        return False
+    if any(t not in _SAME_AS_PICKUP_STRONG and t not in _SAME_AS_PICKUP_FILLER for t in tokens):
+        return False
+    return any(t in _SAME_AS_PICKUP_STRONG for t in tokens)
+
+
+#: Words that mark a message as being ABOUT the drop. A rental keeps a destination the
+#: extraction model reports only from a turn that was — see `planner._strip_trip_fields`.
+_DROP_WORDS = frozenset({"drop", "dropped", "dropoff", "ड्रॉप"})
+
+
+def mentions_drop(text: str) -> bool:
+    """True when the message talks about where the car should drop them."""
+    return any(t in _DROP_WORDS for t in _ACCEPT_TOKEN_RE.findall((text or "").lower()))
+
+
 # ── Reading a whole sentence (rental flow) ────────────────────────────────────
 # The parsers above read a REPLY to a question. This reads a SENTENCE — "I need a car
 # tomorrow at 9 am from Shimla for 8 hours, 4 of us" — which is what riders actually
@@ -993,6 +1122,60 @@ _PICKUP_MARKER_RES = (
     ),
 )
 
+#: A rental's DROP, read from a sentence. Every flow asks for a pickup and a drop since
+#: 2026-09-29, and a rental sentence now carries both: "8 hours from Shimla, drop at
+#: Kufri". Without this the drop was the one detail the code could not read, so with
+#: Vertex down the rider who had said it was asked for it anyway (§2).
+#:
+#: Narrow on purpose. The place AFTER "drop" ("drop at Kufri", "drop me at Kufri", "drop
+#: location Kufri"), or a place that STARTS a clause before it ("Kufri drop kar dena",
+#: "…, Kufri drop"). An unanchored "X drop" would read "from Shimla Kufri drop" as the
+#: place "Shimla Kufri"; that one is left to the extraction model.
+_DROP_MARKER_RES = (
+    (
+        # The word after "drop" must not be the verb it is part of: "Kufri drop kar
+        # dena" read the drop as the place "Kar Dena" before this lookahead.
+        re.compile(
+            r"\bdrop(?:\s*off)?(?:\s+(?:me|us))?"
+            r"(?:\s+(?:location|point|spot|place|city|address))?"
+            r"(?:\s+(?:ko|to|as|is|at|in|on))?"
+            r"\s+(?!(?:kar|karo|karna|kardo|kr|kro|dena|do|dijiye|de)\b)"
+            r"([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})",
+            re.IGNORECASE,
+        ),
+        "after",
+    ),
+    (
+        # The second word may not be the postposition: "Kufri pe drop" read "Kufri Pe".
+        re.compile(
+            r"(?:^|[,.;]\s*|\band\s+)"
+            r"([a-z][a-z']*(?:\s+(?!(?:pe|par|tak)\b)[a-z][a-z']*)?)"
+            r"\s+(?:pe\s+|par\s+|tak\s+)?drop\b",
+            re.IGNORECASE,
+        ),
+        "before",
+    ),
+)
+
+#: A pickup or drop word that INTRODUCES a place ("… drop at Kufri", "… pickup Shimla").
+#: `_break_at_pickup_drop` puts a clause break in front of it, so "pickup Shimla drop
+#: Kufri" reads as two places rather than the one place "Shimla Drop Kufri", which
+#: `parse_place` rightly rejects — losing both ends. Only when a place FOLLOWS: in "from
+#: Shimla Kufri drop" nothing says which word is the drop, and cutting before "drop"
+#: there would hand back the pickup "Shimla Kufri". Left whole, it is rejected and the
+#: model (or a question) settles it.
+_PICKUP_DROP_INTRO_RE = re.compile(
+    r"\s+(?=(?:drop(?:\s*off)?|pick\s*up|pickup)"
+    r"(?:\s+(?:me|us|location|point|at|to|is|ko))*"
+    r"\s+(?!(?:kar|karo|karna|kardo|kr|kro|dena|do|dijiye|de)\b)[a-z])",
+    re.IGNORECASE,
+)
+
+
+def _break_at_pickup_drop(text: str) -> str:
+    """`text` with a clause break before each pickup/drop word that introduces a place."""
+    return _PICKUP_DROP_INTRO_RE.sub(", ", text)
+
 #: Where a DESTINATION sits relative to its marker. Ordered most specific first: the
 #: first pattern that yields a place `parse_place` accepts wins, so "I want to go to
 #: Manali" is read by the "go to" rule rather than by the bare "to" rule finding "to go".
@@ -1039,6 +1222,14 @@ _SENTENCE_TO_RES = (
         re.compile(r"\b([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})\s+tak\b", re.IGNORECASE),
         "before",
     ),
+    (
+        # "Shimla se Manali" — the whole reply is the two ends, pickup first: the bare
+        # form riders give once they are asked for a pickup and a drop. It used to be
+        # read as the ONE place "Shimla Se Manali". Anchored to the end of the message,
+        # so "shimla se lekar kasol jana hai" is left to the `jana` rule above.
+        re.compile(r"\bse\s+([a-z][a-z']*(?:\s+[a-z][a-z']*){0,2})[\s.!]*$", re.IGNORECASE),
+        "after",
+    ),
     # Last resort. Deliberately last: a bare "to" also matches "to go", which
     # `parse_place` then rejects as request vocabulary, so the specific rules above
     # get their turn first.
@@ -1079,11 +1270,16 @@ def read_trip_details(text: str) -> dict[str, Any]:
 
     # The pickup claims its place first -- see `_PICKUP_MARKER_RES`. Without this,
     # "change the pickup to Shimla" moved the DESTINATION to Shimla.
-    named_pickup = _place_beside_marker(
-        stripped, _PICKUP_MARKER_RES, _TRIP_PLACE_STOP_WORDS
-    )
+    # Place scans read the sentence with a break before each "drop <place>" / "pickup
+    # <place>" — see `_break_at_pickup_drop`. The rest of the reading uses it as typed.
+    clauses = _break_at_pickup_drop(stripped)
+    named_pickup = _place_beside_marker(clauses, _PICKUP_MARKER_RES, _TRIP_PLACE_STOP_WORDS)
 
-    destination = _place_beside_marker(stripped, _SENTENCE_TO_RES, _TRIP_PLACE_STOP_WORDS)
+    # "drop at Manali" before the general destination markers: the question itself now
+    # says "drop", so riders answer in those words (see `_DROP_MARKER_RES`).
+    destination = _place_beside_marker(
+        clauses, _DROP_MARKER_RES, _TRIP_PLACE_STOP_WORDS
+    ) or _place_beside_marker(clauses, _SENTENCE_TO_RES, _TRIP_PLACE_STOP_WORDS)
     if destination and destination != named_pickup:
         found["destination"] = destination
     else:
@@ -1097,7 +1293,7 @@ def read_trip_details(text: str) -> dict[str, Any]:
     # collected backwards from `se` and produced the place "Mujhe Palampur", which then
     # went into the reply heading verbatim.
     origin = named_pickup or _place_beside_marker(
-        stripped, _SENTENCE_FROM_RES, _TRIP_PLACE_STOP_WORDS
+        clauses, _SENTENCE_FROM_RES, _TRIP_PLACE_STOP_WORDS
     )
     if origin and origin != destination:
         found["origin"] = origin
@@ -1141,8 +1337,20 @@ def tidy_when(text: Optional[str]) -> Optional[str]:
     """
     if not text or not text.strip():
         return text
+    # Already a date. The planner runs this on the STORED value every turn, and the
+    # stored value is ISO once `sanitize` has resolved it — which the sentence reader
+    # then read as a phrase and cut to "09-29". Turn one handed the booking screen a
+    # date; every turn after it handed over something the Date field could not show,
+    # and the rider had to type the day in again.
+    if ISO_DATE_RE.match(text.strip()):
+        return text.strip()
     found = _sentence_when(text.strip())
     return found.strip() if found else text.strip()
+
+
+#: A calendar date as the booking screen takes it. Shared with `sanitize` so the two
+#: modules agree on what "already resolved" means (§4.6: one reader, one fact).
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def read_rental_details(text: str) -> dict[str, Any]:
@@ -1187,11 +1395,18 @@ def read_rental_details(text: str) -> dict[str, Any]:
     # `_PICKUP_MARKER_RES` first, for the same reason as in `read_trip_details`: it
     # reads "change the pickup to Manali", where the place follows a `to` that the
     # plain pickup patterns do not cover.
+    clauses = _break_at_pickup_drop(text.strip())
     place = _place_beside_marker(
-        text.strip(), _PICKUP_MARKER_RES, _PLACE_STOP_WORDS
-    ) or _place_from_sentence(text.strip())
+        clauses, _PICKUP_MARKER_RES, _PLACE_STOP_WORDS
+    ) or _place_from_sentence(clauses)
     if place:
         found["origin"] = place
+
+    # The drop, when the sentence marks one — see `_DROP_MARKER_RES`. A drop that came
+    # out equal to the pickup is the pickup read twice, not a drop.
+    drop = _place_beside_marker(clauses, _DROP_MARKER_RES, _PLACE_STOP_WORDS)
+    if drop and drop != found.get("origin"):
+        found["destination"] = drop
 
     cab = parse_cab_category(text)
     if cab:
@@ -1360,23 +1575,29 @@ def _q(table: dict[str, str], lang_key: str) -> str:
     return table.get(lang_key, table["en"])
 
 
+#: The rider is asked for a PICKUP and a DROP, the way a cab app asks — one wording in
+#: every flow. These replaced four questions for two details: "आप किस शहर में रहते
+#: हैं?" (local), "Which city are you travelling from?" (outstation), "Where should the
+#: car pick you up?" (rental) and "Where would you like to go?". A resident was being
+#: asked where they LIVE when what the booking needs is where the cab should come.
 _DESTINATION_Q = {
-    "hi": "आप हिमाचल में कहाँ जाना चाहते हैं?",
-    "en": "Where would you like to go in Himachal Pradesh?",
+    "hi": "आपको कहाँ ड्रॉप करना है?",
+    "en": "Where should we drop you?",
 }
 # Used after a first attempt failed to land — same question, with examples, so the
 # user can see the shape of answer we need instead of being asked the same words.
 _DESTINATION_Q_RETRY = {
-    "hi": "मुझे बस जगह का नाम बता दीजिए — जैसे मनाली, शिमला, धर्मशाला या कसोल।",
-    "en": "Just the place name is enough — for example Manali, Shimla, Dharamshala or Kasol.",
+    "hi": "बस ड्रॉप की जगह का नाम बता दें — जैसे मनाली, शिमला, धर्मशाला या कसोल।",
+    "en": "Just the drop location is enough — for example Manali, Shimla, "
+          "Dharamshala or Kasol.",
 }
 _ORIGIN_Q = {
-    "hi": "आप किस शहर से यात्रा शुरू कर रहे हैं?",
-    "en": "Which city are you travelling from?",
+    "hi": "आपको कहाँ से पिकअप करना है?",
+    "en": "Where should we pick you up?",
 }
-_ORIGIN_Q_LOCAL = {
-    "hi": "आप हिमाचल में किस शहर में रहते हैं?",
-    "en": "Which city in Himachal are you based in?",
+_ORIGIN_Q_RETRY = {
+    "hi": "बस पिकअप की जगह का नाम बता दें — कोई शहर, कस्बा या इलाका।",
+    "en": "Just the pickup location is enough — a city, town or area.",
 }
 _DURATION_Q = {
     "hi": "आप कितने दिनों के लिए यात्रा करना चाहते हैं?",
@@ -1387,11 +1608,11 @@ _DURATION_Q_RETRY = {
     "en": "Just the number of days — for example 3, or a week.",
 }
 _GROUP_SIZE_Q = {
-    "hi": "आपके साथ कुल कितने लोग यात्रा कर रहे हैं?",
+    "hi": "आपके साथ कितने लोग यात्रा कर रहे हैं?",
     "en": "How many people will be travelling in total?",
 }
 _GROUP_SIZE_Q_RETRY = {
-    "hi": "कुल लोगों की संख्या बता दें — जैसे 2 या 4।",
+    "hi": "आपके साथ कितने लोग हैं? बस संख्या बता दें — जैसे 2 या 4।",
     "en": "Just the number of people — for example 2 or 4.",
 }
 _WHEN_Q = {
@@ -1428,10 +1649,65 @@ def when_question(lang_key: str, attempt: int = 0, *, past_day: Optional[str] = 
     if past_day:
         return _q(_WHEN_Q_PAST, lang_key).format(day=past_day)
     return _q(_WHEN_Q_RETRY if attempt else _WHEN_Q, lang_key)
-_RENTAL_PICKUP_Q_RETRY = {
-    "hi": "बस शहर का नाम बता दें, जहाँ से गाड़ी लेनी है।",
-    "en": "Just the name of the city or town the car should come to.",
+
+
+#: Why a place name could not be used: the map has no such place — a typo, or a word
+#: that is not a place.
+PLACE_NOT_FOUND = "not_found"
+
+#: Asked when a place the rider named cannot be found on the map. Before this existed
+#: there were two outcomes, both reported as hallucination: the geocoder's first hit was
+#: taken whatever it was ("xyz" became a road in Thane and was priced), or nothing was
+#: found and the turn went ahead anyway, leaving the writer a destination it had no facts
+#: about. `{place}` is quoted in the rider's own words (§4.7), so it is clear WHICH answer
+#: we could not place — and why the question is back.
+_PLACE_NOT_FOUND_Q: dict[str, dict[str, str]] = {
+    SlotName.DESTINATION: {
+        "hi": "“{place}” नाम की कोई जगह मुझे नहीं मिली। कृपया ड्रॉप की जगह की स्पेलिंग "
+              "जाँच कर दोबारा बताएँ — जैसे मनाली, शिमला, धर्मशाला या कसोल।",
+        "en": "I couldn't find a place called “{place}”. Could you check the spelling "
+              "of your drop location — for example Manali, Shimla, Dharamshala or Kasol?",
+    },
+    SlotName.ORIGIN: {
+        "hi": "“{place}” नाम की कोई जगह मुझे नहीं मिली। आपको कहाँ से पिकअप करना है? "
+              "कृपया नाम की स्पेलिंग जाँच लें।",
+        "en": "I couldn't find a place called “{place}”. Where should we pick you up? "
+              "Please check the spelling.",
+    },
 }
+#: Said when we have stopped asking (the per-field cap or the rider's patience ran out)
+#: and go ahead without the place. The reply still has to say the name was not used —
+#: silently proceeding is how the writer came to plan a trip nobody asked for.
+_PLACE_DROPPED_NOTE = {
+    "hi": "“{place}” मुझे नक्शे पर नहीं मिला, इसलिए मैंने इसे छोड़ दिया है।",
+    "en": "I couldn't find “{place}” on the map, so I've left it out.",
+}
+
+
+def unplaceable_question(
+    field: str,
+    place: str,
+    lang_key: str,
+    reason: str = PLACE_NOT_FOUND,
+) -> str:
+    """The question that goes back when a place the rider named cannot be used.
+
+    Deterministic, like every other question: no model decides how to say "I couldn't
+    find that", so the wording cannot drift into a guess about what they meant. One
+    wording per field in every flow, matching the pickup and drop questions.
+    """
+    table = _PLACE_NOT_FOUND_Q.get(field, _PLACE_NOT_FOUND_Q[SlotName.DESTINATION])
+    return _q(table, lang_key).format(place=_quotable(place))
+
+
+def unplaceable_note(place: str, lang_key: str) -> str:
+    """One line for the reply when we went ahead without a place we could not find."""
+    return _q(_PLACE_DROPPED_NOTE, lang_key).format(place=_quotable(place))
+
+
+def _quotable(text: str) -> str:
+    quoted = " ".join((text or "").split())
+    return quoted if len(quoted) <= 40 else quoted[:40].rstrip() + "…"
 #: The DAY is `travel_dates`; this is the hour. Asked separately because the backend
 #: prices a rental off `bookingTime` and applies the night rate from it — "tomorrow"
 #: alone left the quote standing on whatever time the rider happened to be chatting at.
@@ -1481,10 +1757,6 @@ _RENTAL_HOURS_REJECTED_Q = {
     "en": "We don't have a {hours}-hour package. What we do have is {options} — "
           "which would you like?",
 }
-_RENTAL_PICKUP_Q = {
-    "hi": "गाड़ी आपको कहाँ से चाहिए?",
-    "en": "Where should the car pick you up?",
-}
 #: Which cab. Never the FIRST thing asked — the rider is choosing between prices, so
 #: the quoting turn asks it (see the writer's rental steps) and this wording is only
 #: the re-ask. Naming no cab on purpose: the list comes from the fare the backend just
@@ -1503,15 +1775,45 @@ _STILL_NEEDED = {
     "hi": "इसके बिना मैं आगे नहीं बढ़ पाऊँगा —",
     "en": "I can't go ahead without this —",
 }
+
+#: Prepended when the rider's reply could not be used at all — a typo, or a line about
+#: something else — so the re-ask reads as "I didn't understand that", not a robotic
+#: repeat of the same question (§7: the rider's own words go back to them). See the
+#: planner's unread-reply guard. `{text}` is the rider's message, quoted and trimmed.
+_UNREAD_REPLY = {
+    "hi": "क्षमा करें, मैं “{text}” ठीक से समझ नहीं पाया।",
+    "en": "Sorry, I didn't quite catch “{text}”.",
+}
+#: Same, when there is no text worth quoting back (an empty or whitespace message).
+_UNREAD_REPLY_BARE = {
+    "hi": "क्षमा करें, मैं ठीक से समझ नहीं पाया।",
+    "en": "Sorry, I didn't quite catch that.",
+}
+
+
+def unread_reply_preamble(text: str, lang_key: str) -> str:
+    """A short "I didn't understand that" line, in the rider's language.
+
+    Quotes what they typed so the re-ask that follows is clearly a re-ask and not a
+    repeat — repeating the identical question is the thing §7 warns reads as not having
+    listened. The quote is trimmed so a long or messy paste does not swamp the question,
+    and dropped entirely when there is nothing to quote.
+    """
+    quoted = " ".join((text or "").split())
+    if not quoted:
+        return _q(_UNREAD_REPLY_BARE, lang_key)
+    if len(quoted) > 40:
+        quoted = quoted[:40].rstrip() + "…"
+    return _q(_UNREAD_REPLY, lang_key).format(text=quoted)
 _RETURN_Q = {
     "hi": "क्या आपने वापसी के लिए कैब बुक कर ली है, या अपने साधन से लौटेंगे?",
     "en": "Have you already booked your return cab, or will you be making your own way back?",
 }
 
 _LABELS = {
-    "destination": {"hi": "गंतव्य", "en": "destination"},
+    "destination": {"hi": "ड्रॉप की जगह", "en": "drop location"},
     "rental_hours": {"hi": "किराये के घंटे", "en": "rental duration"},
-    "origin": {"hi": "शुरुआती शहर", "en": "starting city"},
+    "origin": {"hi": "पिकअप की जगह", "en": "pickup location"},
     "duration_days": {"hi": "यात्रा के दिन", "en": "trip length"},
     "group_size": {"hi": "यात्रियों की संख्या", "en": "group size"},
     "travel_dates": {"hi": "यात्रा की तारीख", "en": "travel dates"},
@@ -1578,20 +1880,17 @@ SLOTS: dict[str, Slot] = {
             _DESTINATION_Q_RETRY if attempt else _DESTINATION_Q, lang
         ),
         read=lambda e: e.destination,
-        parse=parse_place,
+        parse=parse_location,
         write=_simple_write("destination"),
         label=_label("destination"),
     ),
     SlotName.ORIGIN: Slot(
         name=SlotName.ORIGIN,
-        ask=lambda lang, vt, attempt: _q(
-            (_RENTAL_PICKUP_Q_RETRY if attempt else _RENTAL_PICKUP_Q) if vt == RENTAL
-            else _ORIGIN_Q_LOCAL if vt == LOCAL
-            else _ORIGIN_Q,
-            lang,
+        ask=lambda lang, _vt, attempt: _q(
+            _ORIGIN_Q_RETRY if attempt else _ORIGIN_Q, lang
         ),
         read=lambda e: e.origin or e.home_city,
-        parse=parse_place,
+        parse=parse_location,
         write=_write_origin,
         label=_label("origin"),
     ),
@@ -1727,12 +2026,18 @@ _RIDE_NEEDS: dict[str, Need] = {
     SlotName.RETURN_JOURNEY_PREFERENCE: Need.OPTIONAL,
 }
 
-#: A rental is a car and a driver for a block of time. There is no destination — that
-#: is the whole point of hiring by the hour — so asking for one would be asking the
-#: rider to invent an answer. What the fare needs is the package and the pickup.
+#: A rental is a car and a driver for a block of time. What the fare needs is the
+#: package and the pickup; the drop does not change the price.
 _RENTAL_NEEDS: dict[str, Need] = {
     SlotName.RENTAL_HOURS: Need.REQUIRED,
     SlotName.ORIGIN: Need.REQUIRED,
+    # The drop — where the hire ends — asked right after the pickup, like every flow
+    # (a 2026-09-29 decision; a rental used to have no drop at all). IMPORTANT, never
+    # REQUIRED: plenty of hires end wherever the day ends, so a rider who does not say
+    # still reaches the booking screen, and "same place" is read as the pickup
+    # (`means_same_as_pickup`). Only a drop the rider actually named is kept — see
+    # `planner._strip_trip_fields`.
+    SlotName.DESTINATION: Need.IMPORTANT,
     # The day and the hour are two questions, not one. `travel_dates` takes "tomorrow";
     # `pickup_time` takes the clock time the car should arrive, which the backend reads
     # as `bookingTime` and applies the night rate from. Without it the quote stood on
@@ -1791,9 +2096,10 @@ CANCEL_INTENT = Intent.CANCEL_REQUEST
 #: A full day-by-day plan plus the structured itinerary JSON. Outstation visitors:
 #: they are choosing what to do with several days in an unfamiliar state.
 ITINERARY_MODE = ResponseMode.ITINERARY
-#: A cab recommendation — vehicle, fare, drive time, weather — and nothing else.
-#: Himachal residents already know the place; what they want is the ride, so an
-#: itinerary telling them about Mall Road is noise around the useful part.
+#: A ride — route, drive time, day, weather, and the booking screen — and nothing
+#: else. Residents already know the place; what they want is the ride, so an itinerary
+#: telling them about Mall Road is noise around the useful part. It names no cab: see
+#: `lists_cabs`.
 RIDE_MODE = ResponseMode.RIDE
 #: A short direct answer to a question about a place. No trip, no cab.
 ANSWER_MODE = ResponseMode.ANSWER
@@ -1803,6 +2109,27 @@ CANCELLED_MODE = ResponseMode.CANCELLED
 #: A rental quote — package, cab options and price. No itinerary, no route: the rider
 #: has not said where they are going, and hiring by the hour means they need not.
 RENTAL_MODE = ResponseMode.RENTAL
+
+#: The replies that list and recommend cabs. Only a rental's.
+#:
+#: A product decision (2026-09-28), and a reversal of the one before it: a local ride
+#: used to end in every cab that seats the party with its price, and a trip plan in a
+#: "Book Your Him Cab" list with one cab flagged as recommended. Now a local rider and a
+#: visitor are handed to the app's booking screen, which lists the cabs and their fares
+#: itself, and the chat names none. A rental keeps its recommendation because its
+#: booking screen will not price anything until a cab is chosen, and a rider who had to
+#: pick one there typed every detail in again.
+#:
+#: One table, read by the tool executor, which then never asks for a fare the reply
+#: would not show. Nothing downstream re-decides it: with no fare on state, the reply,
+#: the itinerary, the `cab_fare` event and the handoff all carry no cab — and the
+#: guardrail takes out any vehicle the model names anyway.
+_CAB_LISTING_MODES = frozenset({RENTAL_MODE})
+
+
+def lists_cabs(mode: Optional[str]) -> bool:
+    """True when this reply lists cabs and recommends one. See `_CAB_LISTING_MODES`."""
+    return mode in _CAB_LISTING_MODES
 
 
 def needs_for(

@@ -197,11 +197,13 @@ async def cancel_node(state: AgentState) -> dict:
         "offers": [],
         "route_estimate": None,
         "pickup": None,
+        "drop": None,
         "rental_packages": [],
         "awaiting_cab_choice": False,
         "unavailable_cab_category": None,
         "unbookable_rental_hours": None,
         "past_travel_date": None,
+        "unplaceable_place": None,
         "structured_events": [cancellation.cancellation_event(scope, cleared)],
         "node_trace": ["cancel"],
     }

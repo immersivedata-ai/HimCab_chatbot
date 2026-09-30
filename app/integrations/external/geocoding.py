@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 import httpx
@@ -65,6 +66,89 @@ _PLACE_NAME_KEYS = (
     "city", "town", "village", "municipality", "suburb",
     "county", "state_district", "district", "region",
 )
+
+#: How many candidates a forward lookup asks for. One used to be enough to be wrong:
+#: "Bir" came back as a railway station in Madhya Pradesh, with the paragliding village
+#: in Kangra second. Five is enough to see the Himachal reading when there is one.
+_CANDIDATES = 5
+
+#: What a rider can be driven TO, by the provider's own classification (`category`,
+#: then `type`; `None` accepts every type in the category). Everything else is a match
+#: on a WORD, not on a place — measured against the live server, `"xyz"` came back as a
+#: residential road in Thane, `"hello"` as a shop in Lucknow, and each was then routed,
+#: priced and put on a booking screen. Streets, shops, offices and buildings are the
+#: bulk of OSM, and any of them can share a name with whatever a rider typed.
+_DESTINATION_KINDS: dict[str, Optional[frozenset[str]]] = {
+    "place": None,                           # city, town, village, hamlet, locality …
+    "boundary": frozenset({"administrative"}),
+    "tourism": frozenset({"attraction", "viewpoint", "museum", "camp_site", "zoo", "theme_park"}),
+    "historic": None,
+    "natural": frozenset({"peak", "valley", "water", "glacier", "saddle", "hill", "ridge", "cave_entrance"}),
+    "amenity": frozenset({"place_of_worship", "bus_station", "university", "college", "hospital"}),
+    "aeroway": frozenset({"aerodrome"}),
+    "railway": frozenset({"station"}),
+    "leisure": frozenset({"park", "nature_reserve"}),
+    # A named locality mapped as an area rather than a point — "Solang Valley" is one.
+    "landuse": frozenset({"residential"}),
+}
+
+#: `place_rank` at or below which a result is a city, district or state. A match that
+#: big outranks a Himachal hamlet of the same name — "Delhi" is the capital, not a
+#: village near Shimla that happens to share it.
+_MAJOR_PLACE_RANK = 16
+
+
+def is_destination_kind(row: dict) -> bool:
+    """True when a provider row is somewhere a cab can be sent by name.
+
+    A row with no classification at all is accepted: that is a provider that does not
+    say, which is not the same as one that says "shop". Nominatim always says.
+    """
+    category = row.get("category") or row.get("class")
+    if not category:
+        return True
+    if category not in _DESTINATION_KINDS:
+        return False
+    allowed = _DESTINATION_KINDS[category]
+    return allowed is None or row.get("type") in allowed
+
+
+def _row_in_himachal(row: dict) -> bool:
+    address: dict = row.get("address") if isinstance(row.get("address"), dict) else {}
+    return (address.get("state") or "").strip().lower() == HIMACHAL_STATE
+
+
+def pick_candidate(rows: list) -> Optional[dict]:
+    """The row a rider most plausibly meant, or None when none is a place at all.
+
+    Him Cab drives in Himachal, so a Himachal reading of an ambiguous name wins —
+    "Bir" is the village in Kangra, not the station in Khandwa; "Manikaran" is the
+    gurdwara town, not a stream in Beed. Unless the provider's best answer is a city or
+    bigger: then the name means that city, wherever it is ("Delhi", "Chandigarh").
+    """
+    usable = [r for r in rows if isinstance(r, dict) and is_destination_kind(r)]
+    if not usable:
+        return None
+    top = usable[0]
+    rank = top.get("place_rank")
+    if isinstance(rank, int) and rank <= _MAJOR_PLACE_RANK:
+        return top
+    return next((r for r in usable if _row_in_himachal(r)), top)
+
+
+class LookupStatus(str, Enum):
+    FOUND = "found"
+    #: The provider answered and there is no such place. A real answer about the NAME.
+    NOT_FOUND = "not_found"
+    #: The provider could not be asked. Says nothing about the name, so nothing may be
+    #: rejected on it — see `GeocodingService.lookup`.
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class Lookup:
+    status: LookupStatus
+    place: Optional[Place] = None
 
 
 @dataclass(frozen=True)
@@ -156,7 +240,21 @@ class GeocodingService:
     # Swap provider by reimplementing these two and nothing else.
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _to_place(self, row: object, fallback_name: Optional[str] = None) -> Optional[Place]:
+    def _to_place(
+        self,
+        row: object,
+        fallback_name: Optional[str] = None,
+        *,
+        own_name_first: bool = False,
+    ) -> Optional[Place]:
+        """A provider row as a `Place`.
+
+        `own_name_first` is for FORWARD lookups: the rider named this feature, so it is
+        called what it is — "Hadimba Devi Temple", not "Manali", which is only the town
+        around it. The booking screen showed the enclosing town as the drop, and a
+        rider who asked for the temple saw somewhere else. Reverse lookups keep the
+        town first: a GPS fix is labelled by where it is, not by the nearest building.
+        """
         if not isinstance(row, dict):
             return None
         try:
@@ -164,11 +262,14 @@ class GeocodingService:
         except (KeyError, TypeError, ValueError):
             return None
 
-        address = row.get("address") if isinstance(row.get("address"), dict) else {}
-        name = next(
+        address: dict = row.get("address") if isinstance(row.get("address"), dict) else {}
+        town = next(
             (address[key] for key in _PLACE_NAME_KEYS if address.get(key)),
             None,
-        ) or row.get("name") or fallback_name
+        )
+        name = (
+            (row.get("name") or town) if own_name_first else (town or row.get("name"))
+        ) or fallback_name
         if not name:
             # A coordinate with no nameable place is still useful for measuring a
             # distance, but there is nothing to call it — the caller decides.
@@ -188,35 +289,65 @@ class GeocodingService:
 
     async def geocode(self, query: str) -> Optional[Place]:
         """Where is this place? None when the provider cannot place it."""
+        return (await self.lookup(query)).place
+
+    async def lookup(self, query: str) -> Lookup:
+        """Where is this place — and if nowhere, is that the NAME or the provider?
+
+        The two Nones `geocode` returns need opposite handling. NOT_FOUND is an answer
+        about what the rider typed: "Kasoll" is nowhere, and the planner puts it back to
+        them by name. UNAVAILABLE is an answer about us: the provider timed out, and a
+        real town must not be refused because Nominatim was slow. Only NOT_FOUND is
+        cached; an outage must not become a day of "no such place".
+        """
         cleaned = " ".join((query or "").split())
         if not cleaned:
-            return None
+            return Lookup(LookupStatus.NOT_FOUND)
 
         key = f"fwd:{cleaned.lower()}"
         cached = self._cache.get(key)
         if cached is not None:
-            return cached or None      # a cached miss is stored as False
+            # A cached miss is stored as False.
+            return (
+                Lookup(LookupStatus.FOUND, cached) if cached
+                else Lookup(LookupStatus.NOT_FOUND)
+            )
 
         try:
             payload = await self._get("/search", {
                 "q": cleaned,
                 "format": "jsonv2",
                 "addressdetails": 1,
-                "limit": 1,
+                "limit": _CANDIDATES,
                 # Him Cab operates in India; scoping the search stops "Manali" matching
                 # a hamlet on another continent.
                 "countrycodes": settings.geocoding_country_codes,
             })
         except Exception as e:
             log.warning("geocode_failed", query=cleaned, error=str(e), error_type=type(e).__name__)
-            return None
+            return Lookup(LookupStatus.UNAVAILABLE)
 
         rows = payload if isinstance(payload, list) else []
-        place = self._to_place(rows[0], fallback_name=cleaned) if rows else None
+        row = pick_candidate(rows)
+        place = (
+            self._to_place(row, fallback_name=cleaned, own_name_first=True) if row else None
+        )
         self._cache.set(key, place or False, settings.geocoding_cache_ttl_seconds)
         if place is None:
-            log.info("geocode_no_match", query=cleaned)
-        return place
+            # Counted separately from a provider failure: a rising rate of these is
+            # riders typing names we cannot place, which is a product signal, not an
+            # outage.
+            log.info(
+                "geocode_no_match",
+                query=cleaned,
+                candidates=len(rows),
+                rejected_kinds=[
+                    f"{r.get('category')}/{r.get('type')}"
+                    for r in rows[:_CANDIDATES] if isinstance(r, dict)
+                ],
+            )
+            return Lookup(LookupStatus.NOT_FOUND)
+        return Lookup(LookupStatus.FOUND, place)
 
     async def reverse(self, lat: float, lon: float) -> Optional[Place]:
         """What is at these coordinates? None when the provider cannot say."""

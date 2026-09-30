@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Him Cab — AI Travel Assistant</title>
-  <meta name="description" content="AI-powered travel concierge for Himachal Pradesh trip planning" />
+  <meta name="description" content="AI-powered travel concierge for trip planning" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -413,13 +413,13 @@
       </div>
       <div>
         <div class="header-title">Him Cab AI</div>
-        <div class="header-subtitle">Himachal Travel Assistant</div>
+        <div class="header-subtitle">Travel Assistant</div>
       </div>
     </div>
     <div class="header-right">
-      <a href="/local" style="display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:100px;background:#f0fdf4;border:1px solid #bbf7d0;color:#15803d;font-size:0.72rem;font-weight:600;text-decoration:none;letter-spacing:0.3px;" title="Switch to Local HP Explorer">
+      <a href="/local" style="display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:100px;background:#f0fdf4;border:1px solid #bbf7d0;color:#15803d;font-size:0.72rem;font-weight:600;text-decoration:none;letter-spacing:0.3px;" title="Switch to Local Explorer">
         <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-        HP Local
+        Local
       </a>
       <div class="status-dot" id="status-dot"></div>
       <span class="status-text" id="status-text">Connected</span>
@@ -439,6 +439,9 @@
        background:#fef3c7;border-bottom:1px solid #fde68a;color:#78350f;
        font-size:0.76rem;line-height:1.5;flex-shrink:0">
     <span id="notice-text"></span>
+    <button id="notice-action" style="flex:0 0 auto;align-self:center;border:1px solid #d97706;
+        background:#fff;color:#92400e;font-size:0.72rem;font-weight:600;padding:4px 10px;
+        border-radius:6px;cursor:pointer;white-space:nowrap">Set rider token</button>
   </div>
 
   <div id="chat-container">
@@ -446,7 +449,7 @@
       <div class="welcome-logo">
         <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20h18L12 4 3 20z"/><path d="M12 4v8"/></svg>
       </div>
-      <h1 class="welcome-title">Plan Your Himachal Trip</h1>
+      <h1 class="welcome-title">Plan Your Trip</h1>
       <p class="welcome-desc">
         Him Cab's AI travel concierge. Manali, Shimla, Dharamshala — wherever you want to go, just ask!
       </p>
@@ -459,7 +462,7 @@
       <span id="error-text"></span>
     </div>
     <div class="input-wrapper">
-      <textarea id="msg-input" rows="1" placeholder="Ask about your Himachal trip..." autofocus></textarea>
+      <textarea id="msg-input" rows="1" placeholder="Ask about your trip..." autofocus></textarea>
       <button id="send-btn" title="Send" disabled>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
@@ -479,15 +482,36 @@
     // The rider's Him Cab JWT. This page does NOT log in to Him Cab itself — the
     // native app already holds this token from its own cab-booking login and hands it
     // over when it opens the chat WebView, as `?rider_token=<JWT>` in the URL.
-    // Falls back to the dev token so the page is usable standalone (dev only), in
-    // which case real fares are skipped and pricing stays approximate.
-    const RIDER_TOKEN =
-      new URLSearchParams(window.location.search).get("rider_token") || "dev-test-token";
+    //
+    // Precedence: the URL first (how the WebView hands it over), then whatever was last
+    // set in THIS browser, then the dev placeholder so the page is usable standalone.
+    // The localStorage step is here because this page used to accept a token ONLY via
+    // the URL — there was no input — so a tester who "used a JWT" by pasting it anywhere
+    // on the page was still silently on dev-test-token, got no fare, and reported the
+    // flow as broken. Set it with the "Set rider token" button on the no-fare notice.
+    const TOKEN_KEY = "himcab_rider_token";
+    let RIDER_TOKEN =
+      new URLSearchParams(window.location.search).get("rider_token")
+      || localStorage.getItem(TOKEN_KEY)
+      || "dev-test-token";
 
     const authHeaders = (extra = {}) => ({
       "Authorization": `Bearer ${RIDER_TOKEN}`,
       ...extra,
     });
+
+    // Set (or clear) the rider token from within the page, then reload so the whole
+    // session restarts under the new identity. A prompt keeps this to zero layout risk
+    // on what is a developer test client; the token persists in localStorage.
+    function setRiderToken() {
+      const current = RIDER_TOKEN === "dev-test-token" ? "" : RIDER_TOKEN;
+      const next = window.prompt("Paste the Him Cab rider JWT (leave blank to clear):", current);
+      if (next === null) return;                 // cancelled — leave the token as it was
+      const token = next.trim();
+      if (token) localStorage.setItem(TOKEN_KEY, token);
+      else localStorage.removeItem(TOKEN_KEY);
+      window.location.reload();
+    }
 
     let isStreaming = false;
 
@@ -507,25 +531,30 @@
       $chatContainer.scrollTop = $chatContainer.scrollHeight;
     }
 
-    // ── Why there is no price ───────────────────────────────────────────────
+    // ── The rider token ─────────────────────────────────────────────────────
     //: True while the page is running on the placeholder token. The backend maps it to
-    //: jwt=None on purpose, the fare gate requires a rider JWT, and with no fare there
-    //: are no cab options — the single most common reason this page shows no cabs.
+    //: jwt=None on purpose, so nothing that needs a rider credential — the coupons — is
+    //: fetched for this page.
     const usingDevToken = () => RIDER_TOKEN === "dev-test-token";
 
-    function noticeIfNoFare(events) {
+    // This flow names no cab and requests no fare: only a rental recommends one
+    // (`slots.lists_cabs`), and a visitor picks their cab on the app's booking screen.
+    // So a turn with no cab_fare is correct and says nothing — this used to warn "No cab
+    // options" on it, which would now fire on every turn. What stays is the placeholder
+    // token notice, because it holds the only "Set rider token" button on this page.
+    function noticeAboutToken() {
       const el = document.getElementById("notice");
       if (!el) return;
-      const priced = (events || []).some(e => e.type === "cab_fare");
-      if (priced || !usingDevToken()) { el.style.display = "none"; return; }
+      if (!usingDevToken()) { el.style.display = "none"; return; }
       document.getElementById("notice-text").innerHTML =
-        "<b>No cab options.</b> This page is using the placeholder " +
-        "<code>dev-test-token</code>, which the backend treats as no rider credential " +
-        "at all — so no fare is requested and there are no cabs to choose from. " +
-        "Open this page as <code>?rider_token=&lt;JWT&gt;</code> with a real Him Cab " +
-        "rider token to see prices.";
+        "<b>Placeholder token.</b> This page is on <code>dev-test-token</code>, which the " +
+        "backend treats as no rider credential, so no coupons are fetched. Cabs and fares " +
+        "are chosen on the booking screen in this flow. Set a real Him Cab rider token, " +
+        "or open this page as <code>?rider_token=&lt;JWT&gt;</code>.";
       el.style.display = "flex";
     }
+
+    document.getElementById("notice-action").addEventListener("click", setRiderToken);
 
     function showError(msg) {
       $errorText.textContent = msg;
@@ -571,8 +600,8 @@
     // source; `checkGreetingDrift()` compares the two and complains in the console
     // rather than letting a stale copy here quietly disagree with the backend.
     const GREETINGS = {
-      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी हिमाचल यात्रा की योजना बनाने में मदद कर सकता हूँ। आप कहाँ जाना चाहते हैं?",
-      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip to Himachal Pradesh. Where would you like to go?",
+      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी यात्रा की योजना बनाने में मदद कर सकता हूँ। आपको कहाँ ड्रॉप करना है?",
+      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip. Where should we drop you?",
       "rental": "Welcome to Him Cab! 🙏 I can arrange a car and driver by the hour. How long do you need the car for?"
     };
 
@@ -784,7 +813,7 @@
           }
         }
 
-        noticeIfNoFare(structured);
+        noticeAboutToken();
 
         if (structured.length) {
           const parentCol = bubble.parentElement;

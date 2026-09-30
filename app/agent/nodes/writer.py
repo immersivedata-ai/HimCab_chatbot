@@ -60,7 +60,7 @@ from app.domain.itinerary import (
     TravelInfo,
     WeatherForecast,
 )
-from app.integrations.himcab.quote_builder import classify_trip_type
+from app.integrations.himcab.quote_builder import trip_type_for
 from app.services.vertex_ai import call_model, get_vertex_ai_service
 
 log = get_logger(__name__)
@@ -128,6 +128,16 @@ def _normalize_itinerary_dict(itinerary_dict: dict, state: AgentState) -> dict:
     if not isinstance(llm_budget, str) or llm_budget.strip().lower() not in {b.value for b in BudgetRange}:
         normalized["budget_range"] = _infer_budget_range(entities).value
 
+    # A cab and a cab price come from the fare backend or not at all. The prompt forbids
+    # both in the JSON, and a model that writes them anyway puts "Innova Crysta, Rs 8,000"
+    # on the itinerary card — a recommendation this flow does not make (`slots.lists_cabs`)
+    # at a price nobody quoted. With a real fare, `_apply_real_fare` rebuilds them from it.
+    if not state.cab_fare:
+        for invented in ("cab_package", "cost_breakdown"):
+            if normalized.pop(invented, None) is not None:
+                log.info("itinerary_invented_field_dropped", field=invented,
+                         session_id=state.session_id)
+
     normalized.setdefault("language", str(getattr(state.language, "value", state.language)))
     return normalized
 
@@ -144,11 +154,17 @@ def _build_fare_block(state: AgentState) -> str:
     options = (cf or {}).get("options") or []
 
     if not options:
+        # The usual case for a local ride or a trip plan, which name no cab by design
+        # (`slots.lists_cabs`), and the fallback when a rental's fare did not come back.
+        # Worded for both: the booking screen is where the cab is chosen either way.
+        # "Still recommend travelling with Him Cab" used to close this, and the model
+        # obliged by recommending vehicles no backend had priced.
         return (
             "### HIM CAB FARES\n"
-            "No fare is available for this route right now — do NOT state, estimate or "
-            "imply any price. Say the exact fare will be confirmed when they book, and "
-            "still recommend travelling with Him Cab.\n"
+            "No cab has been priced for this reply. The rider chooses their cab on the "
+            "booking screen, which shows each cab's fare. Do NOT name, suggest or compare "
+            "any cab or vehicle, and do NOT state, estimate or imply any price for the "
+            "ride.\n"
         )
 
     headline = cf.get("category_name")
@@ -558,12 +574,12 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
     names again — re-resolving "Kasol" in the app could easily land somewhere other
     than the point this fare was priced on.
 
-    `trip_type` is the rate card the fare was quoted on, decided by the journey's
-    length rather than by the persona that was talking (see
-    `quote_builder.classify_trip_type`). The app reads it to keep a short hop out of
-    its outstation booking screen, which refuses anything inside one state and under
-    200 km — so a visitor asking about two Manali suburbs is not sent to a "Confirm
-    Route" button that cannot be pressed.
+    `trip_type` is the rate card the fare was quoted on (see `quote_builder.trip_type_for`):
+    the LOCAL/resident flow is LOCAL to match the Him Cab app, and a visitor is priced by
+    the journey's length. The app reads it to keep a short hop out of its outstation
+    booking screen, which refuses anything inside one state and under 200 km — so a
+    resident's 177 km intra-Himachal ride (LOCAL) is not sent to a "Confirm Route" button
+    that cannot be pressed.
 
     None whenever the journey is unknown: with no route there is no pickup, no drop
     and nothing for the booking screen to open on. That is the whole gate — an
@@ -595,11 +611,14 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         # Coordinates when the pickup could be placed, so the map opens on the point we
         # priced; the bare name when it could not, so the app can geocode it itself.
         origin_pin = state.pickup or {"name": pickup_name}
+        drop_name = state.entities.destination
         return {
             "trip_type": TripType.RENTAL,
             "origin": origin_pin,
-            # A rental has no drop — the rider decides where to go once the car is theirs.
-            "destination": None,
+            # The drop, when the rider named one (every flow asks for it since
+            # 2026-09-29) — pinned when it could be placed, by name when it could not.
+            # Null when they gave none: the hire ends wherever the day does.
+            "destination": state.drop or ({"name": drop_name} if drop_name else None),
             "rental_hours": state.entities.rental_hours,
             "included_km": fare.get("included_km"),
             # True when `recommended_category_*` is the rider's own pick rather than our
@@ -633,13 +652,15 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         "distance_km": route["distance_km"],
         "duration_minutes": route["duration_minutes"],
         "duration_text": route["duration_text"],
-        # From the fare when there is one, and from the JOURNEY when there is not.
-        # It is decided by distance either way (`quote_builder.classify_trip_type`), so
-        # a missing fare is no reason to leave it null — and null is expensive here: the
-        # app reads this to choose which booking screen to open, and its outstation
-        # screen refuses anything inside one state and under 200 km. A 514 km Delhi
-        # to Kasol run that arrives without a trip_type opens the wrong form.
-        "trip_type": fare.get("trip_type") or classify_trip_type(route["distance_km"]),
+        # From the fare when there is one, and recomputed the SAME way when there is not:
+        # `trip_type_for` is the one place the rate card is decided (the LOCAL/resident
+        # flow is LOCAL to match the app, everyone else by the journey), so the handoff
+        # can never disagree with the price the fare was quoted on. A missing fare is no
+        # reason to leave this null — the app reads it to choose which booking screen to
+        # open, and its outstation screen refuses anything inside one state and under
+        # 200 km, so a trip that arrives without a trip_type opens the wrong form.
+        "trip_type": fare.get("trip_type")
+        or trip_type_for(state.visitor_type, route["distance_km"]),
         "passengers": state.entities.group_size,
         "travel_dates": _handoff_date(state.entities),
         # The cab we put in front of them, so the booking screen opens on the same one.
@@ -765,7 +786,7 @@ def _build_system_prompt(state: AgentState) -> str:
     # crash this function outright (`None.upper()`), and an unknown duration reached
     # the model as the literal text "None days".
     destination = entities.destination or ""
-    destination_display = destination or "not stated — answer generally about Himachal Pradesh"
+    destination_display = destination or "not stated — answer generally"
     duration_days = _resolved_duration(entities)
 
     # ── Language: ONE language for the whole reply, mirroring the user ─────────
@@ -859,7 +880,7 @@ def _build_system_prompt(state: AgentState) -> str:
     if is_outstation and entities.origin and mode == slots.ITINERARY_MODE:
         outstation_instructions = f"""
 **OUTSTATION VISITOR INSTRUCTIONS (CRITICAL):**
-- This visitor is coming from **{entities.origin}** (OUTSIDE Himachal Pradesh)
+- This visitor is coming from **{entities.origin}**
 - **Day 1 MUST begin with the arrival journey** from {entities.origin} to {destination_display}
 - Account for travel fatigue — plan lighter activities on arrival day
 - Return journey preference: **{entities.return_journey_preference or 'not specified'}**
@@ -876,12 +897,12 @@ def _build_system_prompt(state: AgentState) -> str:
     # hidden gems in a valley they live next to.
     local_instructions = ""
     if is_local and mode == slots.ITINERARY_MODE:
-        home_city = entities.home_city or entities.origin or "their HP home city"
+        home_city = entities.home_city or entities.origin or "their home city"
         local_instructions = f"""
 **LOCAL VISITOR INSTRUCTIONS (IMPORTANT):**
-- This visitor is a **Himachal Pradesh resident** based in **{home_city}**
+- This visitor is a **local resident** based in **{home_city}**
 - They likely already know the popular tourist spots — **prioritise hidden gems and off-beat experiences**
-- Travel time is shorter (intra-HP routes are typically 1-6 hours by cab)
+- Travel time is shorter than for a visitor — use only the drive time given in THIS JOURNEY
 - **No need to account for long-distance travel fatigue** — they can start activities sooner
 - Do NOT ask about or plan return journey — locals manage their own return
 - For 1-2 day trips, use a **weekend getaway format**: compact, action-packed itinerary
@@ -971,11 +992,11 @@ def _build_system_prompt(state: AgentState) -> str:
             "with the exact price shown there, and recommend the flagged one. Follow the "
             "prices exactly as written."
             if has_fares
-            else " No fare came back, so name NO cab and NO vehicle — not Innova, not "
-                 "Tempo Traveller, not SUV, not a 'spacious' or 'larger' one, and not a "
-                 "suggestion of what would suit the group size. Say only that Him Cab "
-                 "will carry them and that the cab and the exact fare are confirmed on "
-                 "the booking screen."
+            else " Name NO cab and NO vehicle — not Innova, not Tempo Traveller, not "
+                 "SUV, not a 'spacious' or 'larger' one, and not a suggestion of what "
+                 "would suit the group size. Say only that Him Cab will carry them, and "
+                 "that they choose their cab and see its exact fare on the booking "
+                 "screen."
         )
     )
     # The old wording here forbade a PRICE and said to "still recommend travelling with
@@ -1030,10 +1051,9 @@ def _build_system_prompt(state: AgentState) -> str:
         # A turn with no bookable duration is a QUESTION; only a chosen one confirms.
         forbidden_step = (
             "FORBIDDEN — do not write any of these, in any wording: a day-by-day plan, "
-            "sightseeing or things-to-do suggestions, a destination or drop-off point, "
-            "a route, a distance between two towns, a drive time, hotel or food advice, "
-            "or any JSON. They are hiring a car by the hour and have not said where "
-            "they are going."
+            "sightseeing or things-to-do suggestions, a drop point other than the one "
+            "in TRIP below, a route, a distance between two towns, a drive time, hotel "
+            "or food advice, or any JSON. They are hiring a car by the hour."
         )
 
         if not _rental_duration_chosen(state):
@@ -1067,7 +1087,8 @@ def _build_system_prompt(state: AgentState) -> str:
                 "Him Cab in the third person — 'we'll have the car with you' reads like "
                 "a person, 'Him Cab is ready to provide' reads like a form letter.",
                 "Line 1: confirm what they are getting in one natural sentence — the "
-                "package, the pickup and when. Do not describe WHO is travelling "
+                "package, the pickup, the drop if TRIP gives one, and when. Do not "
+                "describe WHO is travelling "
                 "('your family', 'your group of 4') unless the party is stated below; "
                 "a headcount nobody gave you is still an invention.",
                 "Then EXACTLY these bullets, in this order, and NOTHING else. Each is "
@@ -1100,7 +1121,16 @@ def _build_system_prompt(state: AgentState) -> str:
                     else "  (b) One bullet PER CAB from HIM CAB FARES — vehicle, seats, "
                     "price — each as its own top-level bullet, never nested under a "
                     "heading. These are the cabs available on this package: list every "
-                    "one of them and never mention a vehicle that is not listed."
+                    "one of them and never mention a vehicle that is not listed. The "
+                    "cab marked (recommended for this group/budget) goes FIRST and is "
+                    "labelled as our recommendation"
+                    + (
+                        f" for {party} passengers — it is the smallest cab that seats "
+                        f"them all"
+                        if (party := state.entities.group_size)
+                        else ""
+                    )
+                    + "."
                     if has_fares
                     else "  (b) No fare came back for this package, so say in one line "
                          "that the price is confirmed on the booking screen. Do NOT "
@@ -1131,9 +1161,10 @@ def _build_system_prompt(state: AgentState) -> str:
                     "be a question — do not ask them to confirm, and do not ask for any "
                     "further detail."
                     if _rental_ready_to_book(state)
-                    else "Last line: ask which of the cabs above they would like. End "
-                         "on that question, and say NOTHING about a booking screen — "
-                         "nothing opens until they have picked a cab."
+                    else "Last line: ask which of the cabs above they would like, and "
+                         "say that replying yes books the recommended one. End on that "
+                         "question, and say NOTHING about a booking screen — nothing "
+                         "opens until they have picked a cab."
                 ),
                 "Hard limit: at most 7 lines in total, including the bullets.",
             ]
@@ -1160,9 +1191,8 @@ def _build_system_prompt(state: AgentState) -> str:
                 "They are already narrowed to what seats this group: recommend all of "
                 "them, and never mention a larger vehicle or one not listed."
                 if has_fares
-                else "  (b) No fare is available, so say in one line that the exact fare "
-                     "is confirmed on the booking screen. Do NOT state, estimate, "
-                     "range or imply any number."
+                else "  (b) One line: they choose their cab on the booking screen, where "
+                     "each cab's fare is shown. Name NO cab and state NO price."
             ),
             # Only when there is a forecast to copy. Pointing at a REAL-TIME DATA
             # section that is not in the prompt leaves the model with a step it cannot
@@ -1259,13 +1289,21 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
     # which is an invitation to write about a place in a reply whose whole job is a car,
     # a duration and a price. Worse, when the extractor had picked a place up in passing
     # ("a car for 8 hours around Manali"), the line named it as the trip's destination.
+    # The DROP is stated only as the rider gave it (the planner keeps no other), and
+    # as a drop — the end of the hire — never as somewhere to plan a visit to.
     if mode == slots.RENTAL_MODE:
+        drop = entities.destination
         trip_facts = [
             f"- Pickup: {origin_display}",
+            (
+                f"- Drop: {drop} — where the hire ends. Say it back; describe nothing there."
+                if drop
+                else "- Drop: not stated — do not name one."
+            ),
             f"- Date: {entities.travel_dates or 'not stated — do not name a date'}",
             f"- Pickup time: {entities.pickup_time or 'not stated — do not state a time'}",
-            "- There is NO destination and NO trip length. They are hiring a car by the "
-            "hour; where they go is their business and they need not have decided.",
+            "- There is NO trip length. They are hiring a car by the hour; where they "
+            "go in between is their business and they need not have decided.",
         ]
         if entities.group_size:
             trip_facts.insert(1, f"- Party: {entities.group_size} people")
@@ -1335,7 +1373,7 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
         slots.RIDE_MODE: "THIS RIDE",
     }.get(mode, "TRIP")
 
-    return f"""You are the AI travel concierge for **Him Cab** — Himachal Pradesh's most trusted local cab service. Help the user genuinely, and guide them toward booking their travel with Him Cab.
+    return f"""You are the AI travel concierge for **Him Cab** — a trusted cab service. Help the user genuinely, and guide them toward booking their travel with Him Cab.
 
 ## LANGUAGE (STRICT)
 {language_instruction}

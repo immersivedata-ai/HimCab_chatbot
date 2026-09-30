@@ -18,7 +18,7 @@ Three flows, one graph, one set of nodes:
 | flow | who | endpoint | what a good turn ends in |
 |---|---|---|---|
 | `outstation` | a visitor planning a trip | `/v1/chat/outstation/*` | a day-by-day itinerary |
-| `local` | a Himachal resident booking a ride | `/v1/chat/local/*` | a route, a fare, a booking screen |
+| `local` | a Himachal resident booking a ride | `/v1/chat/local/*` | a route and a booking screen — the cab and its fare are chosen there |
 | `rental` | anyone hiring a car by the hour | `/v1/chat/rental/*` | a package, a fare, a booking screen |
 
 The flow is chosen by which page the rider opened, seeded into `visitor_type`, and is
@@ -315,9 +315,12 @@ Honest list. Do not rediscover these.
 - **The deploy passes 17 env vars; `.env` has 30.** `OPENWEATHER_API_KEY` is among the
   missing, which is why deployed replies carry no weather line. Check
   `deploy.ps1:57` against `.env` before blaming the code for a missing feature.
-- **No cab options without a rider JWT.** The fare gate requires one, `dev-test-token`
-  maps to `jwt=None`, and no fare means no cabs to choose from. The three test clients
-  now say so on screen.
+- **Only a rental lists and recommends cabs** (`slots.lists_cabs`, a 2026-09-28
+  product decision). A local ride and a trip plan request no fare and name no cab; the
+  app's booking screen does that. "No cabs in the local flow" is not a bug.
+- **No rental cab options without a rider JWT.** The fare gate requires one,
+  `dev-test-token` maps to `jwt=None`, and no fare means no cabs to choose from. The
+  rental test client says so on screen.
 
 ---
 

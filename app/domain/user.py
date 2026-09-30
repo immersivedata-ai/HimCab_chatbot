@@ -92,7 +92,9 @@ class UserProfile(BaseModel):
         if self.display_name:
             parts.append(f"User's name: {self.display_name}")
         if self.home_city:
-            parts.append(f"Home city: {self.home_city} (Himachal local)")
+            # No state name after it. This string goes into the writer's prompt, and a
+            # "(Himachal local)" tag there was one the model could say back to the rider.
+            parts.append(f"Home city: {self.home_city}")
 
         # Loyalty tier info
         tier = self.get_loyalty_tier()

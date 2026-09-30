@@ -14,7 +14,7 @@ Intent categories:
   - places_query:   User asking about attractions/food/places
   - cost_query:     User asking about trip cost
   - show_itinerary: User wants to see their existing itinerary
-  - general_query:  General Himachal travel question
+  - general_query:  General travel question
   - clarification:  User answering a clarification question
 
 Prompt template: app/prompts/templates/router_system.yaml

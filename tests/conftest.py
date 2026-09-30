@@ -11,6 +11,7 @@ the providers rate-limit — occasionally wrong for reasons that have nothing to
 the code under test.
 """
 
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -34,6 +35,9 @@ _KNOWN_PLACES: dict[str, tuple[float, float, str]] = {
     "solan": (30.9045, 77.0967, "Himachal Pradesh"),
     "keylong": (32.5710, 77.0300, "Himachal Pradesh"),
     "parwanoo": (30.8370, 76.9610, "Himachal Pradesh"),
+    "kangra": (32.0998, 76.2691, "Himachal Pradesh"),
+    "palampur": (32.1109, 76.5363, "Himachal Pradesh"),
+    "dadh": (32.0980, 76.5780, "Himachal Pradesh"),
     "delhi": (28.6139, 77.2090, "Delhi"),
     "new delhi": (28.6139, 77.2090, "Delhi"),
     "gurgaon": (28.4595, 77.0266, "Haryana"),
@@ -50,15 +54,29 @@ def _row(name: str) -> dict:
         "lat": str(lat),
         "lon": str(lon),
         "name": name.title(),
+        # The provider's own classification. Production rejects shops, roads and
+        # buildings by it (`geocoding.is_destination_kind`), so the fixture says what
+        # Nominatim says about a town.
+        "category": "place",
+        "type": "town",
+        "place_rank": 18,
         "display_name": f"{name.title()}, {state}, India",
         "address": {"city": name.title(), "state": state, "country": "India"},
     }
 
 
 def _match(query: str) -> str | None:
-    """The known place a query names, or None. Longest match wins ("new delhi")."""
+    """The known place a query names, or None. Longest match wins ("new delhi").
+
+    Whole words, like the real provider: a substring match "found" Kasol for "Kasoll",
+    which is the one typo the unplaceable-place tests exist to catch. A stub looser
+    than the system it stands in for is a stub that hides that system's failures.
+    """
     text = (query or "").lower()
-    hits = [name for name in _KNOWN_PLACES if name in text]
+    hits = [
+        name for name in _KNOWN_PLACES
+        if re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", text)
+    ]
     return max(hits, key=len) if hits else None
 
 

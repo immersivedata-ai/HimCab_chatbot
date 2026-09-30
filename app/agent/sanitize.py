@@ -174,6 +174,84 @@ def resolve_relative_day(text: Any, *, today: Optional[date] = None) -> Optional
     return (today or today_ist()) + timedelta(days=offset)
 
 
+_MONTH_NUMBERS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("jan", "january"), ("feb", "february"), ("mar", "march"),
+            ("apr", "april"), ("may",), ("jun", "june"), ("jul", "july"),
+            ("aug", "august"), ("sep", "sept", "september"), ("oct", "october"),
+            ("nov", "november"), ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+_MONTH_ALT = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+#: Whole-value patterns only: this resolves a travel date the readers have already
+#: reduced to the day (`slots.tidy_when`), not a sentence. Day before month in the
+#: numeric form, because that is how dates are written in India — "15/10" is October.
+_CALENDAR_RES = (
+    re.compile(rf"^(?P<d>\d{{1,2}})\s*(?:st|nd|rd|th)?\s+(?P<m>{_MONTH_ALT})\.?(?:,?\s+(?P<y>\d{{4}}))?$", re.I),
+    re.compile(rf"^(?P<m>{_MONTH_ALT})\.?\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(?P<y>\d{{4}}))?$", re.I),
+    re.compile(r"^(?P<d>\d{1,2})[/.-](?P<mn>\d{1,2})(?:[/.-](?P<y>\d{2}|\d{4}))?$"),
+)
+
+
+#: How far back a year-less date may lie and still be read as THIS year's — i.e. as a
+#: mistake to refuse rather than next year's. A month covers "the 5th" typed on the
+#: 20th; anything older is almost always a date in the coming year.
+_RECENTLY_GONE_DAYS = 31
+
+
+def resolve_calendar_day(text: Any, *, today: Optional[date] = None) -> Optional[date]:
+    """The date a calendar phrase names ("15 Oct", "Oct 15", "15/10"), or None.
+
+    The companion to `resolve_relative_day`. Relative days were already turned into a
+    date for the booking screen; a rider who typed "15 Oct" had those words sent into
+    its Date field instead, which cannot show them — so they typed the day in again.
+
+    With no year it is the NEXT such day — "15 Jan" typed in September is next January
+    — except within `_RECENTLY_GONE_DAYS` of today. A day that went by a fortnight ago
+    is a mistake, not a booking for next year, so it comes back as the past date it
+    names and `travel_date` refuses it by name. Rolling that into next year would
+    quietly book a car eleven months out for a rider who mistyped the month.
+    """
+    cleaned = clean_text(text)
+    if cleaned is None:
+        return None
+    base = today or today_ist()
+    for pattern in _CALENDAR_RES:
+        match = pattern.match(cleaned)
+        if not match:
+            continue
+        parts = match.groupdict()
+        month = (
+            _MONTH_NUMBERS[parts["m"].lower()] if parts.get("m") else int(parts["mn"])
+        )
+        year = int(parts["y"]) if parts.get("y") else base.year
+        if year < 100:
+            year += 2000
+        try:
+            day = date(year, month, int(parts["d"]))
+        except ValueError:
+            return None        # "31/02" names no day
+        if not parts.get("y") and day < base - timedelta(days=_RECENTLY_GONE_DAYS):
+            try:
+                day = day.replace(year=base.year + 1)
+            except ValueError:
+                return None    # 29 Feb, and next year has none
+        return day
+    return None
+
+
+def _resolve_day(text: str, today: date) -> Optional[date]:
+    """Any single day `text` names — relative or on the calendar — or None."""
+    if slots.ISO_DATE_RE.match(text):
+        return date.fromisoformat(text)
+    return resolve_relative_day(text, today=today) or resolve_calendar_day(text, today=today)
+
+
 def travel_date(
     value: Any, *, as_iso: bool = False, today: Optional[date] = None
 ) -> Optional[str]:
@@ -193,7 +271,7 @@ def travel_date(
     if cleaned is None:
         return None
     base = today or today_ist()
-    resolved = resolve_relative_day(cleaned, today=base)
+    resolved = _resolve_day(cleaned, base)
     if resolved is None:
         return cleaned
     if resolved < base:
@@ -225,7 +303,7 @@ def day_already_gone(value: Any, *, today: Optional[date] = None) -> Optional[st
     if cleaned is None:
         return None
     base = today or today_ist()
-    resolved = resolve_relative_day(cleaned, today=base)
+    resolved = _resolve_day(cleaned, base)
     return cleaned if resolved is not None and resolved < base else None
 
 

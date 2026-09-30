@@ -253,10 +253,11 @@ class TestTheRentalConversation:
             entities=ExtractedEntities(visitor_type=RENTAL, **entity_kwargs),
         )
 
-    def test_a_rental_never_asks_for_a_destination(self):
-        """Hiring by the hour means the rider has not chosen one, so asking would be
-        asking them to invent an answer."""
-        assert "destination" not in slots.needs_for("rental_query")
+    def test_a_rental_asks_for_a_drop_but_never_insists_on_one(self):
+        """Every flow asks for a pickup and a drop since 2026-09-29. A rental's drop is
+        IMPORTANT, never REQUIRED: plenty of hires end wherever the day ends, and a rider
+        who does not say must still reach the booking screen. (It used to be absent.)"""
+        assert slots.needs_for("rental_query")["destination"] is slots.Need.IMPORTANT
 
     def test_it_asks_for_the_duration_and_the_pickup(self):
         needs = slots.needs_for("rental_query")
@@ -315,7 +316,8 @@ class TestTheRentalConversation:
     def test_the_questions_stay_rental_whatever_the_router_says(self, drifted_intent):
         needs = slots.needs_for(drifted_intent, RENTAL)
 
-        assert "destination" not in needs, "asked a rental rider where they are going"
+        # The drop, and only as a rental asks for it — never the trip's REQUIRED one.
+        assert needs["destination"] is slots.Need.IMPORTANT
         assert "duration_days" not in needs, "asked a rental rider how many DAYS"
         assert needs["rental_hours"] is slots.Need.REQUIRED
 
@@ -794,12 +796,14 @@ class TestAQuestionIsNeverRepeatedVerbatim:
         decision = slots.decide(
             ExtractedEntities(visitor_type=RENTAL, rental_hours=8, origin="Shimla",
                               asked_counts={"group_size": 2, "travel_dates": 2,
-                                            "pickup_time": 2}),
+                                            "pickup_time": 2, "destination": 2}),
             "rental_query", RENTAL, "en", max_attempts=2,
         )
 
         assert decision.ask_field is None
         assert "group_size" in decision.assumed
+        # The drop is escapable too: asked its allotted times, then left out.
+        assert "destination" in decision.assumed
 
 
 # ── The vocabulary is defined once, in code ───────────────────────────────────
@@ -1214,7 +1218,7 @@ class TestAnUnlistedDurationIsReAsked:
     @pytest.mark.asyncio
     async def test_an_offered_duration_is_left_alone(self):
         result = await self._plan(
-            "8 hours from Shimla tomorrow at 9 am, 4 of us",
+            "8 hours from Shimla tomorrow at 9 am, 4 of us, drop at Kufri",
             ExtractedEntities(visitor_type=RENTAL, last_asked_field="rental_hours"),
             rate_card=RATE_CARD,
         )
@@ -1454,7 +1458,8 @@ class TestARentalStaysARentalWhateverThePhoneSays:
         persona = session.entities.visitor_type
 
         needs = slots.needs_for("plan_trip", persona)
-        assert "destination" not in needs and "duration_days" not in needs
+        # The rental's own table: a drop it may skip, and no trip length at all.
+        assert needs["destination"] is slots.Need.IMPORTANT and "duration_days" not in needs
         assert slots.response_mode("plan_trip", persona) == slots.RENTAL_MODE
 
     def test_the_other_personas_still_follow_their_coordinates(self):
@@ -1728,7 +1733,9 @@ class TestASentenceIsReadInCode:
             session_id="s", user_id="u", intent="rental_query", visitor_type=RENTAL,
             messages=[
                 AIMessage(content=welcome_message(RENTAL)),
-                HumanMessage(content="8 hours from Shimla tomorrow at 9 am, 4 of us"),
+                HumanMessage(
+                    content="8 hours from Shimla tomorrow at 9 am, 4 of us, drop at Kufri"
+                ),
             ],
             entities=ExtractedEntities(visitor_type=RENTAL, last_asked_field="rental_hours"),
         )
@@ -1742,6 +1749,7 @@ class TestASentenceIsReadInCode:
 
         entities = result["entities"]
         assert (entities.rental_hours, entities.origin) == (8, "Shimla")
+        assert entities.destination == "Kufri"
         assert (entities.pickup_time, entities.group_size) == ("09:00", 4)
         assert entities.travel_dates == _days_from_today(1)
         # Nothing left to ask, so the turn goes on to price it.
@@ -1809,7 +1817,10 @@ class TestASentenceIsReadInCode:
         from app.agent.nodes.planner import PLANNER_SYSTEM_PROMPT
 
         assert "A RENTAL CONVERSATION" in PLANNER_SYSTEM_PROMPT
-        assert "destination and duration_days are ALWAYS null here" in PLANNER_SYSTEM_PROMPT
+        assert "duration_days is ALWAYS null here" in PLANNER_SYSTEM_PROMPT
+        # The destination is the DROP, and only when the rider said so.
+        assert "destination is the DROP" in PLANNER_SYSTEM_PROMPT
+        assert "around Manali" in PLANNER_SYSTEM_PROMPT
 
 
 # ── 12. Which cab: the app's "Select Rental Cab" list, as a conversation ──────
@@ -2065,7 +2076,8 @@ class TestTheRentalPromptHasNoTripInIt:
         assert "- Pickup: Shimla" in prompt
         assert "- Date: kal" in prompt
         assert "- Pickup time: 09:00" in prompt
-        assert "There is NO destination and NO trip length" in prompt
+        assert "There is NO trip length" in prompt
+        assert "- Drop: not stated" in prompt
 
     def test_no_destination_line_survives_into_a_rental(self):
         """This block used to open with "Destination: not stated — answer generally about
@@ -2078,15 +2090,17 @@ class TestTheRentalPromptHasNoTripInIt:
         assert "- Duration:" not in prompt and "- Budget:" not in prompt
         assert "- Interests:" not in prompt
 
-    def test_a_destination_the_extractor_picked_up_is_still_not_named(self):
-        """Belt and braces: the planner drops it, and if one ever arrives anyway the
-        prompt does not repeat it back."""
+    def test_a_drop_is_named_as_the_end_of_the_hire_not_a_place_to_visit(self):
+        """A rental's destination is the DROP the rider named (the planner keeps no
+        other — see `test_a_place_mentioned_in_passing_is_never_a_destination`). It is
+        said back as where the hire ends, and never as a trip's destination."""
         prompt = self._prompt(
             entities=ExtractedEntities(visitor_type=RENTAL, origin="Shimla",
                                        rental_hours=8, destination="Kasol"),
         )
 
-        assert "Kasol" not in prompt
+        assert "- Drop: Kasol — where the hire ends" in prompt
+        assert "- Destination:" not in prompt
 
     def test_a_package_with_no_known_km_is_never_given_one(self):
         """When the rate card is unreadable the price still arrives (the backend matches
