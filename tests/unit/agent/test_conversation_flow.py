@@ -205,23 +205,28 @@ class TestQuestionsDoNotHijackAnswers:
 
 class TestARentalSentenceIsUnderstood:
 
+    # Every one of these sentences names a drop: every flow asks for a pickup AND a drop
+    # since 2026-09-29, so a sentence without one is rightly asked for it.
     @pytest.mark.asyncio
     async def test_one_sentence_is_enough_to_reach_a_quote(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
-            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
+            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us, drop at Kufri",
+            NOTHING,
         )
 
         assert turn.produced, "asked a question about details the sentence had given"
         assert chat.questions_asked == 0
         assert (chat.entities.rental_hours, chat.entities.origin) == (8, "Shimla")
+        assert chat.entities.destination == "Kufri"
         assert chat.entities.pickup_time == "09:00"
 
     @pytest.mark.asyncio
     async def test_the_same_sentence_in_hinglish(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
-            "Kal subah 6 baje Manali se gaadi chahiye 4 ghante ke liye, hum 4 hain",
+            "Kal subah 6 baje Manali se gaadi chahiye 4 ghante ke liye, hum 4 hain, "
+            "Kullu pe drop",
             NOTHING,
         )
 
@@ -229,28 +234,43 @@ class TestARentalSentenceIsUnderstood:
         assert chat.entities.rental_hours == 4
         assert chat.entities.pickup_time == "06:00"
         assert chat.entities.origin == "Manali"
+        assert chat.entities.destination == "Kullu"
 
     @pytest.mark.asyncio
     async def test_a_sentence_is_still_understood_when_vertex_is_down(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        turn = await chat.say("4 hrs from Kullu tomorrow at 10 am, 2 of us", None)
+        turn = await chat.say(
+            "4 hrs from Kullu tomorrow at 10 am, 2 of us, drop at Manali", None
+        )
 
         assert turn.produced
         assert chat.entities.rental_hours == 4
         assert chat.entities.origin == "Kullu"
+        assert chat.entities.destination == "Manali"
 
     @pytest.mark.asyncio
-    async def test_a_rental_is_never_asked_where_it_is_going(self):
-        """The reported reply: asked for a car by the hour and answered with "where would
-        you like to go?" and "how many days?". A rental has neither."""
+    async def test_a_sentence_without_a_drop_is_asked_for_one(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say(
+            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
+        )
+
+        assert turn.asked
+        assert turn.result["last_asked_field"] == "destination"
+        assert "ड्रॉप" in turn.question or "drop" in turn.question
+
+    @pytest.mark.asyncio
+    async def test_a_rental_is_asked_for_a_drop_only_after_the_pickup_and_never_for_days(self):
+        """The reported reply was a car-by-the-hour answered with "how many days?". A
+        rental has no trip length; it does have a drop now, asked after the pickup."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         await chat.say("I need a car", NOTHING)
         await chat.say("8 hours", NOTHING)
-        await chat.say("dunno", NOTHING)
+        await chat.say("Shimla", NOTHING)
 
         asked = [t.result["last_asked_field"] for t in chat.turns]
-        assert "destination" not in asked
         assert "duration_days" not in asked
+        assert asked.index("origin") < asked.index("destination")
 
     @pytest.mark.asyncio
     async def test_a_partial_sentence_asks_only_for_what_is_missing(self):
@@ -994,13 +1014,17 @@ class TestSlotPolicy:
                 assert slot.ask(lang, "local", 1), f"{name} has no {lang} retry question"
                 assert slots.label_for(name, lang)
 
-    def test_a_local_is_asked_where_they_live_not_where_they_are_visiting_from(self):
+    def test_every_flow_is_asked_for_the_pickup_in_the_same_words(self):
+        """A resident used to be asked "आप किस शहर में रहते हैं?" — where they LIVE —
+        when the booking needs where the cab should come. Since 2026-09-29 every flow
+        asks for the pickup, in one wording."""
         entities = ExtractedEntities(destination="Kasol", visitor_type="local")
         local = slots.decide(entities, "plan_trip", "local", "hi", max_attempts=2)
         outstation = slots.decide(entities, "plan_trip", "outstation", "hi", max_attempts=2)
+        rental = slots.SLOTS["origin"].ask("hi", "rental", 0)
 
-        assert local.question != outstation.question
-        assert "रहते" in local.question or "रहते" in slots.SLOTS["origin"].ask("hi", "local", 0)
+        assert local.question == outstation.question == rental == "आपको कहाँ से पिकअप करना है?"
+        assert "रहते" not in local.question
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
@@ -1031,3 +1055,90 @@ class TestRouting:
         state = self._state(intent="general_query", needs_clarification=False,
                             entities=ExtractedEntities())
         assert route_after_planner(state) == "tool_executor"
+
+
+# ── An unreadable reply is re-asked, not answered ─────────────────────────────
+
+class TestAnUnreadableReplyIsReAsked:
+    """A reply we could not use at all — a typo, an off-topic non-question line — re-asks
+    the pending question in a booking flow, INSTEAD of handing the turn to the free-text
+    writer. That hand-off is the reported bug: 'something different or a typo → the flow
+    hallucinates an irrelevant reply', because a misread reply is filed as a general
+    question and the slot policy then asks for none of the booking details.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "visitor,field,known",
+        [
+            # A resident answering "how many people?" with a typo. group_size is strict —
+            # the typo parses to no number — so it used to fall through to the writer.
+            ("local", "group_size", {"destination": "Kasol", "origin": "Palampur"}),
+            # A rental rider answering "for how long?" with a typo. rental_hours is strict.
+            (slots.RENTAL, "rental_hours", {"origin": "Manali"}),
+        ],
+    )
+    async def test_an_unreadable_reply_reasks_the_open_question_quoting_it(
+        self, visitor, field, known
+    ):
+        entities = ExtractedEntities(visitor_type=visitor, last_asked_field=field, **known)
+        state = AgentState(
+            session_id="s", user_id="u", intent="general_query", visitor_type=visitor,
+            entities=entities,
+            messages=[AIMessage(content="?"), HumanMessage(content="asdfgh")],
+        )
+        # general_query is what the router files a misread reply under — the exact path
+        # that used to drop the turn into the writer.
+        with patch("app.agent.nodes.planner.get_vertex_ai_service") as svc:
+            stub_vertex(svc, _stub_extractor(NOTHING))
+            result = await planner_node(state)
+
+        assert result["needs_clarification"] is True
+        assert result["last_asked_field"] == field
+        assert "asdfgh" in result["clarification_question"], (
+            "the rider's own words go back to them (§7)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_question_is_answered_not_reasked(self):
+        """The guard must never turn a real question into an interview — the deliberate
+        `TestQuestionsDoNotHijackAnswers` behaviour it sits beside."""
+        chat = Conversation(persona="local")
+        turn = await chat.say("kya wahan abhi thand hai?", NOTHING, intent="general_query")
+
+        assert turn.produced, "a genuine question was deflected instead of answered"
+
+    @pytest.mark.asyncio
+    async def test_an_outstation_visitor_is_told_the_place_was_not_found(self):
+        """The generic re-ask is scoped to the booking flows; a visitor gets the map check.
+
+        This used to assert the turn was PRODUCED — and what it produced was a trip
+        plan for a destination called "Asdfgh", read off the bare reply by
+        `parse_place`. That is the reported hallucination, pinned as correct. The
+        visitor's gibberish is now put back to them by name instead.
+        """
+        chat = Conversation(persona="outstation")
+        turn = await chat.say("asdfgh", NOTHING, intent="general_query")
+
+        assert turn.asked
+        assert "asdfgh" in turn.question.lower()
+        assert chat.entities.destination is None
+
+
+class TestTheUnreadReplyPreamble:
+    """The "I didn't catch that" line that fronts the re-ask, in both languages (§8)."""
+
+    def test_it_quotes_the_riders_own_words(self):
+        assert "kasooll" in slots.unread_reply_preamble("kasooll", "en")
+
+    def test_a_long_paste_is_trimmed_not_dumped_back(self):
+        out = slots.unread_reply_preamble("x" * 90, "en")
+        assert "…" in out and len(out) < 90
+
+    def test_an_empty_message_drops_the_quote_entirely(self):
+        assert slots.unread_reply_preamble("   ", "en") == "Sorry, I didn't quite catch that."
+
+    def test_both_languages_exist_and_are_not_the_same_string(self):
+        en = slots.unread_reply_preamble("Kasol", "en")
+        hi = slots.unread_reply_preamble("Kasol", "hi")
+        assert en != hi and "Kasol" in en and "Kasol" in hi

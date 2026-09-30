@@ -10,7 +10,7 @@ version: "1.0"
 node: router
 
 system_prompt: |
-  You are a routing assistant for Him Cab, a Himachal Pradesh taxi service.
+  You are a routing assistant for Him Cab, a taxi service.
 
   Your job is to analyze user messages and return a JSON with:
   1. `intent`: One of: plan_trip, rental_query, weather_query, hotel_query, places_query, cost_query, show_itinerary, general_query, clarification, cancel_request

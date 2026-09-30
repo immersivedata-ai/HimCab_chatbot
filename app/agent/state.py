@@ -116,6 +116,18 @@ class AgentState(BaseModel):
     #: because a rider who answered precisely and got the identical question back reads
     #: that as not having been understood at all. That is how this was reported.
     past_travel_date: Optional[str] = None
+    #: A place the rider named that could not be used, as {field, value, reason}: the
+    #: map has no such place, or a trip destination is outside Himachal. Set by the
+    #: planner alongside a cleared slot, on the same principle as the two above — the
+    #: question goes back NAMING it. Unset, a typo'd "Kasoll" was either routed to
+    #: whatever the geocoder's first hit happened to be or handed to the writer as a
+    #: destination with no facts behind it, and both were reported as hallucination.
+    unplaceable_place: Optional[dict] = None
+    #: True when the rider answered "which cab?" by taking the one we recommended
+    #: ("haan book kar do", "ok"). Set by the planner, applied by the tool executor —
+    #: the only node that knows which cab that was, because it has just priced them.
+    #: One turn only; the choice itself persists as `entities.cab_category`.
+    accepted_recommended_cab: bool = False
     #: True while the reply's job is to ask WHICH CAB. Set by the tool executor once a
     #: fare has come back with options and the rider has not picked one (and cleared once
     #: they have, or once the question has been asked its allotted times). The writer's
@@ -123,9 +135,12 @@ class AgentState(BaseModel):
     #: booking screen while still asking which cab to open it on.
     awaiting_cab_choice: bool = False
     #: Where the cab collects them, as {name, lat, lon} — rental flow only. A hire by
-    #: the hour has no destination, so there is no `route_estimate` to carry the pin,
-    #: and the booking screen still has to open its map somewhere.
+    #: the hour has no route to measure, so there is no `route_estimate` to carry the
+    #: pin, and the booking screen still has to open its map somewhere.
     pickup: Optional[dict] = None
+    #: Where the hire ends, as {name, lat, lon} — rental flow only, and only when the
+    #: rider named a drop. The same map needs it; the price does not depend on it.
+    drop: Optional[dict] = None
     #: Rental blocks from the rate card ({hours, included_km, label}), rental flow only.
     #: The reply offers exactly these, because the backend matches a duration against
     #: them exactly — see app/integrations/himcab/rental_service.py.

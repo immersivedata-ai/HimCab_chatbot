@@ -125,6 +125,16 @@ def _quiet_weather():
     )
 
 
+def _every_flow_lists_cabs():
+    """Switch the cab policy on for every travelling flow, to test the dormant path."""
+    from app.agent import slots
+
+    return patch.object(
+        slots, "_CAB_LISTING_MODES",
+        frozenset({slots.RENTAL_MODE, slots.RIDE_MODE, slots.ITINERARY_MODE}),
+    )
+
+
 async def _located_state(lat: float, lon: float, **entity_overrides):
     """Agent state for a rider at these coordinates.
 
@@ -192,6 +202,36 @@ class TestRouteFromCoordinates:
         assert origin["lat"] == pytest.approx(28.6139, abs=0.5)
 
     @pytest.mark.asyncio
+    async def test_a_local_ride_never_asks_for_a_fare(self):
+        """Only a rental recommends a cab (`slots.lists_cabs`, a 2026-09-28 decision).
+
+        Everything the fare gate wants is present — a fix, a JWT, a travelling intent —
+        and the backend is still not asked: the cab is chosen on the booking screen,
+        and a fare fetched here would put one back on screen through the events.
+        """
+        from app.core.config import settings
+
+        state = await _located_state(31.1048, 77.1734)
+        state.rider_jwt = "jwt-token"
+
+        fare_svc = MagicMock()
+        fare_svc.get_quote = AsyncMock()
+
+        with _quiet_weather(), \
+             patch("app.agent.nodes.tool_executor.get_fare_service", return_value=fare_svc), \
+             patch.object(settings, "enable_real_fares", True), \
+             patch.object(settings, "enable_offers", False):
+            result = await tool_executor_node(state)
+
+        fare_svc.get_quote.assert_not_awaited()
+        assert result["cab_fare"] is None
+        assert result["route_estimate"] is not None      # the journey is still measured
+
+    # The two below exercise the local/trip pricing path with the policy switched ON.
+    # It is dormant, not deleted — reversing the decision is one line in
+    # `slots._CAB_LISTING_MODES` — so what it guarantees when it runs is still tested.
+
+    @pytest.mark.asyncio
     async def test_the_fare_is_priced_on_the_distance_the_reply_quotes(self):
         """The single most damaging inconsistency available here: quoting one distance
         in the text and pricing the cab on another."""
@@ -216,7 +256,7 @@ class TestRouteFromCoordinates:
         fare_svc = MagicMock()
         fare_svc.get_quote = fake_quote
 
-        with _quiet_weather(), \
+        with _quiet_weather(), _every_flow_lists_cabs(), \
              patch("app.agent.nodes.tool_executor.get_fare_service", return_value=fare_svc), \
              patch.object(settings, "enable_offers", False):
             result = await tool_executor_node(state)
@@ -238,7 +278,7 @@ class TestRouteFromCoordinates:
         fare_svc = MagicMock()
         fare_svc.get_quote = AsyncMock(side_effect=Exception("backend down"))
 
-        with _quiet_weather(), \
+        with _quiet_weather(), _every_flow_lists_cabs(), \
              patch("app.agent.nodes.tool_executor.get_fare_service", return_value=fare_svc), \
              patch.object(settings, "enable_offers", False):
             await tool_executor_node(state)

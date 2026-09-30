@@ -96,13 +96,18 @@ class TestItStatesTheFacts:
         assert "215" in reply
 
     @pytest.mark.parametrize("lang", ["en", "hi"])
-    def test_every_priced_cab_is_listed_with_its_fare(self, lang):
-        """The cabs are already narrowed to what seats the party, so all of them are
-        bookable and the choice is the rider's."""
+    def test_no_cab_is_named_even_when_a_fare_is_on_state(self, lang):
+        """The rider chooses the cab on the booking screen (`slots.lists_cabs`).
+
+        This used to require every priced cab by name with its fare. `_state()` still
+        carries a priced fare, on purpose: the reply must not list it even then,
+        because listing the cabs IS the recommendation a local ride no longer makes.
+        """
         reply = build_ride_reply(_state(), lang)
         for name, fare in [("Economy", "3,200"), ("Sedan", "4,100"), ("SUV", "5,600")]:
-            assert name in reply
-            assert fare in reply
+            assert name not in reply
+            assert fare not in reply
+        assert "गाड़ी चुनें" in reply or "Choose your cab" in reply
 
     @pytest.mark.parametrize("lang", ["en", "hi"])
     def test_it_ends_at_the_booking_screen(self, lang):

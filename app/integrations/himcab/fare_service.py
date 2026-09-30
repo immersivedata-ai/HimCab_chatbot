@@ -10,7 +10,8 @@ Everything above the "CONTRACT BOUNDARY" fence is contract-independent. Only
 are confirmed against POST /api/rider/fare/estimate (see the fence below).
 """
 
-from typing import Optional
+import re
+from typing import Any, Optional
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -30,6 +31,36 @@ log = get_logger(__name__)
 #: entitled to pick and then tell them it was not available.
 _MAX_OPTIONS = 3
 _MAX_RENTAL_OPTIONS = 6
+
+#: Digits inside whatever the backend put in `seatCapacity`.
+_SEAT_DIGITS = re.compile(r"\d+")
+
+
+def _parse_seat_capacity(value: Any) -> Optional[int]:
+    """Seats a category holds, from whatever `seatCapacity` the estimate endpoint sent.
+
+    This exists because the real backend returns `seatCapacity` as a HUMAN RANGE STRING
+    like "4 - 6" for some categories, not an integer — and `FareCategoryFare.seat_capacity`
+    is an int. Handing "4 - 6" straight to the model raised a pydantic ValidationError
+    that took down the WHOLE parse (every category, not just that row): it propagated out
+    of `get_quote`, `tool_executor._safe_call` swallowed it to None, and the rider got a
+    ride reply with NO cabs at all. It went unseen for a long time because a valid rider
+    JWT is the only thing that ever reaches a real response — every stub and every expired
+    token failed earlier, so the estimate body was never actually parsed until now.
+
+    The UPPER bound is the capacity: a "4 - 6" cab seats up to six, so a party of six
+    still fits it, and `vehicles.select_cabs_for_group` keeps cabs whose seats meet the
+    group. None when the field is absent or carries no number, which the seat inference
+    from the category name (`vehicles.seat_capacity_for`) then covers.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value > 0 else None
+    nums = [int(n) for n in _SEAT_DIGITS.findall(str(value))]
+    return max(nums) if nums else None
 
 
 class _RetryableFareError(Exception):
@@ -62,7 +93,20 @@ class FareService:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=5),
-        retry=retry_if_exception_type((_RetryableFareError, httpx.ConnectError, httpx.ReadTimeout)),
+        # ConnectError (refused) and ConnectTimeout/PoolTimeout (never got a socket) all
+        # mean the fare host was not reachable, and all deserve the same retry. This tuple
+        # used to carry ConnectError but not the timeouts, so a refused connection retried
+        # three times while a connect timeout failed on the first attempt — the same
+        # "backend is down" outcome reached two different ways, one of them flakier. A
+        # fare miss is swallowed to None either way (no invented price), so the only thing
+        # the asymmetry changed was how often a transient network blip cost the rider cabs.
+        retry=retry_if_exception_type((
+            _RetryableFareError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.ReadTimeout,
+        )),
     )
     async def _post(self, url: str, body: dict, headers: dict) -> dict:
         """POST with retry on transient errors only. 4xx propagate immediately (no retry)."""
@@ -199,7 +243,14 @@ class FareService:
 
     @staticmethod
     def _extract_categories(rows: list) -> list[FareCategoryFare]:
-        """Pull per-category (id, name, image, totalFare, seatCapacity) out of the rows."""
+        """Pull per-category (id, name, image, totalFare, seatCapacity) out of the rows.
+
+        A row that will not parse is SKIPPED and logged, never raised. One malformed
+        category used to take the whole quote down with it — the exception propagated out
+        of get_quote, _safe_call turned it into None, and the rider got a ride reply with
+        no cabs at all instead of the other categories that parsed perfectly well. A
+        dropped category costs one option; a raised one costs them every option.
+        """
         out: list[FareCategoryFare] = []
         for r in rows:
             if not isinstance(r, dict):
@@ -207,13 +258,26 @@ class FareService:
             fare = r.get("totalFare")
             if fare is None:
                 continue
-            out.append(FareCategoryFare(
-                category_id=r.get("categoryId"),
-                category_name=r.get("name"),
-                category_image=r.get("categoryImage"),
-                total_fare_inr=float(fare),
-                seat_capacity=r.get("seatCapacity"),
-            ))
+            try:
+                out.append(FareCategoryFare(
+                    category_id=r.get("categoryId"),
+                    category_name=r.get("name"),
+                    category_image=r.get("categoryImage"),
+                    total_fare_inr=float(fare),
+                    # The backend sends this as a range string ("4 - 6") for some tiers,
+                    # not an int — parsed to the upper bound here so the strict model
+                    # never sees a shape it will reject. See `_parse_seat_capacity`.
+                    seat_capacity=_parse_seat_capacity(r.get("seatCapacity")),
+                ))
+            except (ValueError, TypeError) as e:
+                # pydantic's ValidationError is a ValueError; float() raises ValueError.
+                log.warning(
+                    "fare_category_skipped",
+                    category=r.get("name"),
+                    total_fare_raw=r.get("totalFare"),
+                    seat_capacity_raw=r.get("seatCapacity"),
+                    error=str(e),
+                )
         return out
 
 

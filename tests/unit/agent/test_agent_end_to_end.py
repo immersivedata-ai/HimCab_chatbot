@@ -115,6 +115,9 @@ class AgentHarness:
             fare_svc._post = AsyncMock(side_effect=fare_response)
         else:
             fare_svc._post = AsyncMock(return_value=fare_response or {"data": []})
+        # Kept so a test can prove the fare backend was never ASKED, not merely that
+        # its answer went unused — a local ride and a trip plan name no cab.
+        self.fare_post = fare_svc._post
 
         messages = list(history or [])
         messages.append(HumanMessage(content=message))
@@ -310,12 +313,13 @@ class TestWholeTurns:
         assert "moves toward a booking" in agent.writer_prompt
 
     @pytest.mark.asyncio
-    async def test_the_itinerary_carries_a_him_cab_fare(self, agent):
-        """The reported failure: itineraries arrived with no Him Cab price.
+    async def test_the_itinerary_names_no_cab_and_asks_for_no_fare(self, agent):
+        """Only a rental recommends a cab (`slots.lists_cabs`, a 2026-09-28 decision).
 
-        Runs the whole turn with a stubbed backend and asserts the fare survives all
-        the way to the prompt AND to the JSON the app renders — the two places the
-        rider can actually see it.
+        This used to assert the opposite — the fare in the prompt, a `cab_fare` card and
+        a priced `cab_package` on the itinerary. A visitor now picks their cab on the
+        app's booking screen, so the backend is not asked, and nothing the rider sees
+        names a cab: not the prompt, not the events, not the itinerary card.
         """
         final = await agent.turn(
             "Gurgaon to Manali, 3 days, 4 of us, next week",
@@ -334,18 +338,15 @@ class TestWholeTurns:
             },
         )
 
-        fare_events = [e for e in final.get("structured_events", []) if e["type"] == "cab_fare"]
-        assert fare_events, "no cab_fare card for the app to render"
-        assert len(fare_events[0]["payload"]["options"]) == 3
+        assert agent.fare_post.await_count == 0, "a trip plan asked for a cab fare"
+        assert "cab_fare" not in _event_types(final)
+        assert "9,600" not in agent.writer_prompt
+        assert "chooses their cab on the booking screen" in agent.writer_prompt
+        assert final["structured_itinerary"].cab_package is None
 
-        # Gurgaon was in no surveyed table, so this is the path that used to yield
-        # nothing at all. The distance now comes from the routing engine.
-        assert fare_events[0]["payload"]["distance_km"] > 0
-        assert "9,600" in agent.writer_prompt
-
-        # The price also lands on the itinerary the app renders, not just in the text.
-        cab_package = final["structured_itinerary"].cab_package
-        assert cab_package is not None and cab_package.estimated_cost_inr == 9600
+        # The journey itself is still measured — Gurgaon was in no surveyed table, and
+        # the distance comes from the routing engine whether or not anything is priced.
+        assert final["route_estimate"]["distance_km"] > 0
 
     @pytest.mark.asyncio
     async def test_a_fare_failure_never_blocks_the_itinerary(self, agent):
@@ -411,9 +412,9 @@ def _local_weather():
 
 
 class TestLocalRiderGetsACabNotAnItinerary:
-    """A Himachal resident asking to go to Manali is booking a ride, not planning a
-    holiday in a place they already know. The reply is the cab, the fare, the drive
-    time and the weather — then a handoff to the app's booking screen."""
+    """A resident asking to go to Manali is booking a ride, not planning a holiday in a
+    place they already know. The reply is the drive time, the day and the weather —
+    then a handoff to the app's booking screen, where they choose the cab."""
 
     async def _local_turn(self, agent, **overrides):
         kwargs = {
@@ -450,20 +451,21 @@ class TestLocalRiderGetsACabNotAnItinerary:
             assert brochure not in reply, f"the ride reply reads like a brochure: {brochure!r}"
 
     @pytest.mark.asyncio
-    async def test_only_cabs_that_seat_the_group_reach_the_rider(self, agent):
-        """The reported symptom: a Mini Bus recommended to four travellers."""
+    async def test_no_cab_is_recommended_to_a_local_rider(self, agent):
+        """Only a rental recommends a cab (`slots.lists_cabs`, a 2026-09-28 decision).
+
+        This test used to require the opposite — every cab that seats four, by name,
+        with its price. The ride now ends at the booking screen, which lists the cabs
+        and their fares itself, so the backend is not asked and no cab is named.
+        """
         final = await self._local_turn(agent)
 
-        fare = next(e for e in final["structured_events"] if e["type"] == "cab_fare")
-        offered = [o["category_name"] for o in fare["payload"]["options"]]
-
-        assert offered == ["Economy", "Sedan", "SUV"]
-        # And the reply names exactly those — no vehicle the party cannot book.
+        assert agent.fare_post.await_count == 0, "a local ride asked for a cab fare"
+        assert "cab_fare" not in _event_types(final)
         reply = final["final_response_text"]
-        for seats_them in ("Economy", "Sedan", "SUV"):
-            assert seats_them in reply
-        assert "Mini Bus" not in reply
-        assert "Tempo Traveller" not in reply
+        for cab in ("Economy", "Sedan", "SUV", "Innova", "Tempo Traveller", "Mini Bus", "₹"):
+            assert cab not in reply, f"the local reply still recommends a cab: {cab!r}"
+        assert "गाड़ी चुनें" in reply or "Choose your cab" in reply
 
     @pytest.mark.asyncio
     async def test_the_reply_carries_the_drive_time_and_temperature(self, agent):
@@ -510,7 +512,9 @@ class TestLocalRiderGetsACabNotAnItinerary:
         for end in ("origin", "destination"):
             assert payload[end]["lat"] and payload[end]["lon"], f"{end} has no map pin"
         assert payload["passengers"] == 4
-        assert payload["recommended_category_id"] is not None
+        # Nothing preselected: the rider chooses the cab on the booking screen.
+        assert payload["recommended_category_id"] is None
+        assert payload["recommended_category_name"] is None
         assert payload["duration_text"] == "4h 30m"
 
     @pytest.mark.asyncio
@@ -620,8 +624,8 @@ class TestOutstationIsUnaffected:
         assert "pickup and drop are already filled in" not in agent.writer_prompt
 
     @pytest.mark.asyncio
-    async def test_a_visitor_is_also_spared_the_oversized_cab(self, agent):
-        """Seat filtering is a plain bug fix, so it applies to both personas."""
+    async def test_a_visitor_is_recommended_no_cab_either(self, agent):
+        """Only a rental recommends a cab — a visitor chooses on the booking screen."""
         final = await agent.turn(
             "Delhi to Manali, 4 of us, 3 days, next week",
             intent="plan_trip",
@@ -634,5 +638,8 @@ class TestOutstationIsUnaffected:
             },
         )
 
-        fare = next(e for e in final["structured_events"] if e["type"] == "cab_fare")
-        assert not any("Bus" in o["category_name"] for o in fare["payload"]["options"])
+        assert agent.fare_post.await_count == 0
+        assert "cab_fare" not in _event_types(final)
+        handoff = next(e for e in final["structured_events"] if e["type"] == "booking_handoff")
+        assert handoff["payload"]["recommended_category_id"] is None
+        assert handoff["payload"]["options"] == []

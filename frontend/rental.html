@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Him Cab — Rent a Car by the Hour</title>
-  <meta name="description" content="Hire a car and driver by the hour anywhere in Himachal Pradesh." />
+  <meta name="description" content="Hire a car and driver by the hour." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;0,14..32,800&display=swap" rel="stylesheet" />
@@ -792,14 +792,16 @@
         ));
 
       } else if (type === "booking_handoff") {
-        // A rental handoff carries a pickup and a duration; `destination` is null by
-        // design — the rider decides where to go once the car is theirs.
+        // A rental handoff carries a pickup and a duration, and the drop when the
+        // rider named one — `destination` is null when they did not.
         const o = p.origin || {};
+        const d = p.destination || {};
         col.appendChild(card(
           "card-booking", "🚕", "Open booking screen", p.trip_type,
           kv([
             ["Pickup",     o.name],
             ["Pin",        o.lat != null ? `${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}` : null],
+            ["Drop",       d.name],
             ["Hours",      p.rental_hours],
             ["Included",   p.included_km ? `${Math.round(p.included_km)} km` : null],
             ["Passengers", p.passengers],
@@ -899,8 +901,8 @@
     // source; `checkGreetingDrift()` compares the two and complains in the console
     // rather than letting a stale copy here quietly disagree with the backend.
     const GREETINGS = {
-      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी हिमाचल यात्रा की योजना बनाने में मदद कर सकता हूँ। आप कहाँ जाना चाहते हैं?",
-      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip to Himachal Pradesh. Where would you like to go?",
+      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी यात्रा की योजना बनाने में मदद कर सकता हूँ। आपको कहाँ ड्रॉप करना है?",
+      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip. Where should we drop you?",
       "rental": "Welcome to Him Cab! 🙏 I can arrange a car and driver by the hour. How long do you need the car for?"
     };
 

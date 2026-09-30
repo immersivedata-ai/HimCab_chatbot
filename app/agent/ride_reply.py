@@ -5,10 +5,14 @@ The reply a Himachal resident gets when they book a cab. Assembled, not generate
 
 WHY THIS IS NOT WRITTEN BY THE MODEL
 ────────────────────────────────────
-A ride reply has exactly one job: confirm the journey, show what the cabs cost, and
-say the booking screen is open. Every line of it is a fact the system already holds —
-the route came from the routing engine, the fares from the Him Cab backend, the
-temperature from the weather provider. There is nothing to compose, only to state.
+A ride reply has exactly one job: confirm the journey and say the booking screen is
+open. Every line of it is a fact the system already holds — the route came from the
+routing engine, the temperature from the weather provider. There is nothing to compose,
+only to state.
+
+It names no cab and quotes no fare. It used to list every cab that seats the party with
+its price; since 2026-09-28 the cabs and their fares are chosen on the app's booking
+screen instead, and only a rental recommends one in chat (`slots.lists_cabs`).
 
 Asking a language model to state facts it has been handed turns out to be the hard
 way. The prompt for this reply grew a FORBIDDEN list — no day-by-day plan, no
@@ -68,17 +72,12 @@ _TEXT: dict[str, dict[str, str]] = {
         "en": "Pickup: {day} at {time}",
         "hi": "पिकअप: {day}, {time} बजे",
     },
-    "cab": {
-        "en": "{name}{seats}: ₹{fare}",
-        "hi": "{name}{seats}: ₹{fare}",
-    },
-    "seats": {
-        "en": " ({count} seats)",
-        "hi": " ({count} सीटें)",
-    },
-    "no_fare": {
-        "en": "The exact fare is confirmed on the booking screen.",
-        "hi": "सटीक किराया बुकिंग स्क्रीन पर पुष्टि होगा।",
+    #: Where the cab is chosen. Said instead of a list: the booking screen shows every
+    #: cab with its fare, so naming one here would be the recommendation this flow no
+    #: longer makes — and a price here could disagree with the one the screen shows.
+    "choose_cab": {
+        "en": "Choose your cab on the booking screen — each cab's fare is shown there.",
+        "hi": "बुकिंग स्क्रीन पर अपनी गाड़ी चुनें — हर गाड़ी का किराया वहीं दिखेगा।",
     },
     "weather": {
         "en": "{place} right now: {temp}°C, {condition}",
@@ -123,7 +122,6 @@ def build_ride_reply(state, lang_key: str = ReplyLanguage.ENGLISH) -> str:
     """
     entities = state.entities
     route = state.route_estimate or {}
-    fare = state.cab_fare or {}
 
     origin = (
         (route.get("origin") or {}).get("name")
@@ -167,30 +165,11 @@ def build_ride_reply(state, lang_key: str = ReplyLanguage.ENGLISH) -> str:
             )
         )
 
-    # ── The cabs ──────────────────────────────────────────────────────────────
-    # Already narrowed to what seats the party (`himcab/vehicles.py`), so every option
-    # here is one the rider can actually book. Listing them all is the choice they came
-    # to make.
-    options = [o for o in (fare.get("options") or []) if o.get("total_fare_inr") is not None]
-    for option in options:
-        amount = _round_inr(option.get("total_fare_inr"))
-        if amount is None:
-            continue
-        seats = option.get("seat_capacity")
-        lines.append(
-            "- "
-            + _t(
-                "cab",
-                lang_key,
-                name=option.get("category_name") or "Cab",
-                seats=_t("seats", lang_key, count=seats) if seats else "",
-                fare=amount,
-            )
-        )
-    if not options:
-        # No number at all rather than an estimate. A fare the backend did not return
-        # is a fare nobody can honour.
-        lines.append("- " + _t("no_fare", lang_key))
+    # ── The cab ───────────────────────────────────────────────────────────────
+    # Chosen on the booking screen, not here — see `choose_cab`. Unconditional: even a
+    # fare that somehow reached state is not listed, because listing it IS the
+    # recommendation.
+    lines.append("- " + _t("choose_cab", lang_key))
 
     # ── Conditions there, if anyone measured them ─────────────────────────────
     # Current temperature only. The forecast and the snowfall risk are real data and

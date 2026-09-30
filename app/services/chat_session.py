@@ -63,13 +63,13 @@ _RESUME_WINDOW = timedelta(hours=24)
 WELCOME_MESSAGES: dict[str, str] = {
     LOCAL: (
         "नमस्ते! Him Cab में आपका स्वागत है 🙏 "
-        "मैं आपकी हिमाचल यात्रा की योजना बनाने में मदद कर सकता हूँ। "
-        "आप कहाँ जाना चाहते हैं?"
+        "मैं आपकी यात्रा की योजना बनाने में मदद कर सकता हूँ। "
+        "आपको कहाँ ड्रॉप करना है?"
     ),
     OUTSTATION: (
         "Welcome to Him Cab! 🙏 "
-        "I can help you plan your trip to Himachal Pradesh. "
-        "Where would you like to go?"
+        "I can help you plan your trip. "
+        "Where should we drop you?"
     ),
     RENTAL: (
         "Welcome to Him Cab! 🙏 "
@@ -145,8 +145,8 @@ _FLOWS: tuple[dict, ...] = (
         "id": LOCAL,
         "title": {"en": "Local ride", "hi": "लोकल सवारी"},
         "subtitle": {
-            "en": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
-            "hi": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
+            "en": "अपने शहर में कैब बुक करें",
+            "hi": "अपने शहर में कैब बुक करें",
         },
     },
     {

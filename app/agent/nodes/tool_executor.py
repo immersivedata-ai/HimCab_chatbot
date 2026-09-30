@@ -47,6 +47,7 @@ from app.integrations.himcab import (
     usable_offers,
 )
 from app.integrations.himcab.models import FareQuote, Offer
+from app.integrations.himcab.quote_builder import trip_type_for
 from app.services import geo
 
 log = get_logger(__name__)
@@ -55,12 +56,18 @@ log = get_logger(__name__)
 TOOL_TIMEOUT_SECONDS = 20
 
 
-async def _safe_call(coro_or_value: Any, label: str) -> Any:
+async def _safe_call(coro_or_value: Any, label: str, session_id: Optional[str] = None) -> Any:
     """
     Wrapper that:
       1. Validates the argument is actually awaitable (catches sync/async mismatch bugs)
       2. Enforces a per-tool timeout
       3. Catches exceptions and logs them without failing the whole node
+
+    `session_id` is threaded through so the two degradation lines below can be correlated
+    to the turn that failed. Without it, `tool_call_failed` — the ONLY line that carries
+    the error type behind a silently-missing fare — could not be tied to a conversation
+    under concurrency, which is the difference between "a fare call is erroring" and
+    "THIS rider's fare call errored". Optional so the many other call sites are untouched.
     """
     try:
         # Guard: if someone passes a non-coroutine (sync result), return it directly
@@ -76,6 +83,7 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
             "tool_call_timeout",
             tool=label,
             timeout_seconds=TOOL_TIMEOUT_SECONDS,
+            session_id=session_id,
         )
         return None
 
@@ -85,6 +93,7 @@ async def _safe_call(coro_or_value: Any, label: str) -> Any:
             tool=label,
             error=str(e),
             error_type=type(e).__name__,
+            session_id=session_id,
         )
         return None
 
@@ -285,6 +294,13 @@ async def _rental_tools(state: AgentState) -> dict:
     elif pickup:
         tasks["pickup"] = _safe_call(geo.resolve_pickup(origin_name=pickup), "pickup")
 
+    # The drop pin, when the rider named one — for the booking map, not the price: a
+    # rental is charged on its package and the odometer, never on where it ends.
+    if entities.destination:
+        tasks["drop"] = _safe_call(
+            geo.resolve_pickup(origin_name=entities.destination), "drop"
+        )
+
     # The rate card's own entry for these hours, when we could read one. It carries the
     # included kilometres — what the package COVERS — and nothing else depends on it:
     # the price comes from the backend either way.
@@ -306,6 +322,7 @@ async def _rental_tools(state: AgentState) -> dict:
         tasks["cab_fare"] = _safe_call(
             get_fare_service().get_quote(quote_input, rider_jwt=state.rider_jwt),
             "cab_fare",
+            session_id=state.session_id,
         )
     else:
         log.info(
@@ -326,12 +343,30 @@ async def _rental_tools(state: AgentState) -> dict:
     # The cab the rider picked, resolved BEFORE offers: a coupon's minimum spend is
     # checked against the fare, and after this line the fare is theirs rather than ours.
     chose_cab = False
+    chosen_entities: Optional[ExtractedEntities] = None
     if cab_fare:
         cab_fare["rental_hours"] = entities.rental_hours
         # None when the rate card was unreadable: the price is still the backend's, but
         # what the package INCLUDES is not something we were told, so nothing claims it.
         cab_fare["included_km"] = package.included_km if package else None
         chose_cab = _select_requested_category(cab_fare, entities.cab_category)
+        # "Haan, book kar do" to the cab question: the rider has taken our
+        # recommendation — the headline, which `select_cabs_for_group` chose as the
+        # smallest cab that seats their party. It becomes THEIR choice exactly as a
+        # typed "suv" would, so the booking screen opens with it selected and the price
+        # beside it, instead of on an empty cab list they have to fill in again.
+        if not chose_cab and state.accepted_recommended_cab:
+            recommended = cab_fare.get("category_name")
+            chose_cab = _select_requested_category(cab_fare, recommended)
+            if chose_cab and recommended:
+                # Persisted as the tier word `sanitize.cab_category` will keep, so the
+                # choice survives the next turn's validation gate.
+                entities = entities.model_copy(deep=True)
+                entities.cab_category = (
+                    slots.parse_cab_category(recommended) or recommended.strip().lower()
+                )
+                entities.last_asked_field = None
+                chosen_entities = entities
 
     offers = await _fetch_offers(
         state, trip_type=TripType.RENTAL, fare_inr=(cab_fare or {}).get("fare_inr")
@@ -358,9 +393,15 @@ async def _rental_tools(state: AgentState) -> dict:
         "cab_fare": cab_fare,
         "offers": offers,
         "pickup": results.get("pickup"),
+        "drop": results.get("drop"),
         "rental_packages": offered_payload,
         "node_trace": ["tool_executor"],
     }
+    if chosen_entities is not None:
+        # The recommendation the rider accepted, written back so `persist` stores it
+        # and the next turn still knows which cab they are booking.
+        result["entities"] = chosen_entities
+        result["last_asked_field"] = None
 
     # ── Answers we cannot act on go back to the rider as questions ────────────
     # Each of these puts a field back in flight, and each needs the same two halves: the
@@ -468,8 +509,15 @@ async def tool_executor_node(state: AgentState) -> dict:
     route_estimate = _journey_dict(state, journey)
 
     # ── Real cab fare (Him Cab backend) ───────────────────────────────────────
-    # Gated: flag on, a usable pickup point, pricing-relevant intent, and a forwarded
-    # rider JWT. Any failure degrades gracefully to None via _safe_call → no price.
+    # Not asked for at all on a local ride or a trip plan: those replies name no cab
+    # (`slots.lists_cabs`), and the app's booking screen prices the cabs itself. A fare
+    # fetched here would only put a cab back on screen through the `cab_fare` event,
+    # the itinerary's cab package or the handoff's preselected category — each one a
+    # recommendation the flow no longer makes.
+    #
+    # Otherwise gated: flag on, a usable pickup point, pricing-relevant intent, and a
+    # forwarded rider JWT. Any failure degrades gracefully to None via _safe_call.
+    lists_cabs = slots.lists_cabs(mode)
     fare_gate = {
         "enable_real_fares": settings.enable_real_fares,
         # A named city, OR a GPS fix — either gives us somewhere to measure from. This
@@ -486,17 +534,31 @@ async def tool_executor_node(state: AgentState) -> dict:
         ),
         "has_rider_jwt": bool(state.rider_jwt),
     }
-    should_quote = all(fare_gate.values())
+    should_quote = lists_cabs and all(fare_gate.values())
     quote_input = None
-    if not should_quote:
+    if not lists_cabs:
+        # By design, not a failure — so not `fare_gate_blocked`, which is the line read
+        # when a fare that SHOULD have come back did not.
+        log.debug("cab_fare_not_requested", mode=str(mode), session_id=state.session_id)
+    elif not should_quote:
         # Log exactly which condition blocked it — this is the single most useful line
         # for diagnosing "why didn't I get a fare" without needing more round-trips.
         log.info("fare_gate_blocked", intent=intent, session_id=state.session_id, **fare_gate)
     else:
-        # trip_type comes from the journey's length, not the rider's persona — a
-        # Himachal resident driving 270 km is still an intercity transfer. The route is
-        # passed in so the price is built on the same distance the reply quotes.
-        quote_input = build_fare_quote_input(entities, journey) if journey else None
+        # The rate card is chosen by `trip_type_for`: the LOCAL/resident flow is priced
+        # LOCAL to match what the Him Cab app charges the rider, everyone else by the
+        # journey. state.visitor_type is the flow's identity — the page the rider opened,
+        # not a guess. The route is passed in so the price is built on the same distance
+        # the reply quotes.
+        quote_input = (
+            build_fare_quote_input(
+                entities,
+                journey,
+                trip_type=trip_type_for(state.visitor_type, journey.distance_km),
+            )
+            if journey
+            else None
+        )
         # distanceInMeters is required by the endpoint, so no resolved journey means no
         # quote. That happens when the geocoder cannot place a name or the routing
         # engine finds no road — both are logged below rather than guessed around.
@@ -504,6 +566,7 @@ async def tool_executor_node(state: AgentState) -> dict:
             tasks["cab_fare"] = _safe_call(
                 get_fare_service().get_quote(quote_input, rider_jwt=state.rider_jwt),
                 "cab_fare",
+                session_id=state.session_id,
             )
         else:
             quote_input = None
@@ -536,22 +599,47 @@ async def tool_executor_node(state: AgentState) -> dict:
 
     # Real cab fare — gross prices straight from /fare/estimate. The endpoint takes no
     # offerId, so these are pre-discount; any coupon is applied on top, below.
-    cab_fare = _package_fare(results.get("cab_fare"))
+    raw_fare = results.get("cab_fare")
+    cab_fare = _package_fare(raw_fare)
     if cab_fare:
         # Journey context, so a fare card can show what the price is FOR without the
         # app having to join it against the route event itself.
         cab_fare["duration_text"] = (route_estimate or {}).get("duration_text")
     elif "cab_fare" in tasks:
-        # The call was made and produced nothing usable. Distinguishing this from
-        # "never attempted" is the difference between chasing a gate and chasing the
-        # backend, so it gets its own line.
-        log.warning(
-            "cab_fare_unavailable",
-            reason="call failed or returned no priced categories",
-            origin=entities.origin or entities.home_city,
-            destination=destination,
-            session_id=state.session_id,
-        )
+        # The call was made and produced no usable price. Two very different things hide
+        # behind that, and they need OPPOSITE fixes, so they no longer share one line:
+        #
+        #   • raw_fare is None            → the HTTP call itself failed and _safe_call
+        #     swallowed it. An expired/wrong-environment rider JWT (401/403), an
+        #     unreachable fare host, or a timeout all land here. The fix is the token or
+        #     the network — nothing about this trip.
+        #   • raw_fare is a FareQuote     → the backend answered but priced no category we
+        #     could use (base_fare_inr 0, no alternatives). The fix is the backend data or
+        #     the group, not the token.
+        #
+        # They were one `cab_fare_unavailable` line reading "call failed or returned no
+        # priced categories", which sent whoever read it to guess which half it was. The
+        # distinguishing bit is the type of raw_fare, available only here — `_package_fare`
+        # collapses both to None on the next line, so it is captured before that.
+        if raw_fare is None:
+            log.warning(
+                "cab_fare_call_failed",
+                reason="fare backend rejected the request, was unreachable, or timed out",
+                backend=settings.java_backend_url,
+                origin=entities.origin or entities.home_city,
+                destination=destination,
+                session_id=state.session_id,
+            )
+        else:
+            log.warning(
+                "cab_fare_backend_empty",
+                reason="backend answered but priced no usable cab category",
+                base_fare_inr=getattr(raw_fare, "base_fare_inr", None),
+                options=len(getattr(raw_fare, "alternatives", None) or []),
+                origin=entities.origin or entities.home_city,
+                destination=destination,
+                session_id=state.session_id,
+            )
 
     # ── Offers (Him Cab backend) ──────────────────────────────────────────────
     # Fetched after the fare, because whether a coupon applies depends on what the ride

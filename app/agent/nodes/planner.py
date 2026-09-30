@@ -44,6 +44,7 @@ from app.core.enums import SlotName
 from app.core.logging import get_logger
 from app.domain.conversation import ExtractedEntities
 from app.domain.itinerary import BudgetRange, GroupType
+from app.integrations.external.geocoding import LookupStatus
 from app.integrations.himcab import available_packages, offered_hours
 from app.services import geo
 from app.services.vertex_ai import call_model, get_vertex_ai_service
@@ -319,14 +320,14 @@ class _VertexExtraction(BaseModel):
         )
 
 
-PLANNER_SYSTEM_PROMPT = """You are an information extractor for a Himachal Pradesh travel service.
+PLANNER_SYSTEM_PROMPT = """You are an information extractor for a cab and travel booking service.
 
 You are NOT talking to the user. You read the conversation and report what the user
 has actually said. Another system decides what to ask next — never write a question.
 
 Extract these fields (null when the user has not stated them):
-- destination: where in Himachal they want to go
-- origin: the city they are starting from
+- destination: the DROP location — where they want to go / be dropped
+- origin: the PICKUP location — where the cab should collect them
 - origin_in_himachal: true if `origin` is a town/city inside Himachal Pradesh, false if
   it is outside (Delhi, Chandigarh, Mumbai, Amritsar, Dehradun...), null if no origin yet.
   Use your own geography knowledge. This says where the JOURNEY starts, not who they are.
@@ -363,20 +364,23 @@ Extract these fields (null when the user has not stated them):
 MERGING (the conversation is multi-turn):
 - The latest user message is often a SHORT answer to the assistant's previous question.
   Read that question to understand it: "How many days?" + "5" means duration_days = 5;
-  "Which city are you travelling from?" + "delhi" means origin = "Delhi".
+  "Where should we pick you up?" + "delhi" means origin = "Delhi";
+  "Where should we drop you?" + "manali" means destination = "Manali".
 - Previously extracted values are given to you. Repeat them in your output. Never replace
   a known value with null, and never overwrite one unless the user has just changed it.
 
 A RENTAL CONVERSATION (the request says so above) IS NOT A TRIP:
-- The rider is hiring a car and a driver BY THE HOUR. They have no destination, no trip
-  length in days and no itinerary, and they are not expected to have one.
-- destination and duration_days are ALWAYS null here, however the message is phrased.
-  "A car for 8 hours around Manali" is rental_hours=8 with destination null — Manali is
-  where the car will be driven about, not a trip they asked you to plan.
+- The rider is hiring a car and a driver BY THE HOUR. They have no trip length in days
+  and no itinerary, and they are not expected to have one.
+- duration_days is ALWAYS null here, however the message is phrased.
+- destination is the DROP — where the car leaves them when the hire ends — and ONLY
+  when they said so: "drop me at Kufri", "Kufri drop", or a place given in answer to
+  "Where should we drop you?". "A car for 8 hours around Manali" is rental_hours=8 with
+  destination null — Manali is where the car will be driven about, not a drop.
 - A place they name is the PICKUP (`origin`) only when they said so: "from Shimla",
   "pick me up in Kullu", "Mandi se". A place mentioned any other way fills nothing.
-- What matters is exactly what their booking screen asks for: the duration, the pickup
-  address, the date, the clock time and which cab. Nothing else.
+- What matters is exactly what their booking screen asks for: the duration, the pickup,
+  the drop, the date, the clock time and which cab. Nothing else.
 
 NEVER INVENT:
 - Every field the user has not stated is null. Not a plausible guess, not a common
@@ -415,20 +419,31 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
 
 
 #: Trip-shaped fields that CANNOT exist in a rental conversation. The extraction model
-#: still reports them — "a car for 8 hours around Manali" reliably comes back with
-#: destination="Manali" — and every one of them then leaks somewhere it does not belong:
-#: into the writer's TRIP block, into the itinerary shortcut in `route_after_router`,
-#: into the profile's past-trip list in `persist`. Hiring a car by the hour means the
-#: rider has not chosen a destination and need not, so these are dropped at the door
-#: rather than guarded against one consumer at a time.
-_NOT_IN_A_RENTAL = ("destination", "duration_days", "return_journey_preference")
+#: still reports them, and every one of them then leaks somewhere it does not belong:
+#: into the writer's TRIP block, into the itinerary shortcut in `route_after_router`.
+#: So these are dropped at the door rather than guarded against one consumer at a time.
+_NOT_IN_A_RENTAL = ("duration_days", "return_journey_preference")
 
 
-def _strip_trip_fields(merged: dict, session_id: str) -> None:
-    """Remove trip-only facts from a rental conversation's entities (mutates)."""
+def _strip_trip_fields(
+    merged: dict, *, stored: dict, about_the_drop: bool, session_id: str
+) -> None:
+    """Remove trip-only facts from a rental conversation's entities (mutates).
+
+    The destination is the rental's DROP now (a 2026-09-29 decision — every flow asks
+    for a pickup and a drop), so it is no longer stripped outright. But the model's
+    reading of it is still not trusted on its own: "a car for 8 hours around Manali"
+    reliably comes back with destination="Manali", which is where the car will be
+    driven about, not where the hire ends. A drop is kept from the session as it was,
+    or from a turn that was ABOUT the drop — an answer to "Where should we drop you?",
+    or a message that says "drop". Anything else the model put there is put back.
+    """
     dropped = [f for f in _NOT_IN_A_RENTAL if merged.get(f) is not None]
     for field in dropped:
         merged.pop(field, None)
+    if not about_the_drop and merged.get("destination") != stored.get("destination"):
+        merged["destination"] = stored.get("destination")
+        dropped.append("destination")
     if dropped:
         log.info("rental_trip_fields_dropped", fields=dropped, session_id=session_id)
 
@@ -464,6 +479,97 @@ async def _reject_unsold_duration(
         session_id=session_id,
     )
     return hours
+
+
+#: Place fields checked against the map before anything acts on them, and the slot a
+#: rejection re-asks. `home_city` re-asks the ORIGIN: for a resident the two are one
+#: question (`slots._write_origin`), and there is no separate "where do you live?".
+_PLACE_SLOTS: dict[str, SlotName] = {
+    "destination": SlotName.DESTINATION,
+    "origin": SlotName.ORIGIN,
+    "home_city": SlotName.ORIGIN,
+}
+
+
+async def _place_problem(value: str, field: str, visitor_type: Optional[str]) -> Optional[str]:
+    """Why this place name cannot be used, or None when it can — or when we cannot tell.
+
+    `sanitize.place` answers "is this shaped like a place name?"; this answers "is it a
+    place?", which only the map knows. Every place a rider names reached the fare, the
+    booking screen and the writer unchecked: a typo that the geocoder could not place
+    went ahead with no route and a writer free to describe somewhere that does not
+    exist, and a word it COULD match went ahead as whatever it matched.
+
+    A provider outage is NOT a rejection. It says nothing about the name, and refusing
+    "Shimla" because Nominatim was slow would be the same failure pointed the other way.
+    """
+    lookup = await geo.look_up_place(value)
+    if lookup.status is LookupStatus.UNAVAILABLE:
+        return None
+    if lookup.status is LookupStatus.NOT_FOUND or lookup.place is None:
+        return slots.PLACE_NOT_FOUND
+    # Deliberately no "is it in Himachal?" test. A real place anywhere is a place a
+    # rider may book, and the flow no longer tells anyone it only plans Himachal trips.
+    return None
+
+
+async def _reject_unplaceable(
+    merged: dict,
+    corrected: dict[str, Any],
+    state: AgentState,
+    visitor_type: Optional[str],
+) -> Optional[dict]:
+    """Clear the first place name that is not on the map. Returns what it was, or None.
+
+    Checked in one place, after every writer of `merged` and after the sanitize gate,
+    for the same reason that gate is where it is: there is no route around it. A place
+    that was only PROPOSED as a change (`corrected`) is withdrawn from the proposal
+    instead — the value the rider already had stays, because a typo in a correction is
+    not a reason to lose the original.
+
+    The geocoder's cache is shared with the tool executor, so a name checked here is
+    routed there without a second request.
+    """
+    fix_name = state.rider_location.place_name if state.rider_location else None
+
+    for field, slot in _PLACE_SLOTS.items():
+        # A proposed change is checked first: it is what the rider has JUST said.
+        for source, is_correction in ((corrected, True), (merged, False)):
+            value = source.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            # Named by the reverse geocoder from the device's own fix — already a place.
+            if fix_name and geo.same_place(value, fix_name):
+                continue
+            reason = await _place_problem(value, field, visitor_type)
+            if reason is None:
+                continue
+            if is_correction:
+                corrected.pop(field, None)
+            else:
+                merged[field] = None
+                # A resident's origin and home city are one answer; clearing one and
+                # keeping the other would keep the name we just refused.
+                if field in ("origin", "home_city") and geo.same_place(
+                    merged.get("origin" if field == "home_city" else "home_city"), value
+                ):
+                    merged["origin" if field == "home_city" else "home_city"] = None
+            log.info(
+                "place_rejected",
+                field=field,
+                value=value,
+                reason=reason,
+                was_correction=is_correction,
+                session_id=state.session_id,
+            )
+            return {
+                "field": field,
+                "slot": str(slot),
+                "value": value,
+                "reason": reason,
+                "was_correction": is_correction,
+            }
+    return None
 
 
 def _build_entities(merged: dict) -> ExtractedEntities:
@@ -560,6 +666,7 @@ def _resolve(
         "assumed_fields": list(decision.assumed),
         "unbookable_rental_hours": unbookable_hours,
         "past_travel_date": past_travel_date,
+        "unplaceable_place": None,
         "node_trace": ["planner"],
     }
 
@@ -592,6 +699,119 @@ def _ask_about_the_change(
         "assumed_fields": [],
         "unbookable_rental_hours": None,
         "structured_events": [event],
+        "node_trace": ["planner"],
+    }
+
+
+def _reask_unread(
+    state: AgentState,
+    entities: ExtractedEntities,
+    visitor_type: Optional[str],
+    lang_key: str,
+    field: str,
+    slot: slots.Slot,
+    latest_text: str,
+) -> dict:
+    """Re-ask the one open question when the rider's reply could not be used at all.
+
+    Bypasses `slots.decide` on purpose: `decide` answers "what is still missing?" from
+    THIS turn's intent, and the whole problem is that the intent is a misread of an
+    off-topic or typo'd reply — so the policy would ask the wrong thing, or nothing at
+    all. Here we already know which question is open (`field`, the one we asked last
+    turn) and simply put it again, prefaced with the rider's own words so it reads as "I
+    didn't catch that" rather than the identical question fired twice.
+
+    The attempt count is read BEFORE it is bumped, so the retry wording escalates on the
+    same schedule as `slots.decide`, and the bump keeps the per-field cap honest.
+    """
+    attempt = entities.asked_counts.get(field, 0)
+    question = slot.ask(lang_key, visitor_type, attempt)
+    entities.asked_counts[field] = attempt + 1
+    entities.last_asked_field = field
+    log.info(
+        "reply_unread_reasked",
+        field=field,
+        no_progress_turns=entities.no_progress_turns,
+        session_id=state.session_id,
+    )
+    return {
+        "entities": entities,
+        "needs_clarification": True,
+        "clarification_question": (
+            f"{slots.unread_reply_preamble(latest_text, lang_key)} {question}"
+        ),
+        "visitor_type": visitor_type,
+        "last_asked_field": field,
+        "assumed_fields": [],
+        "unbookable_rental_hours": None,
+        "past_travel_date": None,
+        "node_trace": ["planner"],
+    }
+
+
+def _ask_about_unplaceable(
+    state: AgentState,
+    entities: ExtractedEntities,
+    visitor_type: Optional[str],
+    lang_key: str,
+    unplaceable: dict,
+) -> dict:
+    """Put a place we could not find back to the rider, quoting what they typed.
+
+    Bypasses `slots.decide` for the reason `_reask_unread` does: the policy answers
+    "what is missing next?", and here we already know which answer failed. Left to the
+    policy, a rejected ORIGIN with no destination yet would ask for the destination and
+    the rider would never learn their starting city had been dropped.
+
+    Bounded like every other question. A REQUIRED slot (a trip's destination, a
+    rental's pickup) is asked until it is answered — nothing can be produced without
+    it, and inventing one is the failure this exists to prevent. Anything else stops
+    being asked at the usual caps; the turn then goes ahead WITHOUT the place, and the
+    reply says so (`slots.unplaceable_note`) rather than planning around a name the map
+    has never heard of.
+    """
+    slot = unplaceable["slot"]
+    needs = slots.needs_for(state.intent, visitor_type)
+    required = needs.get(slot) is slots.Need.REQUIRED
+    cap = settings.max_clarification_attempts
+    patience_left = (
+        entities.asked_counts.get(slot, 0) < cap
+        and entities.no_progress_turns < cap
+        and not entities.proceed_requested
+    )
+
+    if not (required or patience_left):
+        log.info(
+            "place_rejected_and_left_out",
+            field=unplaceable["field"],
+            value=unplaceable["value"],
+            session_id=state.session_id,
+        )
+        result = _resolve(state, entities, visitor_type, lang_key)
+        result["change_note"] = slots.unplaceable_note(unplaceable["value"], lang_key)
+        result["unplaceable_place"] = unplaceable
+        return result
+
+    entities.asked_counts[slot] = entities.asked_counts.get(slot, 0) + 1
+    entities.last_asked_field = slot
+    if unplaceable["was_correction"]:
+        # They asked to CHANGE this field and the new name did not land. The next reply
+        # is the name they meant, so it is applied as the change it is instead of being
+        # put to them for confirmation a second time (see the modification branch).
+        entities.awaiting_change_detail = True
+
+    return {
+        "entities": entities,
+        "needs_clarification": True,
+        "clarification_question": slots.unplaceable_question(
+            slot, unplaceable["value"], lang_key, unplaceable["reason"]
+        ),
+        "visitor_type": visitor_type,
+        "last_asked_field": slot,
+        "assumed_fields": [],
+        "unbookable_rental_hours": None,
+        "past_travel_date": None,
+        "unplaceable_place": unplaceable,
         "node_trace": ["planner"],
     }
 
@@ -801,7 +1021,14 @@ Report what the user has stated. Use null for anything they have not."""
         merged.update(confirmed_changes)
 
     if is_rental:
-        _strip_trip_fields(merged, state.session_id)
+        _strip_trip_fields(
+            merged,
+            stored=existing_entities,
+            about_the_drop=(
+                previously_asked == SlotName.DESTINATION or slots.mentions_drop(latest_text)
+            ),
+            session_id=state.session_id,
+        )
 
     # ── Visitor classification (code, from what they told us) ─────────────────
     # `current` is passed so an in-state ORIGIN cannot promote a visitor to resident;
@@ -825,19 +1052,22 @@ Report what the user has stated. Use null for anything they have not."""
     )
     if visitor_type:
         merged["visitor_type"] = visitor_type
-        # The local flow asks "which city in Himachal are you based in?", so when a rider
-        # we ALREADY treat as a resident names an in-state origin, that answer is their
-        # home city — recorded so the classification survives later turns. Deliberately
-        # not done for a visitor: their in-state origin is where the trip starts, not
-        # where they live, and writing it here is what used to turn them into a local.
+        # When a rider we ALREADY treat as a resident names an in-state pickup, it is
+        # recorded as their home city too, so the classification survives later turns —
+        # a resident who later changes the pickup to Chandigarh is still on the local
+        # flow they opened. (This dates from when the local flow asked where they LIVE;
+        # it now asks for the pickup, and the recording is kept for that stickiness.)
+        # Deliberately not done for a visitor: their in-state origin is where the trip
+        # starts, not where they live, and writing it here used to turn them into a local.
         if visitor_type == LOCAL and origin_in_hp and not merged.get("home_city"):
             merged["home_city"] = merged.get("origin")
 
     # ── "Here" — the pickup answered by pointing rather than naming ───────────
-    # Only for the rental pickup, and only as a reply to that exact question. Now that
-    # a rental always asks where the car should collect them, "here" / "yahin" / "my
-    # location" is a reply riders genuinely give — and it used to parse as a PLACE
-    # called "Here", which the geocoder resolved to something and the car was sent to.
+    # Every flow, and only as a reply to that exact question. Every flow now asks
+    # "आपको कहाँ से पिकअप करना है?", and "here" / "yahin se" / "my location" is a reply
+    # riders genuinely give — which used to parse as a PLACE called "Here", which the
+    # geocoder resolved to something and the car was sent to. (Rental-only until every
+    # flow asked for a pickup: a resident asked where they LIVE did not answer "here".)
     #
     # The fix is the honest reading of it, and a better one than the pickup this flow
     # used to assume: exact coordinates the rider has just confirmed, rather than a
@@ -846,8 +1076,7 @@ Report what the user has stated. Use null for anything they have not."""
     # reply announces the pickup. Without one we would be guessing at a name and
     # sending a car on it, so the question is simply asked again.
     if (
-        is_rental
-        and latest_text
+        latest_text
         and previously_asked == SlotName.ORIGIN
         and not merged.get("origin")
         and slots.means_current_location(latest_text)
@@ -856,21 +1085,37 @@ Report what the user has stated. Use null for anything they have not."""
         if fix is not None and fix.is_precise and fix.place_name:
             merged["origin"] = fix.place_name
             log.info(
-                "rental_pickup_from_device_fix",
+                "pickup_from_device_fix",
                 place=fix.place_name,
                 distance_km=fix.place_distance_km,
                 session_id=state.session_id,
             )
         else:
             # Deliberately fills nothing: `decide` then re-asks, and the second wording
-            # ("just the name of the city or town the car should come to") is exactly
-            # the right thing to say to somebody whose "here" we could not place.
+            # ("just the pickup location — a city, town or area") is exactly the right
+            # thing to say to somebody whose "here" we could not place.
             log.info(
-                "rental_pickup_here_without_usable_fix",
+                "pickup_here_without_usable_fix",
                 has_fix=fix is not None,
                 is_precise=bool(fix and fix.is_precise),
                 session_id=state.session_id,
             )
+
+    # ── "Same place" — a rental's drop answered by pointing back at the pickup ─
+    # An hourly hire often ends where it began. Rental-only: on a ride or a trip, a drop
+    # at the pickup is not a journey, so the reply is left for the place reader, which
+    # rejects it and asks again. Keyed on the STORED drop, not `merged`: the model may
+    # already have written "Same Place" there as though it were a town.
+    if (
+        is_rental
+        and latest_text
+        and previously_asked == SlotName.DESTINATION
+        and not existing_entities.get("destination")
+        and merged.get("origin")
+        and slots.means_same_as_pickup(latest_text)
+    ):
+        merged["destination"] = merged["origin"]
+        log.info("rental_drop_same_as_pickup", session_id=state.session_id)
 
     # ── Read the reply as an answer to the question we asked ──────────────────
     # Strictly scoped: only the fields that question covered, only if the reply has
@@ -957,6 +1202,25 @@ Report what the user has stated. Use null for anything they have not."""
             if stored in (None, "", [], {}):
                 # Nothing there yet — an ANSWER. Fills the blank, takes nothing away,
                 # and needs no confirmation.
+                #
+                # Unless the model filled the same blank this turn with something else.
+                # The readers cap a place at a few words after a marker and cannot tell
+                # "go TO Kasol" from "places TO eat in Manali": the second came back as
+                # destination "Eat", overwrote the model's "Manali", and was planned as
+                # a trip. On a blank slot the model's reading of the whole sentence
+                # wins, as it already does below for a change. The reader is the
+                # safety net for when the model says nothing, not a second opinion.
+                #
+                # The MODEL's value — `result_dict`, not `merged`. `merged` also holds
+                # what the bare-answer parser just wrote, and that parser is weaker than
+                # this reader on a sentence: "pickup Shimla drop Manali" parsed there as
+                # the one place "Shimla Manali", and deferring to it threw away this
+                # reader's correct two ends.
+                model_value = result_dict.get(field)
+                if model_value not in (None, "", [], {}) and not _same_value(
+                    model_value, value
+                ):
+                    continue
                 filled[field] = value
             elif not _same_value(value, stored):
                 # A CHANGE: the rider has restated a slot as something different from
@@ -1029,6 +1293,26 @@ Report what the user has stated. Use null for anything they have not."""
         merged["proceed_requested"] = True
         log.info("proceed_requested", session_id=state.session_id)
 
+    # ── "The one you suggested is fine" ───────────────────────────────────────
+    # The cab question lists the cabs that seat THIS party, recommended one first. A
+    # rider who answers "haan book kar do", "ok" or "aap batao" has chosen — the cab we
+    # recommended — and used to be told we had not understood them, with no booking
+    # screen until they typed its name back. Read here only as a reply to that exact
+    # question; the tool executor, which knows which cab was recommended, applies it.
+    accepted_recommended_cab = bool(
+        is_rental
+        and latest_text
+        and previously_asked == SlotName.CAB_CATEGORY
+        and not merged.get("cab_category")
+        and (
+            slots.accepts_recommendation(latest_text)
+            or _looks_like_proceed_request(latest_text)
+            or result_dict.get("user_wants_to_proceed_now")
+        )
+    )
+    if accepted_recommended_cab:
+        log.info("recommended_cab_accepted", session_id=state.session_id)
+
     # The booking screen wants a DATE in its date field, not the sentence the rider
     # happened to answer with. Rentals only: a trip's "sometime after Diwali" is worth
     # keeping word for word, and nothing renders it into a form.
@@ -1063,6 +1347,11 @@ Report what the user has stated. Use null for anything they have not."""
     if past_day:
         log.info("travel_date_already_gone", value=past_day, session_id=state.session_id)
 
+    # ── A place that is not on the map, refused on the turn it arrives ────────
+    # After the gate, so only a well-formed name costs a lookup, and before anything
+    # can act on it. See `_reject_unplaceable`.
+    unplaceable = await _reject_unplaceable(merged, corrected, state, visitor_type)
+
     # ── A duration we do not sell, refused on the turn it arrives ─────────────
     unbookable_hours = (
         await _reject_unsold_duration(merged, state.rider_jwt, state.session_id)
@@ -1084,15 +1373,27 @@ Report what the user has stated. Use null for anything they have not."""
     # us a real, different value. Without `or corrected`, a turn that only changes an
     # already-known detail would count as no progress and inch the agent towards giving
     # up on a rider who is actively engaged.
-    if (
+    made_progress = bool(
         (_known_slots(entities) - known_before)
         or corrected
         or bare_correction
         or confirmed_changes
-    ):
+        # Taking the recommended cab is an answer, even though it fills no slot until
+        # the tool executor writes the cab in — without this the reply read as no
+        # progress and the "didn't catch that" re-ask fired on a perfectly clear yes.
+        or accepted_recommended_cab
+    )
+    if made_progress:
         entities.no_progress_turns = 0
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1
+
+    # ── A place we could not find goes back to the rider, by name ─────────────
+    # Ahead of the modification branch: "nahi, Kasoll" is a change the rider asked for
+    # with a name we cannot place, and without this it fell through to "which detail
+    # would you like to change?" — asking about the one thing they had just told us.
+    if unplaceable and not corrected:
+        return _ask_about_unplaceable(state, entities, visitor_type, lang_key, unplaceable)
 
     # ── A change the rider has asked for ───────────────────────────────
     # `corrected` holds values that would OVERWRITE something already on the session.
@@ -1149,9 +1450,51 @@ Report what the user has stated. Use null for anything they have not."""
             visitor_type,
         )
 
+    # ── A reply we could not use at all ────────────────────────────────────────
+    # The rider answered, but nothing in it was usable — not the field we asked about,
+    # not any other slot, not a correction, not "just get on with it". In a booking flow
+    # the old behaviour handed this turn to the free-text writer, which then answered a
+    # question the rider never asked: the reported "typo / something off-topic → the flow
+    # hallucinates an irrelevant reply". It happens because a misread reply is classified
+    # as a general question, and `slots.decide` then asks for none of the booking slots.
+    #
+    # So the pending question outranks a misclassified intent here: re-ask it, NAMING that
+    # we could not read the reply so it does not read as a robotic repeat (§7). Wholly
+    # deterministic — no model runs on this path, so a typo can never become an invented
+    # answer. Bounded by the SAME patience cap as every other question
+    # (`no_progress_turns`), so a rider who keeps typing past us still reaches a plan or a
+    # booking screen rather than an endless re-ask. Scoped to the booking flows the report
+    # is about; an outstation visitor's general question is still answered.
+    reasked_slot = slots.SLOTS.get(previously_asked) if previously_asked else None
+    if (
+        previously_asked is not None
+        and reasked_slot is not None
+        and not made_progress
+        and not entities.proceed_requested
+        and visitor_type in (slots.LOCAL, slots.RENTAL)
+        and not reasked_slot.read(entities)
+        and entities.no_progress_turns < settings.max_clarification_attempts
+        # A day that has gone or a duration Him Cab does not sell was CAUGHT — the rider
+        # answered, the answer just cannot be used — and `_resolve` re-asks NAMING that
+        # (§7). Those beat this generic "didn't catch that", which is for a reply we could
+        # not read at all.
+        and unbookable_hours is None
+        and past_day is None
+        # A genuine question is answered, never turned into an interview — the deliberate
+        # `TestQuestionsDoNotHijackAnswers` behaviour. This guard is only for a reply that
+        # was an attempted ANSWER and failed (a typo, an off-topic line), which is where
+        # the free-text writer was inventing irrelevant prose.
+        and not slots._looks_like_a_question(latest_text)
+    ):
+        return _reask_unread(
+            state, entities, visitor_type, lang_key,
+            previously_asked, reasked_slot, latest_text,
+        )
+
     result = _resolve(
         state, entities, visitor_type, lang_key, unbookable_hours, past_day
     )
+    result["accepted_recommended_cab"] = accepted_recommended_cab
 
     # A change that just landed is stated in the reply, so the rider can see it took.
     # Everything downstream — route, fare, weather, booking handoff — is rebuilt from

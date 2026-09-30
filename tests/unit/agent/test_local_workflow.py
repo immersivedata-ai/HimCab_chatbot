@@ -182,8 +182,9 @@ class TestPlannerLocalFlow:
         assert "return_journey_preference" not in result["assumed_fields"]
 
     @pytest.mark.asyncio
-    async def test_local_visitor_asks_home_city(self):
-        """Planner should ask local visitor their home city when unknown."""
+    async def test_local_visitor_is_asked_for_the_pickup(self):
+        """With no pickup known, a local is asked where the cab should come — not, as
+        before 2026-09-29, which city they live in."""
         from app.agent.nodes.planner import planner_node
         from tests.conftest import wire_extraction
 
@@ -212,10 +213,10 @@ class TestPlannerLocalFlow:
             result = await planner_node(state)
 
         assert result["needs_clarification"] is True
-        # The question may be in Hindi (हिमाचल/शहर/रहते) or English (home/city/based)
+        assert result["last_asked_field"] == "origin"
         q = result["clarification_question"].lower()
-        assert ("home" in q or "city" in q or "based" in q
-                or "हिमाचल" in q or "शहर" in q or "रहते" in q)
+        assert "पिकअप" in q or "pick you up" in q
+        assert "रहते" not in q and "live" not in q
 
 
 # ── State & Entity Tests ──────────────────────────────────────────────────────

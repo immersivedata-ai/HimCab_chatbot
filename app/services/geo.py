@@ -42,7 +42,11 @@ from typing import Optional
 
 from app.core.logging import get_logger
 from app.domain.location import PRECISE_FIX_KM, RiderLocation
-from app.integrations.external.geocoding import Place, get_geocoding_service
+from app.integrations.external.geocoding import (
+    Lookup,
+    Place,
+    get_geocoding_service,
+)
 from app.integrations.external.routing import RoadRoute, get_routing_service
 
 log = get_logger(__name__)
@@ -163,6 +167,16 @@ async def place_in_himachal(name: str) -> Optional[bool]:
     """
     place = await get_geocoding_service().geocode(name)
     return None if place is None else place.in_himachal
+
+
+async def look_up_place(name: str) -> Lookup:
+    """Is this a place at all? FOUND, NOT_FOUND, or UNAVAILABLE (we could not ask).
+
+    The planner's reality check on every place name it is about to act on. Shares the
+    geocoder's cache with `resolve_journey`, so checking a name here costs the tool
+    executor nothing when it routes the same name a moment later.
+    """
+    return await get_geocoding_service().lookup(name)
 
 
 # ── The journey ───────────────────────────────────────────────────────────────
