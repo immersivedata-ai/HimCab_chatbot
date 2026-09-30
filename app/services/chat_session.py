@@ -28,21 +28,29 @@ Tier 4 means these endpoints never 404 on a missing/expired session — the fron
 cannot get into a broken state that requires it to "reset" anything.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
+from app.core.enums import Persona
 from app.core.logging import get_logger
-from app.models.location import RiderLocation
-from app.models.session import Language, MessageRole, TripSession
-from app.services.firestore import get_session_service
+from app.domain.conversation import Language, MessageRole, TripSession
+from app.domain.location import RiderLocation
+from app.repositories.firestore import get_session_service
 
 log = get_logger(__name__)
 
 # Personas = which front-end app opened the chat. Fixed by the route, never sent by
 # the client. Durably stored on the session (TripSession.persona).
-LOCAL = "local"
-OUTSTATION = "outstation"
-VALID_PERSONAS = (LOCAL, OUTSTATION)
+#
+# Aliases onto app/core/enums.Persona — the same objects the agent compares against.
+# These used to be three independent string literals here, three more in
+# app/agent/slots.py and two in the planner, with nothing checking they matched.
+LOCAL = Persona.LOCAL
+OUTSTATION = Persona.OUTSTATION
+#: Hiring a car by the hour. A SERVICE the rider chose, not a guess about who they
+#: are — which is why a GPS fix never overrides it (see `resolve_persona`).
+RENTAL = Persona.RENTAL
+VALID_PERSONAS = tuple(Persona)
 
 # How far back the recent-session scan will look to resume a conversation when the
 # active-chat pointer is missing. Beyond this we'd rather start clean than resurrect a
@@ -63,19 +71,129 @@ WELCOME_MESSAGES: dict[str, str] = {
         "I can help you plan your trip to Himachal Pradesh. "
         "Where would you like to go?"
     ),
+    RENTAL: (
+        "Welcome to Him Cab! 🙏 "
+        "I can arrange a car and driver by the hour. "
+        "How long do you need the car for?"
+    ),
 }
+
+#: The rental greeting, minus its closing question. The question is swapped for one
+#: that names the real packages whenever the rate card is readable — see
+#: `welcome_message`. Split here so the greeting is written once.
+_RENTAL_GREETING = (
+    "Welcome to Him Cab! 🙏 I can arrange a car and driver by the hour. "
+)
 
 # Each front end has a default reply language; the agent still adapts to whatever the
 # user actually writes (see app/agent/language.py).
 DEFAULT_LANGUAGE: dict[str, Language] = {
     LOCAL: Language.HINDI,
     OUTSTATION: Language.ENGLISH,
+    # Rentals are taken by residents and visitors alike, so there is no safe default
+    # from the service itself — English, then `app/agent/language.py` follows whatever
+    # the rider actually writes from their first message onward.
+    RENTAL: Language.ENGLISH,
 }
 
 
-def welcome_message(persona: str) -> str:
-    """The opening line for a persona (falls back to the outstation/English copy)."""
+def welcome_message(
+    persona: str, rental_packages: Optional[list[dict]] = None
+) -> str:
+    """The opening line for a persona (falls back to the outstation/English copy).
+
+    A rental greeting names the packages the rate card sells when they are known. It is
+    the very first thing the rider reads AND it asks for the one field the backend
+    matches exactly, so leaving it open invites an unbookable answer before the
+    conversation has started. With no packages it asks the open question, unchanged.
+    """
+    if persona == RENTAL and rental_packages:
+        from app.agent import slots
+
+        # English to match the greeting it is appended to; the agent switches to
+        # whatever the rider actually writes from their first message onward.
+        return _RENTAL_GREETING + slots.rental_hours_question(
+            [p["label"] for p in rental_packages], "en"
+        )
     return WELCOME_MESSAGES.get(persona, WELCOME_MESSAGES[OUTSTATION])
+
+
+# ── The flow chooser (the in-chat replacement for the persona dropdown) ───────
+# Before a rider picks a service, the assistant offers the three as selectable boxes
+# rather than the app deciding for them from a dropdown or the screen they opened. Each
+# box names the persona a tap starts, so a selection maps straight onto the same flow
+# that /start already opens — the chooser adds a way to CHOOSE, not a fourth flow.
+#
+# Kept here beside WELCOME_MESSAGES, and bilingual for the same reason: the chooser copy
+# and the greeting copy are the same kind of thing and should move together. The chooser
+# has no persona yet, so the caller says which language to render (default English).
+
+CHOOSER_MESSAGE: dict[str, str] = {
+    "en": "Welcome to Him Cab! 🙏 What can I help you with today?",
+    "hi": "नमस्ते! Him Cab में आपका स्वागत है 🙏 आज मैं आपकी कैसे मदद कर सकता हूँ?",
+}
+
+#: The selectable services, in display order (the same order as the Persona enum, so it
+#: matches VALID_PERSONAS and the rest of the system). `id` is the persona a tap starts.
+#:
+#: The local box is the one deliberate exception to "en means English": its subtitle is
+#: written in Hindi in BOTH tables, because that flow answers in Hindi and the line under
+#: the title is where a rider who wants a Hindi conversation recognises it. The title
+#: stays English so the three boxes still scan as one list.
+_FLOWS: tuple[dict, ...] = (
+    {
+        "id": LOCAL,
+        "title": {"en": "Local ride", "hi": "लोकल सवारी"},
+        "subtitle": {
+            "en": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
+            "hi": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें",
+        },
+    },
+    {
+        "id": OUTSTATION,
+        "title": {"en": "Outstation ride", "hi": "आउटस्टेशन सवारी"},
+        "subtitle": {
+            "en": "Planning for long trips: a day-by-day plan",
+            "hi": "लंबी यात्रा की योजना — दिन-प्रतिदिन कार्यक्रम",
+        },
+    },
+    {
+        "id": RENTAL,
+        "title": {"en": "Rent by the hour", "hi": "घंटे के हिसाब से किराया"},
+        "subtitle": {
+            "en": "A car and driver for a few hours",
+            "hi": "कुछ घंटों के लिए गाड़ी और ड्राइवर",
+        },
+    },
+)
+
+
+def _flow_text(table: dict[str, str], lang_key: str) -> str:
+    """One localized string, falling back to English for any other language key."""
+    return table.get(lang_key, table["en"])
+
+
+def chooser_message(lang_key: str = "en") -> str:
+    """The neutral opening line shown above the flow boxes."""
+    return _flow_text(CHOOSER_MESSAGE, lang_key)
+
+
+def flow_options(lang_key: str = "en") -> list[dict]:
+    """The selectable service boxes, localized. `persona` is what a tap starts.
+
+    Returned as plain dicts so the same list feeds both the typed `FlowOption` response
+    and the `flow_options` structured-event payload without either owning the other.
+    """
+    return [
+        {
+            "persona": flow["id"],
+            "title": _flow_text(flow["title"], lang_key),
+            "subtitle": _flow_text(flow["subtitle"], lang_key),
+            "base_path": f"/v1/chat/{flow['id']}",
+            "language": DEFAULT_LANGUAGE.get(flow["id"], Language.ENGLISH).value,
+        }
+        for flow in _FLOWS
+    ]
 
 
 # ── Which assistant is this rider talking to ──────────────────────────────────
@@ -103,6 +221,11 @@ def resolve_persona(
     person who says "I'm coming from Delhi" is a visitor whatever their phone says. The
     fix is the opening assumption; the conversation is the correction.
     """
+    # A rental is a service the rider picked, not an inference about them. Their
+    # coordinates say whether they live here; they do not say they stopped wanting a
+    # car by the hour, so the fix never overrides this one.
+    if requested == RENTAL:
+        return RENTAL, "requested"
     if location is None:
         return (requested if requested in VALID_PERSONAS else OUTSTATION), "default"
     return location.visitor_type, "coordinates"
@@ -147,15 +270,21 @@ async def _load_owned_session(session_id: str, user_id: str) -> Optional[TripSes
 def apply_location(session: TripSession, location: Optional[RiderLocation]) -> bool:
     """Attach a fresh GPS fix to a conversation. True when anything changed.
 
-    Beyond storing the fix, this fills in the pickup city — but ONLY when the fix
-    actually sits on a town we know (`is_precise`). A fix 40 km from the nearest named
-    place is perfectly good for measuring a distance and useless as a place name: it
-    would have the reply announce "your trip from Mandi" to somebody who has never been
-    there. In that case the coordinates are still used for the route, and the assistant
-    asks which city they are starting from, as it always did.
+    Beyond storing the fix, this fills in the starting city for a TRIP — but only when
+    the fix actually sits on a town we know (`is_precise`). A fix 40 km from the nearest
+    named place is perfectly good for measuring a distance and useless as a place name:
+    it would have the reply announce "your trip from Mandi" to somebody who has never
+    been there. In that case the coordinates are still used for the route, and the
+    assistant asks which city they are starting from, as it always did.
+
+    A RENTAL never has its pickup filled in this way. There, `origin` is the address a
+    driver is sent to rather than a city someone is travelling from, and the rider is
+    always asked for it.
 
     A rider who has already NAMED their starting city keeps it. Their words outrank
     their phone: someone booking a Delhi pickup from their Shimla sofa means Delhi.
+
+    What this must NEVER do is re-persona a rental. See the visitor_type block below.
     """
     if location is None:
         return False
@@ -167,7 +296,31 @@ def apply_location(session: TripSession, location: Optional[RiderLocation]) -> b
 
     session.rider_location = location
 
-    if location.place_name and location.is_precise and not session.entities.origin:
+    # Decided once, up here, because BOTH blocks below turn on it — the pickup fill
+    # and the persona. See each for why a rental is different.
+    is_rental = RENTAL in (session.persona, session.entities.visitor_type)
+
+    # A fix answers "which city are you travelling FROM" — a city-level fact about a
+    # journey, and a question worth skipping when the phone already knows.
+    #
+    # It does NOT answer "where should the car pick you up?", which is what `origin`
+    # means in a rental: a PICKUP POINT, the address a driver is sent to. `is_precise`
+    # only promises the fix is within PRECISE_FIX_KM (15 km) of the town the geocoder
+    # named, and a reverse-geocoded town centre is not an address. Filling it here meant
+    # the pickup question was silently already answered, so the rider was never asked
+    # — and a car booked from an airport, a hotel or an office was quoted, and sent, to
+    # whatever settlement the phone happened to sit nearest.
+    #
+    # So a rental always asks. The coordinates are still used for what they are good
+    # for: the map pin and the weather (`tool_executor._rental_tools`), and once the
+    # rider names a pickup that agrees with the fix, `_fix_matches_origin` hands the
+    # exact coordinates to `geo.resolve_pickup` — a better pin than this line ever set.
+    if (
+        location.place_name
+        and location.is_precise
+        and not session.entities.origin
+        and not is_rental
+    ):
         session.entities.origin = location.place_name
         if location.in_himachal:
             session.entities.home_city = location.place_name
@@ -177,7 +330,16 @@ def apply_location(session: TripSession, location: Optional[RiderLocation]) -> b
             session.entities.last_asked_field = None
         changed = True
 
-    if session.entities.visitor_type != location.visitor_type:
+    # A fix says "local" or "outstation" — a guess about WHO the rider is, which is
+    # exactly what coordinates are good for. It says nothing about a RENTAL, which is a
+    # service they chose, and overwriting it here was the single worst bug this flow has
+    # had: the rental screen sends a GPS fix, so from the very first turn the rider was
+    # served as a local or a visitor. `needs_for` fell back to the trip checklist and
+    # asked where they wanted to GO and for how many DAYS; `response_mode` produced a
+    # cab quote or an itinerary; the reply had nothing to do with hiring a car. Every
+    # other guard against this (`resolve_persona`, `classify_visitor_type`,
+    # `needs_for`, `response_mode`) reads a value this line had already destroyed.
+    if not is_rental and session.entities.visitor_type != location.visitor_type:
         session.entities.visitor_type = location.visitor_type
         changed = True
 
@@ -185,7 +347,10 @@ def apply_location(session: TripSession, location: Optional[RiderLocation]) -> b
 
 
 async def _create_session(
-    persona: str, user_id: str, location: Optional[RiderLocation] = None
+    persona: str,
+    user_id: str,
+    location: Optional[RiderLocation] = None,
+    rental_packages: Optional[list[dict]] = None,
 ) -> TripSession:
     """Create + persist a fresh conversation, pre-seeded with the welcome message."""
     language = DEFAULT_LANGUAGE.get(persona, Language.ENGLISH)
@@ -201,13 +366,17 @@ async def _create_session(
     # The welcome message below asks where they want to go, so record that as the
     # question in flight. Without it the planner treats the first reply as unprompted
     # and its answer-parsing safety net can't fire on a one-word "manali".
-    session.entities.last_asked_field = "destination"
+    # The welcome asks the first question, so record which one — that is what lets a
+    # bare "8 hours" or "manali" be read as the answer to it.
+    session.entities.last_asked_field = (
+        "rental_hours" if persona == RENTAL else "destination"
+    )
     # Applied after the seed so a GPS fix wins over the persona for visitor_type, and
     # so the pickup city is known before the rider's first message.
     apply_location(session, location)
     session.add_message(
         MessageRole.ASSISTANT,
-        welcome_message(persona),
+        welcome_message(persona, rental_packages),
         language=language,
     )
 
@@ -293,13 +462,13 @@ async def _find_resumable(persona: str, user_id: str) -> Optional[TripSession]:
         log.warning("chat_session_resume_lookup_failed", user_id=user_id, error=str(e))
         return None
 
-    cutoff = datetime.now(timezone.utc) - _RESUME_WINDOW
+    cutoff = datetime.now(UTC) - _RESUME_WINDOW
     for session in recent:
         if session.persona != persona:
             continue
         updated = session.updated_at
         if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
+            updated = updated.replace(tzinfo=UTC)
         if updated >= cutoff:
             return session
     return None
@@ -333,14 +502,21 @@ async def _refresh_location(
 
 
 async def start_chat(
-    user_id: str, persona: str, location: Optional[RiderLocation] = None
+    user_id: str,
+    persona: str,
+    location: Optional[RiderLocation] = None,
+    rental_packages: Optional[list[dict]] = None,
 ) -> TripSession:
     """Open the chat dialog: ALWAYS begins a fresh conversation.
 
     Called when the user opens the chat UI, so every open starts from a clean greeting
     rather than dropping them into a half-finished plan from days ago.
+
+    `rental_packages` is passed in rather than fetched here so the caller can send the
+    same list to the client as a `rental_packages` event — the greeting and the chips
+    beneath it are then guaranteed to offer the same durations.
     """
-    return await _create_session(persona, user_id, location)
+    return await _create_session(persona, user_id, location, rental_packages)
 
 
 async def resolve_chat(

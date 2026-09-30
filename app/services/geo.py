@@ -17,8 +17,8 @@ routes somebody had already typed in.
 
 Everything is now resolved live, per request:
 
-  `app/services/external/geocoding.py`  name ↔ coordinates, and which state
-  `app/services/external/routing.py`    real road distance and drive time
+  `app/integrations/external/geocoding.py`  name ↔ coordinates, and which state
+  `app/integrations/external/routing.py`    real road distance and drive time
 
 What remains here is the composition — turning a rider's fix and a destination name
 into one `Journey` the rest of the agent can use — plus the coordinate arithmetic
@@ -41,20 +41,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.core.logging import get_logger
-from app.services.external.geocoding import Place, get_geocoding_service
-from app.services.external.routing import RoadRoute, get_routing_service
+from app.domain.location import PRECISE_FIX_KM, RiderLocation
+from app.integrations.external.geocoding import Place, get_geocoding_service
+from app.integrations.external.routing import RoadRoute, get_routing_service
 
 log = get_logger(__name__)
 
 _NON_ALNUM = re.compile(r"[^a-z0-9 ]+")
 
-#: Within this of a named town, the fix IS that town — close enough to call it the
-#: rider's pickup out loud. Further out the coordinates still measure the journey, but
-#: the name is only the nearest thing the provider could point at, so the assistant
-#: asks rather than announcing "your trip from Mandi" to somebody who has never been
-#: there. Reverse geocoding returns the enclosing administrative area, so this is a
-#: sanity bound on how far that area's centre may be, not a lookup radius.
-PRECISE_FIX_KM = 15.0
+# PRECISE_FIX_KM is imported above from app.domain.location, which owns it: it says
+# what a location MEANS, not how one is fetched. Imported rather than redefined so
+# `geo.PRECISE_FIX_KM` keeps working for callers that already reference it here.
 
 
 def normalize(name: str) -> str:
@@ -215,6 +212,37 @@ class Journey:
         }
 
 
+async def resolve_pickup(
+    *,
+    origin_name: Optional[str] = None,
+    origin_fix: Optional[LocationFix] = None,
+) -> Optional[dict]:
+    """Just the pickup point — `{name, lat, lon}` — for a hire that has no drop.
+
+    A car rented by the hour has no destination, so `resolve_journey` has nothing to
+    measure; the booking screen still needs somewhere to open its map. Same precedence
+    as a journey's origin, for the same reason: the device's fix is where the cab
+    actually goes, and the named city is the fallback.
+
+    None when neither can be placed. The handoff then carries the pickup by name alone
+    and the app geocodes it — worse than a pin, better than no handoff.
+    """
+    if origin_fix is not None:
+        return {
+            "name": origin_fix.place_name or origin_name or "Your location",
+            "lat": origin_fix.lat,
+            "lon": origin_fix.lon,
+        }
+    if not origin_name:
+        return None
+
+    place = await get_geocoding_service().geocode(origin_name)
+    if place is None:
+        log.info("pickup_unresolved", origin=origin_name)
+        return None
+    return {"name": place.name, "lat": place.lat, "lon": place.lon}
+
+
 async def resolve_journey(
     destination: str,
     *,
@@ -269,3 +297,42 @@ async def resolve_journey(
         return None
 
     return Journey(origin=origin_place, destination=destination_place, route=route)
+
+
+# ── The rider's location, as the session stores it ────────────────────────────
+
+def rider_location_from_fix(
+    fix: LocationFix, accuracy_m: Optional[float] = None
+) -> RiderLocation:
+    """A resolved `LocationFix` as the persistable entity."""
+    return RiderLocation(
+        lat=fix.lat,
+        lon=fix.lon,
+        in_himachal=fix.in_himachal,
+        place_name=fix.place_name,
+        place_distance_km=fix.nearest_city_km,
+        state=fix.state,
+        accuracy_m=accuracy_m,
+    )
+
+
+async def resolve_rider_location(
+    lat: Optional[float],
+    lon: Optional[float],
+    accuracy_m: Optional[float] = None,
+) -> Optional[RiderLocation]:
+    """Resolve raw device coordinates, or None when they are unusable.
+
+    Unusable covers a missing pair, the (0, 0) a phone reports before it has a fix
+    (see `valid_coordinates`), and a geocoder that cannot place the point. Returning
+    None rather than a wrong location keeps the agent on the ask-them path instead of
+    pricing the wrong journey.
+
+    Async because the lookup is live — there is no coordinate table to consult. This
+    was `RiderLocation.resolve`; it lives here rather than on the model because it
+    performs I/O, and an entity that needs a network to exist is not an entity.
+    """
+    if lat is None or lon is None:
+        return None
+    fix = await locate(lat, lon)
+    return rider_location_from_fix(fix, accuracy_m) if fix else None

@@ -10,9 +10,8 @@ Him Cab rider app for end-to-end cab booking.
 
 ```mermaid
 graph TB
-    subgraph Client["Mobile App / Web UI"]
+    subgraph Client["Mobile App"]
         APP["Him Cab Rider App"]
-        WEB["Test Frontend"]
     end
 
     subgraph API["FastAPI Backend"]
@@ -41,7 +40,6 @@ graph TB
     end
 
     APP --> GW
-    WEB --> GW
     GW --> SSE
     GW --> REST
     SSE --> R
@@ -59,6 +57,65 @@ graph TB
     PS --> FS
     CTX --> FS
 ```
+
+## Package Layering
+
+The packages under `app/` are ordered, and the order is enforced by
+`tests/unit/test_architecture.py` rather than left to good intentions. Each layer may
+import the ones below it and never the ones above.
+
+```mermaid
+graph TD
+    API["app/api — FastAPI routers, middleware"]
+    SCH["app/schemas — wire formats (a CONTRACT)"]
+    AGENT["app/agent — LangGraph: graph, nodes, slot policy"]
+    SVC["app/services — chat_session, geo, vertex_ai, cache"]
+    REPO["app/repositories — Firestore"]
+    INT["app/integrations — himcab/, external/"]
+    DOM["app/domain — entities. Imports nothing outward"]
+    CORE["app/core — config, enums, exceptions, logging"]
+
+    API --> SCH
+    API --> AGENT
+    API --> SVC
+    AGENT --> SVC
+    AGENT --> INT
+    AGENT --> REPO
+    AGENT --> SCH
+    SVC --> INT
+    SVC --> REPO
+    SCH --> DOM
+    INT --> DOM
+    REPO --> DOM
+    SVC --> DOM
+    DOM --> CORE
+```
+
+| Layer | Holds | May not import |
+|---|---|---|
+| `domain/` | Entities: `TripSession`, `Itinerary`, `UserProfile`, `RiderLocation`, `WeatherReport` | anything except `core` |
+| `schemas/` | Request/response bodies, `StructuredEvent` | `api`, `agent`, `services`, `integrations`, `repositories` |
+| `repositories/` | Firestore session + profile stores | `api`, `schemas`, `agent` |
+| `integrations/` | HTTP clients: Him Cab backend, geocoding, routing, weather | `api`, `schemas`, `agent` |
+| `services/` | Application logic that is neither entity nor I/O client | `api` |
+| `agent/` | The LangGraph pipeline and the conversation policy | `api` |
+| `api/` | Delivery. Nothing imports this | — |
+
+**Why `schemas` and `domain` are separate.** They were one file. A field added so the
+app could render something kept becoming a field that was persisted, and a field the
+agent needed kept leaking into the public API shape. They change for different reasons
+and at different costs: an entity can be refactored whenever the code needs it, while
+renaming a field in `schemas/` breaks every shipped mobile build that has not updated.
+
+**Why no web framework below `api/`.** A test asserts that `domain`, `integrations`,
+`repositories` and `agent` import neither `fastapi` nor `starlette`. The graph has to
+be runnable from a test, a script or a queue worker — not only from inside a request.
+
+**What this caught.** `RiderLocation` — an entity — had a `resolve()` classmethod that
+called the geocoder, so `app/domain` depended on an HTTP client and the model could not
+be constructed or reasoned about without a network. The lookup moved to
+`geo.resolve_rider_location()`; the entity kept the data and the one rule that is about
+the data rather than about fetching it (`PRECISE_FIX_KM`).
 
 ## Data Flow
 

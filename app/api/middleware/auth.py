@@ -6,10 +6,9 @@ Validates Bearer tokens on every protected request.
 Injects user_id into request state for downstream handlers.
 """
 
+import firebase_admin
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-
-import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
 
 from app.core.config import settings
@@ -99,16 +98,16 @@ async def get_current_user(
         log.debug("auth_verified", uid=user.uid)
         return user
 
-    except firebase_auth.ExpiredIdTokenError:
+    except firebase_auth.ExpiredIdTokenError as e:
         log.info("auth_token_expired", token_prefix=token[:8] + "...")
-        raise AuthenticationError("Token has expired. Please sign in again.")
-    except firebase_auth.InvalidIdTokenError:
+        raise AuthenticationError("Token has expired. Please sign in again.") from e
+    except firebase_auth.InvalidIdTokenError as e:
         log.info("auth_token_invalid", token_prefix=token[:8] + "...")
-        raise AuthenticationError("Invalid authentication token.")
-    except firebase_auth.RevokedIdTokenError:
+        raise AuthenticationError("Invalid authentication token.") from e
+    except firebase_auth.RevokedIdTokenError as e:
         log.info("auth_token_revoked", token_prefix=token[:8] + "...")
-        raise AuthenticationError("Token has been revoked. Please sign in again.")
+        raise AuthenticationError("Token has been revoked. Please sign in again.") from e
     except Exception as e:
         log.warning("auth_failed", error=str(e), error_type=type(e).__name__)
-        raise AuthenticationError("Authentication failed.")
+        raise AuthenticationError("Authentication failed.") from e
 

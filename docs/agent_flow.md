@@ -162,15 +162,21 @@ booking screen, which refuses anything inside one state and under 200 km.
   concurrently; offers follow the fare. That order is forced by the data — the fare
   needs the distance, and whether a coupon applies depends on the fare.
 - **Where the journey is measured from**: the rider's own GPS fix when the app sent one
-  and they have not named a different origin (`distances.resolve_route_from_fix`).
-  A fix within 15 km of a surveyed town keeps the measured distance; beyond that the
-  coordinates are the better number, because "Manali" and a point 30 km down the Kullu
-  road are not the same journey. Falls back to city-to-city when there is no fix.
+  and they have not named a different origin (`tool_executor._resolve_journey`). A fix
+  within `geo.PRECISE_FIX_KM` (15 km) of the town the geocoder names is close enough to
+  call that town their pickup out loud; beyond that the coordinates still measure the
+  journey but the name is only the nearest thing the provider could point at, because
+  "Manali" and a point 30 km down the Kullu road are not the same journey. Falls back to
+  city-to-city when there is no fix.
 - **How a fare gets priced**: `/fare/estimate` is distance-driven, so the route needs a
-  distance. Surveyed routes use the measured figure (`himcab/distances.py`); everything
-  else is computed (`services/geo.py`) and the fare is labelled approximate all the way
-  to the reply. `bookingTime` is the rider's clock in IST, so the night-charge window is
-  the same one the booking will be priced in.
+  distance. There is no table of surveyed routes any more — the distance and the drive
+  time come from a routing engine over the real road graph
+  (`app/integrations/external/routing.py`), composed into a `Journey` by
+  `app/services/geo.py`, with place names resolved by
+  `app/integrations/external/geocoding.py`. When the engine finds no road, the journey
+  is None and no fare is quoted at all: the reply says the fare is confirmed at booking
+  rather than inventing one. `bookingTime` is the rider's clock in IST, so the
+  night-charge window is the same one the booking will be priced in.
 - **Which cabs are offered**: the endpoint prices EVERY category, so the raw list always
   includes vehicles the group cannot sensibly book. `himcab/vehicles.py` narrows it to
   what seats them, smallest suitable first — repeating the backend's list verbatim is

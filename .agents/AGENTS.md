@@ -1,0 +1,4 @@
+### Architecture & System Design Preferences
+- **Self-Hosted Over Managed Services**: When designing or explaining caching architectures, prioritize open-source, self-hosted Redis deployments (e.g., running Redis via Docker Compose or on standard compute instances) over managed cloud services (like AWS ElastiCache or GCP Memorystore).
+- **Semantic Caching Explanations**: Always explain the underlying mechanics of semantic caching in detail. This includes detailing the embedding model used, how vectors are stored (e.g., using Redisearch/RediSearch modules), how cosine similarity thresholds are evaluated, and the exact flow of a cache hit vs. a miss.
+- **Latency Optimization**: Focus explanations heavily on how the proposed architecture reduces end-to-end latency, detailing connection pooling, local L1 caching fallbacks, and the avoidance of round-trip times to LLMs.

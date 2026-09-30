@@ -185,6 +185,100 @@ visitor whatever their phone reports.
 Skipping this endpoint is fine: `/start`, `/stream` and `/message` all accept the same
 coordinates and route themselves, returning the persona they actually used.
 
+#### 0a. Let the rider choose — the flow picker
+
+```
+GET  /v1/chat/flows?lang=en
+POST /v1/chat/select
+```
+
+The in-chat replacement for the persona dropdown. Instead of the app deciding the flow
+from a screen or a menu, the assistant opens with a neutral line and three selectable
+boxes; the rider taps one and that flow starts.
+
+`GET /v1/chat/flows` needs no `Authorization` header and does no I/O — it is a constant,
+like `/greeting`, so it can be drawn the instant the chat opens. Pass `?lang=hi` for the
+Hindi copy.
+
+**Response**: `FlowChooserResponse`
+```json
+{
+  "message": "Welcome to Him Cab! 🙏 What can I help you with today?",
+  "language": "en",
+  "flows": [
+    { "persona": "local",      "title": "Local ride",      "subtitle": "मैं हिमाचल में रहता/रहती हूँ — कैब बुक करें", "base_path": "/v1/chat/local",      "language": "hi" },
+    { "persona": "outstation", "title": "Outstation ride", "subtitle": "Planning for long trips: a day-by-day plan",  "base_path": "/v1/chat/outstation", "language": "en" },
+    { "persona": "rental",     "title": "Rent by the hour", "subtitle": "A car and driver for a few hours",           "base_path": "/v1/chat/rental",     "language": "en" }
+  ],
+  "structured_events": [ { "type": "flow_options", "payload": { "flows": [ ... ] } } ]
+}
+```
+
+Render `message` as the first assistant bubble and `flows` as tappable boxes (or render
+the `flow_options` structured event with the same code that handles every other card).
+Render each box's strings verbatim: `lang` localizes them, except the local box's subtitle,
+which is Hindi in both languages because that is the flow that answers in Hindi — the line
+under the title is where a rider looking for a Hindi conversation recognises it.
+
+When the rider taps a box, tell the backend which flow they chose:
+
+```
+POST /v1/chat/select
+{ "flow": "rental", "lat": 31.1048, "lon": 77.1734 }
+```
+
+This returns a `StartChatResponse` identical to `POST /v1/chat/{flow}/start` — it is the
+single "the rider chose a service" call, so the app never has to build a per-persona
+path. Coordinates are optional and behave exactly as on `/start`: they set the pickup
+point, and for `local`/`outstation` a fix decides local-vs-visiting (a Delhi fix on a
+`local` selection is served as `outstation`, and the response's `persona` says so).
+`rental` is never re-routed by a fix. A client that prefers per-persona paths can call
+`{base_path}/start` from the box instead — same result.
+
+#### 0b. The greeting, with nothing in front of it
+
+```
+GET /v1/chat/{local|outstation|rental}/greeting
+```
+
+No `Authorization` header, no session created, no backend called. Returns:
+
+```json
+{
+  "persona": "local",
+  "message": "नमस्ते! Him Cab में आपका स्वागत है 🙏 …",
+  "language": "hi",
+  "is_final": true
+}
+```
+
+**Render your own bundled copy of this string instead of calling this on the hot
+path.** `/start` cannot be fast — it reverse-geocodes the fix, reads the rental rate
+card (with retries, when that backend is slow) and writes a session to Firestore before
+it can answer, and none of that work changes the greeting text. Worse, on a cold start
+*no* endpoint answers until the container has booted, so only text the app already has
+can appear at all.
+
+The pattern:
+
+1. Draw the bundled greeting the instant the chat screen opens. No network call.
+2. Let the rider start typing immediately — `/stream` works whether or not `/start` ran.
+3. Call `/start` in the background for the `session_id`, the resolved persona and, for
+   rental, the package chips.
+4. Replace the bubble text only if what comes back differs.
+
+`is_final` tells you whether step 4 will do anything. It is `true` for local and
+outstation — `/start` returns the identical string, so the bubble never flickers — and
+`false` for rental, where `/start` upgrades the open "how long do you need the car
+for?" to one naming the durations the rate card actually sells. Both are answerable, so
+showing the generic one first costs the rider nothing, but the named one is what stops
+an unbookable answer and should replace it as soon as it lands.
+
+Call this endpoint in the background to confirm your bundled copy is still current. A
+copy that has drifted shows the rider one greeting and swaps it for another a moment
+later, which is a worse experience than the delay it was meant to remove.
+`frontend/local.html` is a worked example of the whole pattern.
+
 #### 1. Open the chat dialog
 ```
 POST /v1/chat/{local|outstation}/start?lat=31.1048&lon=77.1734
@@ -311,9 +405,15 @@ without breaking older app builds.
 | `itinerary` | Full `Itinerary` — `destination`, `duration_days`, `group_type`, `budget_range`, `days[]`, `cab_package`, `hotels[]`, `weather`, `travel_info`, `cost_breakdown`, `hidden_gems[]`, `generated_at`, `language`. `weather` and `cab_package` are filled from the live services, not from the model. | A trip plan was generated |
 | `weather_alert` | One alert — `event`, `severity`, `description` | Destination has an active weather alert |
 | `snowfall_alert` | `risk` (`high`\|`critical`), `message` | Snowfall risk at the destination |
-| `cab_fare` | `{options[], category_name, fare_inr, vehicle_label, seat_capacity, trip_type, distance_km, duration_text, distance_source, is_approximate, source, best_offer, fare_after_offer_inr}`. When `is_approximate` is true the route distance was computed rather than surveyed — render the price as "approx". `distance_source` is `surveyed` \| `gps` \| `city`. `best_offer` / `fare_after_offer_inr` are present only when a live coupon applies. | A fare was quoted for the route |
+| `cab_fare` | `{options[], category_name, fare_inr, vehicle_label, seat_capacity, trip_type, distance_km, duration_text, distance_source, is_approximate, source, best_offer, fare_after_offer_inr, selected_by_rider}`. On a rental, `options[]` is the **Select Rental Cab** list: render it as a radio group and send the rider's pick back as its `category_name`. `selected_by_rider` is true once they have picked one, and then `fare_inr` / `category_name` are THEIR cab rather than our recommendation. When `is_approximate` is true the route distance was computed rather than surveyed — render the price as "approx". `distance_source` is `surveyed` \| `gps` \| `city`. `best_offer` / `fare_after_offer_inr` are present only when a live coupon applies. | A fare was quoted for the route |
 | `offers` | `{trip_type, fare_inr, offers: [{offer_id, coupon_code, coupon_name, coupon_value_inr, minimum_value_inr, fare_after_offer_inr, applies_to_this_fare, terms_and_conditions, image, expire_date}], best_offer}`. Real coupons from `/api/rider/offer/*`, already filtered to this trip type, today's date and the quoted fare, **best saving first**. | The rider has at least one coupon that applies to this trip |
-| `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, distance_source, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, offer_id, coupon_code, fare_after_offer_inr, options[]}`. Open the booking screen with both pins already dropped on the map, the recommended cab preselected and the coupon prefilled (`offer_id` is exactly what `POST /api/rider/trip/book-ride` takes). `trip_type` (`OUTSTATION` \| `LOCAL`, decided by the journey's length rather than by the persona) is the rate card it was priced on — use it to open the booking screen that will accept the journey. Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A travelling rider's route was resolved — either persona |
+| `rental_packages` | `{packages: [{hours, included_km, label, from_rate_card}], selected_hours}`. The hourly blocks the rider may choose from, shortest first; `selected_hours` is present once they have chosen one. **Render these as taps.** The backend matches a rental duration exactly (`rentHours == chart.getMaxHour()`), so a typed duration that is not on this list cannot be priced. The list is the rate card narrowed to the durations the product sells (`RENTAL_HOUR_OPTIONS`, currently 4 and 8 hours) — a chart for any other duration is priced by the backend but never offered here, so do not render one. When the rate card cannot be read at all, those same durations are sent with `from_rate_card: false` and `included_km: null`. Offer these as taps like any other — a `cab_fare` can still arrive for them, because the backend matches the rental chart from `rentHours` itself — but show no distance allowance beside one. Sent on the turn that ASKS for the duration and on every rental turn after it, so the list on screen is never stale. | `/v1/chat/rental/*` only |
+| `request_cancelled` | `{scope, dismiss_booking_screen, cleared_fields[], open_screen}`. The rider called the request off. **Act on this**: dismiss any booking sheet a previous `booking_handoff` opened and clear the fare/package cards for this conversation — what they describe no longer exists. `scope` is `request` (this chat's request, now dropped), `booked_trip` (they mean a cab already booked in the app) or `unclear` (either; the reply covers both). `open_screen` is `trips` when they need the app's own cancellation flow, else null. **Nothing is cancelled on the backend by this event** — a confirmed booking is cancelled only from the Trips screen (`DELETE /api/rider/trip/cancel-ride/{id}`), which is what notifies the driver. | The rider said cancel / never mind / rehne do |
+| `booking_handoff` | `{origin: {name, lat, lon}, destination: {name, lat, lon}, distance_km, duration_minutes, duration_text, is_approximate, distance_source, trip_type, passengers, travel_dates, recommended_category_id, recommended_category_name, fare_inr, offer_id, coupon_code, fare_after_offer_inr, options[]}`. On a rental it also carries `rental_hours`, `included_km`, `pickup_time` (`"HH:mm"`, the hour the fare was priced on — open the screen on exactly this time) and `category_selected_by_rider`, with `destination: null` since an hourly hire has no drop. A rental handoff is sent only once the rider has settled a duration AND picked a cab (or there was no priced list to pick from), because the Rent a Car screen cannot book without both — so the reply never announces a screen while still asking which cab. Open the booking screen with both pins already dropped on the map, the recommended cab preselected and the coupon prefilled (`offer_id` is exactly what `POST /api/rider/trip/book-ride` takes). `trip_type` (`OUTSTATION` \| `LOCAL`, decided by the journey's length rather than by the persona) is the rate card it was priced on — use it to open the booking screen that will accept the journey. Nothing is reserved — this is a handoff, and the assistant never asks the rider to confirm a booking. | A travelling rider's route was resolved — either persona |
+| `change_confirmation` | `{changes: [{field, label, current, proposed}]}`. The rider changed a detail they had already given, and is being asked to confirm it **before** it is applied. **Nothing has changed yet when this arrives** — any `booking_handoff` already on screen is still the OLD journey and must not be updated until the rider confirms. Render each pair with a Yes and a No; both send an ordinary message (`yes` / `haan`, `no` / `nahi`). Both sides are sent because `proposed` is our reading of the rider's sentence, and showing it is how a misparse gets caught before a car is sent on it. A reply that is neither yes nor no but carries a different value ("nahi, Kullu jaana hai") simply becomes the next proposal. | The rider changes a detail already on the session |
+| `change_options` | `{fields: [{field, label, current}]}`. The rider asked to change something without saying what, so these are the details we hold, for them to pick from. **Render as tappable rows**; tapping one should send the field and its new value as an ordinary message ("destination Kasol"). A detail given in reply to this card is applied **directly** — no `change_confirmation` follows, because the rider has already said they want a change. | "I want to change something", "mujhe kuch badalna hai", "wait" |
+| `flow_options` | `{flows: [{persona, title, subtitle, base_path, language}]}`. The selectable services shown before a flow is chosen — the in-chat replacement for the persona dropdown. **Render each `flows[]` entry as a tappable box.** When the rider taps one, call `POST /v1/chat/select` with `flow` = that box's `persona`, and the backend starts that flow and returns its greeting. Carried on `GET /v1/chat/flows`; shaped as a structured event so the same card-rendering code handles it. | `GET /v1/chat/flows` |
+| `input_request` | `{field, kind: "date"}` or `{field, kind: "number", min, max, unit}`. `field` is `travel_dates`, `group_size` or `duration_days`; `unit` is `people` or `days`. The question just asked wants one date or one small number, so **offer a calendar (no past days) or a `min`..`max` number picker** beside the reply. Send the pick back as an ordinary message — `"25-09-2026"` for a date, the bare number (`"4"`) for a number — so it is read by the same parser as a typed answer. Typing stays allowed; the picker is only a shortcut. | The turn that ASKS for the travel date, the headcount or the number of days — never on the answer |
 
 The `offers` event is **absent**, never empty, when nothing applies. The reply text and
 this event agree by construction: the assistant may name only the coupons listed here,

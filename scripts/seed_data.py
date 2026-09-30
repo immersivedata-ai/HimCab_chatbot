@@ -10,22 +10,17 @@ Usage:
 
 import asyncio
 import sys
-from datetime import datetime, timezone, timedelta
 
 # Ensure the app package is importable
 sys.path.insert(0, ".")
 
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
-from app.models.session import (
-    ExtractedEntities,
+from app.domain.conversation import (
     Language,
-    MessageRole,
-    SessionStatus,
-    TripSession,
 )
-from app.models.user import PastTrip, TravelPreferences, UserProfile
-from app.services.firestore import get_firestore_client
+from app.domain.user import PastTrip, TravelPreferences, UserProfile
+from app.repositories.firestore import get_firestore_client
 
 configure_logging()
 log = get_logger(__name__)

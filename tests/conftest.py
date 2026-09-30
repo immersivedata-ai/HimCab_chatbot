@@ -11,14 +11,13 @@ the providers rate-limit — occasionally wrong for reasons that have nothing to
 the code under test.
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-from langchain_core.messages import HumanMessage, AIMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.state import AgentState
-from app.models.session import ExtractedEntities, Language
-
+from app.domain.conversation import ExtractedEntities, Language
 
 # ── No test may reach the network ─────────────────────────────────────────────
 
@@ -85,8 +84,7 @@ def no_network(monkeypatch):
     give different distances; tests that care about an exact figure stub the engine
     themselves.
     """
-    from app.services.external import geocoding as geocoding_module
-    from app.services.external import routing as routing_module
+    from app.integrations.external import geocoding as geocoding_module, routing as routing_module
 
     geocoder = geocoding_module.GeocodingService()
     router = routing_module.RoutingService()
@@ -117,7 +115,7 @@ def no_network(monkeypatch):
     monkeypatch.setattr("app.services.geo.get_routing_service", lambda: router)
 
     # The offers backend is a real host too — a test must never call it.
-    from app.services.himcab import offers_service as offers_module
+    from app.integrations.himcab import offers_service as offers_module
 
     offers = offers_module.OffersService()
     offers._get = AsyncMock(return_value={"data": []})
@@ -126,7 +124,23 @@ def no_network(monkeypatch):
         "app.agent.nodes.tool_executor.get_offers_service", lambda: offers, raising=False
     )
 
-    yield {"geocoder": geocoder, "router": router, "offers": offers}
+    # The rental rate card lives on the same backend. A fresh instance per test, so the
+    # package cache cannot leak a rate card from one test into the next.
+    from app.integrations.himcab import rental_service as rental_module
+
+    rental = rental_module.RentalService()
+    rental._get = AsyncMock(return_value={"data": []})
+    monkeypatch.setattr(rental_module, "get_rental_service", lambda: rental)
+    monkeypatch.setattr(
+        "app.agent.nodes.tool_executor.get_rental_service", lambda: rental, raising=False
+    )
+
+    yield {
+        "geocoder": geocoder,
+        "router": router,
+        "offers": offers,
+        "rental": rental,
+    }
 
 
 # ── Agent State Fixtures ──────────────────────────────────────────────────────
@@ -182,8 +196,8 @@ def places_query_state():
 @pytest.fixture
 def mock_firestore():
     """Mock Firestore services."""
-    with patch("app.services.firestore.get_session_service") as session_mock, \
-         patch("app.services.firestore.get_user_profile_service") as profile_mock:
+    with patch("app.repositories.firestore.get_session_service") as session_mock, \
+         patch("app.repositories.firestore.get_user_profile_service") as profile_mock:
         session_svc = AsyncMock()
         profile_svc = AsyncMock()
         session_mock.return_value = session_svc
@@ -209,3 +223,57 @@ def sample_weather_data():
         ],
         "alerts": [],
     }
+
+
+# ── The extraction boundary ──────────────────────────────────────────────────
+
+def wire_extraction(**facts):
+    """What `with_structured_output(...).ainvoke(...)` actually returns.
+
+    Use this, never `PlannerExtraction`, when stubbing the extraction model.
+
+    The distinction is not pedantry — it is the reason a serious bug survived a green
+    suite. Vertex cannot represent the `anyOf` that `Optional[...]` produces, so the
+    planner sends `_VertexExtraction` (flat scalars, sentinel defaults) and converts.
+    Tests stubbed the boundary with `PlannerExtraction`, a shape the real system never
+    returns, so they exercised a conversion that did not exist and passed happily while
+    extraction failed on about half of all live calls.
+
+    Takes the node-model values a test wants to express — `origin_in_himachal=True`,
+    `group_size=2`, `travel_dates=None` — and produces the wire shape that carries them.
+    """
+    from app.agent.nodes.planner import _VertexExtraction
+
+    tri = {True: "yes", False: "no", None: ""}
+    wire: dict = {}
+    for name, value in facts.items():
+        if value is None:
+            continue
+        if name == "origin_in_himachal":
+            wire[name] = tri[value]
+        else:
+            wire[name] = value
+    return _VertexExtraction(**wire)
+
+
+def stub_vertex(svc, llm):
+    """Wire a mocked `get_vertex_ai_service` so every path returns `llm`.
+
+    The service exposes three ways to reach a model and they are not interchangeable:
+
+      * `get_flash_model()` — a Runnable with the standby model already attached, used
+        by the router and writer. It is NOT a `ChatVertexAI`, so it has no
+        `.with_structured_output`.
+      * `structured(schema)` — the planner's path: the structured runnable, standby
+        composed behind it in the one order that works.
+      * `primary_model()` — the bare client, no standby.
+
+    A test that stubs only the first leaves the planner talking to a bare `MagicMock`,
+    whose `ainvoke` is not awaitable — which surfaces as `object MagicMock can't be used
+    in 'await' expression` inside an `except` block, i.e. as a silently degraded turn
+    rather than a failed assertion. Hence one helper, used everywhere.
+    """
+    svc.return_value.get_flash_model.return_value = llm
+    svc.return_value.primary_model.return_value = llm
+    svc.return_value.structured.return_value = llm.with_structured_output.return_value
+    return llm

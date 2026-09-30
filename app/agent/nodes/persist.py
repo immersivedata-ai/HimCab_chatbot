@@ -10,8 +10,8 @@ Responsibilities:
 
 from app.agent.state import AgentState
 from app.core.logging import get_logger
-from app.services.firestore import get_session_service, get_user_profile_service
-from app.models.session import MessageRole
+from app.domain.conversation import MessageRole
+from app.repositories.firestore import get_session_service, get_user_profile_service
 
 log = get_logger(__name__)
 

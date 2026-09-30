@@ -191,8 +191,15 @@ async def get_rider(
         if settings.is_production:
             raise AuthenticationError("Invalid authentication token.")
         log.debug("rider_auth_dev_bypass", user_id=DEV_USER_ID)
-        # jwt=None → the fare gate skips real fares and degrades to approximate
-        # pricing, which is the correct behaviour for a token that can't buy a ride.
+        # jwt=None → the fare gate refuses to quote at all. NOT "degrades to
+        # approximate pricing", which this comment used to claim and which does not
+        # exist anywhere: there is no estimator, and there should not be — an invented
+        # fare is exactly what `guardrails` is there to stop.
+        #
+        # The consequence is worth stating plainly, because it is the single most
+        # common "the flow is broken" report: no JWT means no fare, and no fare means
+        # no cab options, so the rider is offered no choice of vehicle. The three test
+        # clients say so on screen when they are running on this token.
         return RiderIdentity(user_id=DEV_USER_ID, jwt=None, claims={})
 
     claims = _decode_claims(token)

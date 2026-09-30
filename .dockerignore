@@ -18,8 +18,14 @@ graphify-out/
 .benchmarks/
 .agents/
 
-# ── Frontend (test UI — served locally only, not part of the API deployment) ──
-frontend/
+# The browser test clients DO ship. They drive the three workflows end to end against
+# the public endpoints, and app/main.py serves them on any non-production APP_ENV — so
+# they have to be in the image for the deployed URL to have anything to serve. Setting
+# APP_ENV=production turns them off at runtime without rebuilding.
+#
+# Their tooling is another matter: nothing is built from these, so they are weight.
+frontend/node_modules/
+frontend/package-lock.json
 
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/

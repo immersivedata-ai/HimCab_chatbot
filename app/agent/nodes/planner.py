@@ -28,26 +28,51 @@ Three guarantees this node makes, each covering a reported failure:
 
 import asyncio
 import json
-from datetime import datetime, timezone
-from typing import Optional
+import random
+from datetime import UTC, datetime
+from typing import Any, Literal, Optional
 
+from google.api_core.exceptions import ResourceExhausted
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from app.agent import slots
+from app.agent import modification, sanitize, slots
 from app.agent.language import detect_reply_language
 from app.agent.state import AgentState
 from app.core.config import settings
+from app.core.enums import SlotName
 from app.core.logging import get_logger
-from app.models.itinerary import BudgetRange, GroupType
-from app.models.session import ExtractedEntities
+from app.domain.conversation import ExtractedEntities
+from app.domain.itinerary import BudgetRange, GroupType
+from app.integrations.himcab import available_packages, offered_hours
 from app.services import geo
-from app.services.vertex_ai import get_vertex_ai_service
+from app.services.vertex_ai import call_model, get_vertex_ai_service
 
 log = get_logger(__name__)
 
-LOCAL = "local"
-OUTSTATION = "outstation"
+# Aliases onto app/core/enums.Persona, via slots — one set of objects for the whole
+# system, so a persona compare here cannot disagree with one in chat_session.
+LOCAL = slots.LOCAL
+OUTSTATION = slots.OUTSTATION
+#: Hiring a car by the hour. Not a kind of person, so `classify_visitor_type` never
+#: reclassifies it — see the note there.
+RENTAL = slots.RENTAL
+
+#: How many times a blank extraction is retried before the turn degrades to the
+#: deterministic readers. Two, because a rider is waiting on every one of these.
+_EXTRACTION_ATTEMPTS = 2
+
+
+async def _backoff(attempt: int) -> None:
+    """Wait before re-asking, a little longer each time and never the same twice.
+
+    This retry used to fire instantly. That is fine for the case it was written for — a
+    model that answered in the wrong shape — and wrong for the case that actually
+    happens under load, where every client re-asks at the same moment and the second
+    attempt lands in the same congestion as the first. The jitter is the point: without
+    it, backoff merely synchronises everyone onto the same slower clock.
+    """
+    await asyncio.sleep(0.25 * (2 ** attempt) * (1 + random.random()))
 
 # Bare greetings, recognised so "hi" costs no LLM call. Matched on the whole
 # message after punctuation is stripped — never on a substring, so "hi, plan
@@ -73,26 +98,60 @@ _PROCEED_PHRASES = (
 async def classify_visitor_type(
     origin: Optional[str],
     origin_in_himachal: Optional[bool] = None,
+    *,
+    home_city: Optional[str] = None,
+    current: Optional[str] = None,
 ) -> Optional[str]:
-    """Classify the traveller from their starting city.
+    """Decide whether this rider is a Himachal resident or a visitor.
 
-    `origin_in_himachal` is the extraction model's geography call and wins when it is
-    available, because it costs nothing — it came back with the extraction. Otherwise
-    the city is geocoded and the provider's administrative state decides, which is the
-    same source that prices the route, so a town is never known to one and unknown to
-    the other.
+    The evidence is asymmetric, and treating it symmetrically was a bug:
 
-    Returns None when there is no origin, or when neither source can place it, so the
-    caller keeps whatever classification it already had rather than guessing.
+      • an origin OUTSIDE Himachal is strong evidence of a visitor. Nobody drives in
+        from Delhi and needs to be told about their own state.
+      • an origin INSIDE Himachal proves nothing on its own. It fits a resident, and
+        it equally fits a tourist who is already here — someone in Manali asking to
+        go on to Kasol. Reading it as residence flipped English-speaking visitors to
+        the local persona the moment they named their starting city, which switched
+        them to Hindi and replaced their itinerary with a cab quote.
+
+    So residence has to be stated, not inferred: `home_city` is where they LIVE (the
+    extractor only fills it for a Himachal town), while `origin` is merely where this
+    journey starts. An in-state origin leaves `current` untouched.
+
+    Returns None when there is no evidence either way, so the caller keeps whatever
+    classification it already had rather than guessing.
     """
+    # A rental is a SERVICE the rider chose, not a guess about who they are, so no
+    # amount of geography cancels it. Rentals are picked up from anywhere — Delhi,
+    # Chandigarh, Ambala — and reading that pickup as "a visitor" turned the hire into
+    # a holiday: the rider was asked where they wanted to go and for how many days,
+    # and got an itinerary instead of a car. They leave this flow by opening a
+    # different tab, never by naming a city.
+    if current == RENTAL:
+        return RENTAL
+
+    # Residence beats everything, including an origin somewhere else — a Shimla
+    # resident flying out of Delhi is still a local.
+    if home_city and await geo.place_in_himachal(home_city):
+        return LOCAL
+
     if not origin:
         return None
-    if origin_in_himachal is not None:
-        return LOCAL if origin_in_himachal else OUTSTATION
-    in_himachal = await geo.place_in_himachal(origin)
+
+    in_himachal = (
+        origin_in_himachal
+        if origin_in_himachal is not None
+        else await geo.place_in_himachal(origin)
+    )
     if in_himachal is None:
         return None
-    return LOCAL if in_himachal else OUTSTATION
+    if not in_himachal:
+        return OUTSTATION
+
+    # In-state origin: consistent with a resident AND with a visitor already here.
+    # Not enough on its own — keep what we had (the GPS fix or the front end they
+    # opened), and let them say "I live in Manali" if they want to be treated as one.
+    return current
 
 
 class PlannerExtraction(BaseModel):
@@ -101,6 +160,9 @@ class PlannerExtraction(BaseModel):
     Note there is no `needs_clarification`/`clarification_question` here any more:
     those were asked for, then discarded by the node, and the model spent tokens
     producing questions nobody read.
+
+    This is the model the NODE works in, with `None` meaning "not stated". It is not
+    the shape sent to Vertex — see `_VertexExtraction` for why it cannot be.
     """
 
     destination: Optional[str] = None
@@ -114,6 +176,24 @@ class PlannerExtraction(BaseModel):
     special_requirements: list[str] = Field(default_factory=list)
     return_journey_preference: Optional[str] = None
     home_city: Optional[str] = None
+    rental_hours: Optional[int] = Field(
+        default=None,
+        description="Hours the rider wants to hire a car for, if they said (rental flow).",
+    )
+    pickup_time: Optional[str] = Field(
+        default=None,
+        description=(
+            'The clock time the cab should arrive, as "HH:mm" on the 24-hour clock. '
+            'Only from an actual time the user gave. Null for a vague "morning".'
+        ),
+    )
+    cab_category: Optional[str] = Field(
+        default=None,
+        description=(
+            "The cab tier the rider chose, lower-cased and nothing else "
+            '("luxury", "economy", "mini bus"). Only when they picked one.'
+        ),
+    )
     origin_in_himachal: Optional[bool] = Field(
         default=None,
         description="True if `origin` is a town inside Himachal Pradesh, False if outside, null if unknown.",
@@ -123,6 +203,120 @@ class PlannerExtraction(BaseModel):
         description="True if the user asked to stop being asked questions and just get the plan.",
     )
     confidence: float = 0.5
+
+
+#: Values the model writes when it means "not stated". It is told to use "" and
+#: sometimes writes the word instead; both are the absence of an answer, and letting
+#: either through would put the string "null" in a destination field.
+_WIRE_BLANKS = {"", "null", "none", "n/a", "na", "unknown", "not stated", "-"}
+
+
+# ── Why there are two extraction models ───────────────────────────────────────
+#
+# THIS EXISTS BECAUSE OF ONE INCOMPATIBILITY, and the cost of not having it was the
+# whole extraction layer silently failing about half the time.
+#
+# `Optional[str]` compiles to `anyOf: [{"type": "string"}, {"type": "null"}]`, and
+# Vertex's `Schema` proto has no `anyOf`. In `json_mode` it says so outright —
+# `ValueError: Unknown field for Schema: anyOf`. In the default `function_calling` mode
+# it says nothing at all: the schema is mangled on the way through, the model returns no
+# tool call, and `with_structured_output` hands back `None`. Measured over 25 calls on a
+# real conversation, that was 12 to 19 failures. Every one logged a single
+# `planner_extraction_failed` line and degraded exactly as designed, which is why it
+# survived so long — the node kept working, on the deterministic readers alone.
+#
+# What a rider saw was an assistant that followed short answers and lost the plot on
+# whole sentences, because a sentence is precisely what those readers cannot fully parse
+# and the model was supposed to. Reported as hallucination; it was an empty extraction
+# every other turn and a writer left to fill the silence.
+#
+# So `_VertexExtraction` is flat scalars with sentinel defaults — no `anyOf`, no
+# `$defs` — and is used with `json_mode`. `to_extraction` puts the `None`s back, so
+# nothing downstream knows.
+#
+# THE SENTINEL IS NOT THE SAME FOR EVERY TYPE, and the reason is a second Vertex rule
+# found the hard way. A plain string field may default to "", but an ENUM MEMBER MAY
+# NOT BE EMPTY:
+#
+#     400 GenerateContentRequest.generation_config.response_schema
+#         .properties[origin_in_himachal].enum[0]: cannot be empty
+#
+# The first version of this class used "" as the sentinel inside `Literal` too. Vertex
+# rejected the schema, LangChain retried it — `max_retries` was 6 at the time — and a
+# four-turn conversation logged 39 to 45 of those 400s, about six and a half rejected
+# requests for every extraction that eventually got through. On Dynamic Shared Quota
+# that is not just waste; it is six times the request volume into a pool that answers
+# 429 when it is busy, which is exactly what production then started returning.
+#
+# So enum sentinels are the WORD "unknown", and `_WIRE_BLANKS` maps it back to None
+# along with the other ways a model says "nothing". `test_extraction_boundary.py`
+# asserts no enum value is empty, beside the `anyOf` guard — same class of defect, and
+# neither is visible without asking the schema.
+#
+# KEEP THE DOCSTRING BELOW SHORT. Pydantic sends it to Vertex as the schema description,
+# so every word here would be re-sent on every extraction call.
+class _VertexExtraction(BaseModel):
+    """Trip facts as flat scalars. "", 0 and "unknown" mean "the user did not say"."""
+
+    destination: str = ""
+    origin: str = ""
+    duration_days: int = 0
+    travel_dates: str = ""
+    group_type: Literal[
+        "unknown", "solo", "couple", "family", "friends", "corporate"
+    ] = "unknown"
+    group_size: int = 0
+    budget_range: Literal["unknown", "budget", "moderate", "luxury"] = "unknown"
+    interests: list[str] = Field(default_factory=list)
+    special_requirements: list[str] = Field(default_factory=list)
+    return_journey_preference: str = ""
+    home_city: str = ""
+    rental_hours: int = 0
+    pickup_time: str = ""
+    cab_category: str = ""
+    #: Three-state, as a string. A bare `bool` cannot say "no origin yet", and
+    #: `Optional[bool]` would reintroduce the `anyOf` this class exists to avoid.
+    origin_in_himachal: Literal["unknown", "yes", "no"] = "unknown"
+    user_wants_to_proceed_now: bool = False
+    confidence: float = 0.5
+
+    def to_extraction(self) -> PlannerExtraction:
+        """Back to `None`-means-unstated, which is what the node is written against."""
+
+        def text(value: str) -> Optional[str]:
+            cleaned = (value or "").strip()
+            return None if cleaned.lower() in _WIRE_BLANKS else cleaned
+
+        def count(value: int) -> Optional[int]:
+            # 0 is the sentinel AND a nonsense answer for every count here — no trip
+            # lasts zero days and no cab carries zero people — so nothing real is lost.
+            return value if value and value > 0 else None
+
+        # `text` already treats "unknown" as blank, so the enum sentinel goes through
+        # the same door as every other way the model says nothing.
+        chosen = text(self.group_type)
+        budget = text(self.budget_range)
+        himachal = text(self.origin_in_himachal)
+
+        return PlannerExtraction(
+            destination=text(self.destination),
+            origin=text(self.origin),
+            duration_days=count(self.duration_days),
+            travel_dates=text(self.travel_dates),
+            group_type=GroupType(chosen) if chosen else None,
+            group_size=count(self.group_size),
+            budget_range=BudgetRange(budget) if budget else None,
+            interests=[i for i in self.interests if text(i)],
+            special_requirements=[s for s in self.special_requirements if text(s)],
+            return_journey_preference=text(self.return_journey_preference),
+            home_city=text(self.home_city),
+            rental_hours=count(self.rental_hours),
+            pickup_time=text(self.pickup_time),
+            cab_category=text(self.cab_category),
+            origin_in_himachal=None if himachal is None else himachal == "yes",
+            user_wants_to_proceed_now=self.user_wants_to_proceed_now,
+            confidence=self.confidence,
+        )
 
 
 PLANNER_SYSTEM_PROMPT = """You are an information extractor for a Himachal Pradesh travel service.
@@ -135,7 +329,7 @@ Extract these fields (null when the user has not stated them):
 - origin: the city they are starting from
 - origin_in_himachal: true if `origin` is a town/city inside Himachal Pradesh, false if
   it is outside (Delhi, Chandigarh, Mumbai, Amritsar, Dehradun...), null if no origin yet.
-  Use your own geography knowledge — this drives whether they are treated as a resident.
+  Use your own geography knowledge. This says where the JOURNEY starts, not who they are.
 - duration_days: integer, ONLY if the user gave a number of days (or a length like "a week")
 - travel_dates: their rough travel time, verbatim ("next week", "kal", "15 Jan")
 - group_type: one of [solo, couple, family, friends, corporate]
@@ -144,7 +338,22 @@ Extract these fields (null when the user has not stated them):
 - interests: things they said they want to do or see
 - special_requirements: constraints they stated (accessibility, dietary, pets...)
 - return_journey_preference: "booked" | "not_booked" | "own_arrangement" | null
-- home_city: their home city, if it is inside Himachal Pradesh
+- rental_hours: integer — hours they want to HIRE a car for, only in a rental
+  conversation and only if they gave a number ("8 hours", "aadha din" = 4, "full day"
+  = 8). This is a duration, never a distance and never a trip length in days.
+- cab_category: the cab tier they picked from a list you offered them ("standard",
+  "economy", "luxury", "mini bus", "premium"), lower-cased. Null unless they chose one.
+- pickup_time: the clock time the cab should ARRIVE, as "HH:mm" on the 24-hour clock.
+  "6 am" -> "06:00", "shaam 5 baje" -> "17:00", "18:30" -> "18:30", "subah 6" -> "06:00".
+  A DAY is not a time: "kal" and "tomorrow" are travel_dates, not this. Neither is a
+  vague part of the day — "morning", "subah" and "evening" with no hour are null here,
+  because the fare is calculated from this figure and a guessed hour changes the price.
+  A phrase can fill both: "kal subah 6 baje" is travel_dates="kal" and pickup_time="06:00".
+- home_city: where they LIVE, if that is inside Himachal Pradesh, and ONLY when they
+  have actually said so ("I'm from Kullu", "main Shimla mein rehta hoon", "we live in
+  Mandi"). This is the one field that marks somebody as a resident rather than a
+  visitor, so do NOT fill it from where their trip happens to start: a tourist saying
+  "I'm in Manali right now" is origin=Manali with home_city=null.
 - user_wants_to_proceed_now: true when the user asks you to stop asking and just produce
   the plan, says the choice is up to you, or says they do not know / it does not matter.
   Recognise this in ANY language or phrasing ("just make it", "bas bana do", "kuch bhi",
@@ -157,6 +366,17 @@ MERGING (the conversation is multi-turn):
   "Which city are you travelling from?" + "delhi" means origin = "Delhi".
 - Previously extracted values are given to you. Repeat them in your output. Never replace
   a known value with null, and never overwrite one unless the user has just changed it.
+
+A RENTAL CONVERSATION (the request says so above) IS NOT A TRIP:
+- The rider is hiring a car and a driver BY THE HOUR. They have no destination, no trip
+  length in days and no itinerary, and they are not expected to have one.
+- destination and duration_days are ALWAYS null here, however the message is phrased.
+  "A car for 8 hours around Manali" is rental_hours=8 with destination null — Manali is
+  where the car will be driven about, not a trip they asked you to plan.
+- A place they name is the PICKUP (`origin`) only when they said so: "from Shimla",
+  "pick me up in Kullu", "Mandi se". A place mentioned any other way fills nothing.
+- What matters is exactly what their booking screen asks for: the duration, the pickup
+  address, the date, the clock time and which cab. Nothing else.
 
 NEVER INVENT:
 - Every field the user has not stated is null. Not a plausible guess, not a common
@@ -194,12 +414,69 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
     )
 
 
+#: Trip-shaped fields that CANNOT exist in a rental conversation. The extraction model
+#: still reports them — "a car for 8 hours around Manali" reliably comes back with
+#: destination="Manali" — and every one of them then leaks somewhere it does not belong:
+#: into the writer's TRIP block, into the itinerary shortcut in `route_after_router`,
+#: into the profile's past-trip list in `persist`. Hiring a car by the hour means the
+#: rider has not chosen a destination and need not, so these are dropped at the door
+#: rather than guarded against one consumer at a time.
+_NOT_IN_A_RENTAL = ("destination", "duration_days", "return_journey_preference")
+
+
+def _strip_trip_fields(merged: dict, session_id: str) -> None:
+    """Remove trip-only facts from a rental conversation's entities (mutates)."""
+    dropped = [f for f in _NOT_IN_A_RENTAL if merged.get(f) is not None]
+    for field in dropped:
+        merged.pop(field, None)
+    if dropped:
+        log.info("rental_trip_fields_dropped", fields=dropped, session_id=session_id)
+
+
+async def _reject_unsold_duration(
+    merged: dict, rider_jwt: Optional[str], session_id: str
+) -> Optional[int]:
+    """Clear a rental duration Him Cab does not sell, returning what it was.
+
+    Asked and answered in the SAME turn, which is the whole point. The duration used to
+    be validated only where the fare is requested — after the pickup, the date, the time
+    and the headcount had all been collected — so a rider who opened with "6 hours" was
+    put through four more questions before being told the first answer had never been
+    usable. Clearing it here puts the duration question back in flight immediately, and
+    `clarify_node` names the packages in the same breath.
+
+    The offered list is TTL-cached in the rental service, so this costs a network call
+    once an hour rather than once a turn. An empty list means we cannot tell, and
+    nothing is rejected on a guess — the fare gate is still there as the backstop.
+    """
+    hours = merged.get("rental_hours")
+    if not hours:
+        return None
+    offered = await available_packages(rider_jwt)
+    if not offered or hours in offered_hours(offered):
+        return None
+
+    merged["rental_hours"] = None
+    log.info(
+        "rental_duration_rejected_early",
+        requested_hours=hours,
+        offered_hours=offered_hours(offered),
+        session_id=session_id,
+    )
+    return hours
+
+
 def _build_entities(merged: dict) -> ExtractedEntities:
     """Rebuild the entity bag from the merged dict, preserving conversation control.
 
     `last_asked_field` is deliberately NOT carried over — it is set by `_resolve`
     from this turn's decision, so a stale question can never be used to reinterpret a
     later message.
+
+    `pending_changes` and `awaiting_change_detail` are dropped for the same reason and
+    are re-set only by the modification branch. A proposal that outlived the turn it
+    was made on would be a change the rider never confirmed, applied later against a
+    message that was never about it.
     """
     return ExtractedEntities(
         destination=merged.get("destination"),
@@ -214,6 +491,9 @@ def _build_entities(merged: dict) -> ExtractedEntities:
         visitor_type=merged.get("visitor_type"),
         return_journey_preference=merged.get("return_journey_preference"),
         home_city=merged.get("home_city"),
+        rental_hours=merged.get("rental_hours"),
+        pickup_time=merged.get("pickup_time"),
+        cab_category=merged.get("cab_category"),
         asked_counts=dict(merged.get("asked_counts") or {}),
         proceed_requested=bool(merged.get("proceed_requested")),
         no_progress_turns=int(merged.get("no_progress_turns") or 0),
@@ -225,16 +505,36 @@ def _known_slots(entities: ExtractedEntities) -> set[str]:
     return {name for name, slot in slots.SLOTS.items() if slot.read(entities)}
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """True when two slot values are the same, ignoring case for the string ones.
+
+    Place names arrive title-cased from the code readers ("Dharamshala") and however
+    the extraction model happened to capitalise them; "Kangra" and "kangra" are one
+    slot value, and reading them as different would flag a change that never happened.
+    """
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip().lower() == b.strip().lower()
+    return bool(a == b)
+
+
 def _resolve(
     state: AgentState,
     entities: ExtractedEntities,
     visitor_type: Optional[str],
     lang_key: str,
+    unbookable_hours: Optional[int] = None,
+    past_travel_date: Optional[str] = None,
 ) -> dict:
     """Apply the slot policy and package the node's return value.
 
     Shared by the LLM path and the LLM-failure path so a Vertex outage changes what
     the agent KNOWS, never how it BEHAVES.
+
+    `unbookable_hours` is a duration the rider asked for that Him Cab does not sell, and
+    `past_travel_date` a day they named that has already gone. Both travel on state so
+    the question that goes back to them can NAME what could not be used — see
+    `graph.clarify_node`. A question that just repeats itself is the thing both exist to
+    prevent.
     """
     decision = slots.decide(
         entities,
@@ -258,6 +558,40 @@ def _resolve(
         "visitor_type": visitor_type,
         "last_asked_field": decision.ask_field,
         "assumed_fields": list(decision.assumed),
+        "unbookable_rental_hours": unbookable_hours,
+        "past_travel_date": past_travel_date,
+        "node_trace": ["planner"],
+    }
+
+
+def _ask_about_the_change(
+    state: AgentState,
+    entities: ExtractedEntities,
+    question: str,
+    event: dict,
+    visitor_type: Optional[str],
+) -> dict:
+    """A turn that asks about a modification and does nothing else.
+
+    Bypasses `_resolve` on purpose. `slots.decide` answers "what is still missing?",
+    and during a modification nothing is missing — the rider is changing something
+    they already gave us. Routing this through the slot policy would replace the
+    confirmation with whatever question happened to be next in the table.
+
+    `last_asked_field` is cleared for the same reason: the reply coming back is a yes,
+    a no, or a new value, and reading it as the answer to a slot question is how "nahi"
+    would have become a destination.
+    """
+    entities.last_asked_field = None
+    return {
+        "entities": entities,
+        "needs_clarification": True,
+        "clarification_question": question,
+        "visitor_type": visitor_type,
+        "last_asked_field": None,
+        "assumed_fields": [],
+        "unbookable_rental_hours": None,
+        "structured_events": [event],
         "node_trace": ["planner"],
     }
 
@@ -268,6 +602,11 @@ async def planner_node(state: AgentState) -> dict:
 
     lang_key, reply_language = detect_reply_language(state)
     latest_text = _latest_user_text(state)
+    # Hiring a car by the hour, decided by the SERVICE the rider opened rather than by
+    # this turn's intent — the router re-reads every message and calls half of a rental
+    # chat `plan_trip`. Two things hang off it: the trip-shaped fields are dropped, and
+    # the message is read for rental details in code as well as by the model.
+    is_rental = RENTAL in (state.visitor_type, state.entities.visitor_type)
     # The single detail our last question asked about. The reply is only ever read
     # as an answer to THIS field.
     previously_asked = state.entities.last_asked_field
@@ -286,20 +625,75 @@ async def planner_node(state: AgentState) -> dict:
             greeting_entities.no_progress_turns = state.entities.no_progress_turns + 1
         return _resolve(state, greeting_entities, state.visitor_type, lang_key)
 
+    # ── A change we asked about last turn ─────────────────────────────
+    # Read before the extraction model, not after: "haan" is unmistakable in code, and
+    # sending it to a model to be classified adds a round trip and a way to be wrong
+    # about the one turn where being wrong rewrites a booking screen.
+    pending = dict(state.entities.pending_changes or {})
+    confirmed_changes: dict[str, Any] = {}
+    if pending:
+        verdict = modification.reads_as_confirmation(latest_text)
+        if verdict is True:
+            confirmed_changes = pending
+            log.info(
+                "change_confirmed", fields=sorted(pending), session_id=state.session_id
+            )
+        elif verdict is False:
+            # Declined. Keep every old value, and ask what they DID mean — a rider who
+            # says "no" to our reading has still told us something is wrong, and
+            # dropping it there leaves them exactly where the reported bug left them.
+            declined = state.entities.model_copy(deep=True)
+            declined.pending_changes = {}
+            declined.awaiting_change_detail = True
+            declined.no_progress_turns = 0
+            log.info(
+                "change_declined", fields=sorted(pending), session_id=state.session_id
+            )
+            return _ask_about_the_change(
+                state,
+                declined,
+                modification.kept_message(lang_key)
+                + "\n"
+                + modification.which_detail_question(declined, lang_key),
+                modification.which_detail_event(declined, lang_key),
+                state.visitor_type,
+            )
+        else:
+            # Neither yes nor no. The likeliest reason is that they answered with a
+            # DIFFERENT value ("no, make it Kullu"), which the readers below handle far
+            # better than a yes/no test can. The old proposal is dropped rather than
+            # left hanging, so it cannot be applied by a later turn that was never
+            # about it.
+            log.info(
+                "change_confirmation_unclear",
+                fields=sorted(pending),
+                session_id=state.session_id,
+            )
+
     conversation_text = "\n".join(
         f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
         for m in state.messages[-10:]
     )
-    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+    today = datetime.now(UTC).strftime("%A, %d %B %Y")
     asked_context = (
-        f"\nThe assistant's last question asked about: {', '.join(previously_asked)}. The "
-        f"user's latest message is most likely the answer to it."
+        f"\nThe assistant's last question asked about: {previously_asked}. The "
+        f"user's latest message is most likely the answer to it (it may be a short "
+        f"reply or contain a typo)."
         if previously_asked else ""
+    )
+
+    # Named in the prompt rather than left to be inferred from the transcript: the
+    # extractor's rules for a rental are different, and "rental" in the persona line was
+    # being read as just another kind of traveller.
+    service_line = (
+        "\nRequest type: RENTAL — a car and driver BY THE HOUR. There is no destination "
+        "and no trip length. Read the RENTAL CONVERSATION rules below."
+        if is_rental else ""
     )
 
     prompt = f"""Today's date: {today}
 Conversation language: {reply_language}
-Visitor classification so far: {state.visitor_type or 'unknown'}{asked_context}
+Visitor classification so far: {state.visitor_type or 'unknown'}{service_line}{asked_context}
 
 Conversation so far:
 {conversation_text}
@@ -310,24 +704,75 @@ Already extracted (carry these forward; do not null them out):
 Report what the user has stated. Use null for anything they have not."""
 
     try:
-        llm = (
-            get_vertex_ai_service()
-            .get_flash_model(streaming=False)
-            .with_structured_output(PlannerExtraction)
-        )
-        raw_result = await asyncio.wait_for(
-            llm.ainvoke([
-                SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ]),
-            timeout=settings.llm_call_timeout_seconds,
-        )
-        result_dict = (
-            raw_result.model_dump()
-            if isinstance(raw_result, PlannerExtraction)
-            else dict(raw_result)
-        )
+        # `json_mode` rather than the default function calling, and `_VertexExtraction`
+        # rather than `PlannerExtraction` — both are required together, and the note on
+        # that class says why. In short: the default combination returned None on about
+        # half of all calls and this one has not returned None yet.
+        # `structured` rather than `get_flash_model(...).with_structured_output(...)`:
+        # same runnable, with the standby model behind it for when the primary's quota
+        # pool is empty. See `vertex_ai.structured`.
+        llm = get_vertex_ai_service().structured(_VertexExtraction, method="json_mode")
+        messages = [
+            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
+        raw_result = None
+        for attempt in range(_EXTRACTION_ATTEMPTS):
+            raw_result = await asyncio.wait_for(
+                call_model(llm.ainvoke(messages)),
+                timeout=settings.llm_call_timeout_seconds,
+            )
+            if raw_result is not None:
+                break
+            # A None here is the model declining to answer in the required shape. It is
+            # not an error and raises nothing — it used to reach `dict(None)` and come
+            # out as a TypeError, which read in the logs like a bug in this file.
+            # Retried because it is transient; counted because a rising rate means the
+            # schema and the model have drifted apart again.
+            log.warning(
+                "planner_extraction_empty",
+                attempt=attempt + 1,
+                session_id=state.session_id,
+            )
+            if attempt + 1 < _EXTRACTION_ATTEMPTS:
+                await _backoff(attempt)
+
+        if raw_result is None:
+            raise ValueError(
+                f"the model returned no parseable object in "
+                f"{_EXTRACTION_ATTEMPTS} attempts"
+            )
+        if not isinstance(raw_result, _VertexExtraction):
+            # LangChain types this return as `dict | BaseModel`. Anything else here is
+            # a version change in how structured output is handed back, and guessing at
+            # it would put whatever arrived straight into the rider's entities.
+            raise TypeError(
+                f"extraction returned {type(raw_result).__name__}, "
+                f"expected _VertexExtraction"
+            )
+
+        result_dict = raw_result.to_extraction().model_dump()
         llm_ok = True
+
+    except ResourceExhausted as e:
+        # THROTTLED, not broken. Logged under its own name because the two need
+        # different responses and used to be indistinguishable: a rising
+        # `planner_extraction_failed` rate means the schema and the model have drifted
+        # apart, a rising `vertex_throttled` means the quota pool is full and no amount
+        # of staring at this file will help.
+        #
+        # Nothing is retried here. LangChain has already retried with backoff by the
+        # time this is raised, and a further re-ask would be one more request into a
+        # pool that has just said it has no room.
+        log.warning(
+            "vertex_throttled",
+            node="planner",
+            error=str(e)[:200],
+            session_id=state.session_id,
+        )
+        result_dict = {}
+        llm_ok = False
 
     except Exception as e:
         # Degrade, don't derail: keep what we know, read the reply in code, and let
@@ -348,28 +793,233 @@ Report what the user has stated. Use null for anything they have not."""
         if key not in control_keys and val not in (None, []):
             merged[key] = val
 
-    # ── Visitor classification (code, from the origin city) ───────────────────
+    # A change the rider confirmed last turn, applied over whatever the model still
+    # believes. It has to land AFTER the merge above: the extraction model re-reports
+    # the whole conversation every turn and will happily re-assert the old value it has
+    # seen five times, which is exactly how the confirmed change used to evaporate.
+    if confirmed_changes:
+        merged.update(confirmed_changes)
+
+    if is_rental:
+        _strip_trip_fields(merged, state.session_id)
+
+    # ── Visitor classification (code, from what they told us) ─────────────────
+    # `current` is passed so an in-state ORIGIN cannot promote a visitor to resident;
+    # only a stated home city does that. See `classify_visitor_type`.
+    # A rental never uses this: `classify_visitor_type` returns RENTAL before it reads
+    # `origin_in_himachal` (the pickup says nothing about who the rider is), and the
+    # `home_city` promotion below is LOCAL-only. Geocoding the pickup here would be a
+    # wasted Nominatim round-trip on the planner's critical path.
+    origin_in_hp = result_dict.get("origin_in_himachal")
+    if origin_in_hp is None and merged.get("origin") and not is_rental:
+        origin_in_hp = await geo.place_in_himachal(merged["origin"])
+
     visitor_type = (
-        await classify_visitor_type(merged.get("origin"), result_dict.get("origin_in_himachal"))
+        await classify_visitor_type(
+            merged.get("origin"),
+            origin_in_hp,
+            home_city=merged.get("home_city"),
+            current=state.visitor_type,
+        )
         or state.visitor_type
     )
     if visitor_type:
         merged["visitor_type"] = visitor_type
-        if visitor_type == LOCAL and not merged.get("home_city"):
+        # The local flow asks "which city in Himachal are you based in?", so when a rider
+        # we ALREADY treat as a resident names an in-state origin, that answer is their
+        # home city — recorded so the classification survives later turns. Deliberately
+        # not done for a visitor: their in-state origin is where the trip starts, not
+        # where they live, and writing it here is what used to turn them into a local.
+        if visitor_type == LOCAL and origin_in_hp and not merged.get("home_city"):
             merged["home_city"] = merged.get("origin")
+
+    # ── "Here" — the pickup answered by pointing rather than naming ───────────
+    # Only for the rental pickup, and only as a reply to that exact question. Now that
+    # a rental always asks where the car should collect them, "here" / "yahin" / "my
+    # location" is a reply riders genuinely give — and it used to parse as a PLACE
+    # called "Here", which the geocoder resolved to something and the car was sent to.
+    #
+    # The fix is the honest reading of it, and a better one than the pickup this flow
+    # used to assume: exact coordinates the rider has just confirmed, rather than a
+    # town centre nobody was asked about. It is accepted only when the fix is precise
+    # — `is_precise` is what makes `place_name` a name worth saying out loud, and the
+    # reply announces the pickup. Without one we would be guessing at a name and
+    # sending a car on it, so the question is simply asked again.
+    if (
+        is_rental
+        and latest_text
+        and previously_asked == SlotName.ORIGIN
+        and not merged.get("origin")
+        and slots.means_current_location(latest_text)
+    ):
+        fix = state.rider_location
+        if fix is not None and fix.is_precise and fix.place_name:
+            merged["origin"] = fix.place_name
+            log.info(
+                "rental_pickup_from_device_fix",
+                place=fix.place_name,
+                distance_km=fix.place_distance_km,
+                session_id=state.session_id,
+            )
+        else:
+            # Deliberately fills nothing: `decide` then re-asks, and the second wording
+            # ("just the name of the city or town the car should come to") is exactly
+            # the right thing to say to somebody whose "here" we could not place.
+            log.info(
+                "rental_pickup_here_without_usable_fix",
+                has_fix=fix is not None,
+                is_precise=bool(fix and fix.is_precise),
+                session_id=state.session_id,
+            )
 
     # ── Read the reply as an answer to the question we asked ──────────────────
     # Strictly scoped: only the fields that question covered, only if the reply has
     # the right shape. A safety net for a missed one-word answer, not an interpreter.
+    corrected: dict[str, Any] = {}
+    bare_correction: Optional[str] = None
+
     recovered = slots.read_answer(previously_asked, latest_text, merged, visitor_type) if latest_text else None
     if recovered:
         log.info("short_answer_recovered", field=recovered, session_id=state.session_id)
-        if recovered == "origin":
-            # An origin recovered in code still decides the persona.
-            visitor_type = await classify_visitor_type(merged.get("origin")) or visitor_type
+        # Skipped for a rental for the same reason as the classification above: the
+        # pickup does not decide the persona (`classify_visitor_type` returns RENTAL),
+        # so geocoding it and re-classifying would change nothing but the latency.
+        if recovered == "origin" and not is_rental:
+            # An origin recovered in code carries the same weight as an extracted one.
+            recovered_in_hp = await geo.place_in_himachal(merged["origin"])
+            visitor_type = await classify_visitor_type(
+                merged.get("origin"),
+                recovered_in_hp,
+                home_city=merged.get("home_city"),
+                current=visitor_type,
+            ) or visitor_type
             if visitor_type:
                 merged["visitor_type"] = visitor_type
-                if visitor_type == LOCAL and not merged.get("home_city"):
+                if visitor_type == LOCAL and recovered_in_hp and not merged.get("home_city"):
+                    merged["home_city"] = merged.get("origin")
+
+    # ── Read the reply as a CORRECTION to the question we asked ────────────
+    # `read_answer` above only fills an EMPTY slot. A bare reply that changes one that
+    # is already filled — "nahi, Kasol" after the destination is in — landed nowhere.
+    # Guarded to the field the assistant itself asked last turn — that is what makes a
+    # bare reply unambiguous. Like the sentence reader below it PROPOSES rather than
+    # writes, because it overwrites a value the rider already gave us.
+    if latest_text and previously_asked:
+        asked_slot = slots.SLOTS.get(previously_asked)
+        stored = existing_entities.get(previously_asked)
+        if asked_slot:
+            # Read against `stored`, not against `merged`: the text is what establishes
+            # that a change was asked for, and it says so whether or not the extraction
+            # model also noticed. Reading against `merged` made the behaviour depend on
+            # the model — the same reply confirmed on one turn and applied silently on
+            # the next, for no reason the rider could see.
+            new_value = slots.read_correction_to_asked(
+                previously_asked, latest_text, stored
+            )
+            if new_value is not None:
+                # The model's reading of the same reply wins WHAT is proposed when it
+                # moved the field too; the text only had to establish THAT it moved.
+                model_value = merged.get(previously_asked)
+                if model_value is not None and not _same_value(model_value, stored):
+                    new_value = model_value
+                # Proposed, not written. Same rule as the sentence block below: this
+                # overwrites a value the rider already gave, so they get to see our
+                # reading of it before a booking screen is built on it.
+                corrected[previously_asked] = new_value
+                bare_correction = previously_asked
+                log.info(
+                    "bare_answer_correction_proposed",
+                    field=previously_asked,
+                    session_id=state.session_id,
+                )
+
+    # ── Read the whole sentence, in code ──────────────────────────────────────
+    # `read_answer` above handles a BARE reply to the question in flight ("manali").
+    # This handles the other thing riders actually type — a sentence — which used to
+    # depend entirely on the extraction model. A miss there was silent: the detail
+    # vanished, and the assistant asked for something it had just been told, which is
+    # what a rider experiences as not being listened to.
+    #
+    # Reported twice, once per flow. For rentals it was "I need a car tomorrow at 9 am
+    # from Shimla for 8 hours". For trips it was the very first turn: the greeting asks
+    # "आप कहाँ जाना चाहते हैं?", the rider answers "mei shimla jana chahta hu", and the
+    # same question comes back — because `parse_place` caps an answer at three words on
+    # purpose, so a bare "shimla" was recovered and a sentence containing it was not.
+    #
+    # Every value here is anchored on an unmistakable marker — see the two readers in
+    # `slots`. A marker-anchored value fills an EMPTY slot, and it also CORRECTS a slot
+    # that already holds one when the rider changes their mind — see `corrected` below.
+    if latest_text:
+        reader = slots.read_rental_details if is_rental else slots.read_trip_details
+        filled: dict[str, Any] = {}
+        for field, value in reader(latest_text).items():
+            stored = existing_entities.get(field)
+            if stored in (None, "", [], {}):
+                # Nothing there yet — an ANSWER. Fills the blank, takes nothing away,
+                # and needs no confirmation.
+                filled[field] = value
+            elif not _same_value(value, stored):
+                # A CHANGE: the rider has restated a slot as something different from
+                # what the session holds. Every detail may already be in and the
+                # booking already on screen; "mujhe dharamshala jaana hai" moves it.
+                #
+                # Compared against `stored` — the value as it was BEFORE this turn —
+                # rather than against `merged`, which the extraction model has already
+                # written to. That is what makes the detection uniform: whether the
+                # model caught the change or missed it, the rider sees the same
+                # confirmation. It used to depend on which, so the same sentence was
+                # sometimes applied silently and sometimes not.
+                #
+                # The model's value wins WHAT is proposed when it moved the field too:
+                # reading a whole sentence is its strength, and these regexes cap a
+                # place at three words. The reader's job here is to establish THAT
+                # something changed, which it can do from the text alone — a
+                # model-only disagreement is far more often a re-wording ("kal" ->
+                # "tomorrow") than a change the rider asked for.
+                model_value = merged.get(field)
+                corrected[field] = (
+                    model_value
+                    if model_value is not None and not _same_value(model_value, stored)
+                    else value
+                )
+
+        # `filled` goes in unconditionally and `corrected` does not. That is the whole
+        # distinction this flow turns on: filling a blank takes nothing away, while
+        # changing a value overwrites something the rider already gave us and is
+        # already looking at. The second one is proposed and confirmed below; see
+        # app/agent/modification.py for why it is worth the extra turn.
+        if filled:
+            merged.update(filled)
+        for field in corrected:
+            # Put back what the session held. The model may have written its own change
+            # into `merged` several steps ago, and leaving it there would apply the very
+            # change we are about to ask about — the confirmation would be theatre.
+            merged[field] = existing_entities.get(field)
+        if filled or corrected:
+            log.info(
+                "sentence_read_in_code",
+                flow="rental" if is_rental else "trip",
+                filled=sorted(filled),
+                proposed=sorted(corrected),
+                llm_ok=llm_ok,
+                session_id=state.session_id,
+            )
+
+        # A changed pickup re-decides who the rider is, exactly as a recovered or
+        # extracted origin does above: "actually, start from Delhi" turns a resident's
+        # ride into a visitor's transfer. Skipped for a rental, where the pickup never
+        # sets the persona (`classify_visitor_type` returns RENTAL regardless).
+        if "origin" in filled and not is_rental:
+            corrected_in_hp = await geo.place_in_himachal(merged["origin"])
+            visitor_type = await classify_visitor_type(
+                merged.get("origin"),
+                corrected_in_hp,
+                home_city=merged.get("home_city"),
+                current=visitor_type,
+            ) or visitor_type
+            if visitor_type:
+                merged["visitor_type"] = visitor_type
+                if visitor_type == LOCAL and corrected_in_hp and not merged.get("home_city"):
                     merged["home_city"] = merged.get("origin")
 
     # ── "Stop asking and just do it" ──────────────────────────────────────────
@@ -378,6 +1028,46 @@ Report what the user has stated. Use null for anything they have not."""
     ):
         merged["proceed_requested"] = True
         log.info("proceed_requested", session_id=state.session_id)
+
+    # The booking screen wants a DATE in its date field, not the sentence the rider
+    # happened to answer with. Rentals only: a trip's "sometime after Diwali" is worth
+    # keeping word for word, and nothing renders it into a form.
+    if is_rental and merged.get("travel_dates"):
+        merged["travel_dates"] = slots.tidy_when(merged["travel_dates"])
+
+    # ── The validation gate ───────────────────────────────────────────────────
+    # Everything above WRITES into `merged` — the extraction model, the answer parsers
+    # and the sentence reader — and until this existed only the last two checked what
+    # they wrote. The model's output went straight through, so a group of 500, a
+    # negative trip length, a pickup of "Here" or a travel date of "yesterday" reached
+    # the fare request and the booking screen unopposed.
+    #
+    # Placed here, after every writer and before `_build_entities`, so there is exactly
+    # one gate and no route around it. A value that fails is dropped rather than
+    # corrected: the slot is empty again, so `slots.decide` asks for it on this very
+    # turn instead of the rider discovering the problem at the booking screen.
+    #
+    # For a rental this is also where "tomorrow" becomes a real date — see
+    # `sanitize.travel_date`.
+    # Asked BEFORE the gate, because the gate is what empties the field: afterwards
+    # there is nothing left to tell the rider we could not use.
+    past_day = sanitize.day_already_gone(merged.get("travel_dates"))
+
+    merged, rejected = sanitize.sanitize_entities(merged, is_rental=is_rental)
+    if rejected:
+        log.info(
+            "entity_values_rejected",
+            fields=rejected,
+            session_id=state.session_id,
+        )
+    if past_day:
+        log.info("travel_date_already_gone", value=past_day, session_id=state.session_id)
+
+    # ── A duration we do not sell, refused on the turn it arrives ─────────────
+    unbookable_hours = (
+        await _reject_unsold_duration(merged, state.rider_jwt, state.session_id)
+        if is_rental else None
+    )
 
     entities = _build_entities(merged)
 
@@ -390,12 +1080,87 @@ Report what the user has stated. Use null for anything they have not."""
     # cleared `last_asked_field`, which reset the streak, which let it start asking
     # again on the very next message. The user got interrogated, then a plan, then
     # interrogated again. Only real progress — a slot that gained a value — resets it.
-    if _known_slots(entities) - known_before:
+    # A correction is progress too, even though it fills no NEW slot: the rider handed
+    # us a real, different value. Without `or corrected`, a turn that only changes an
+    # already-known detail would count as no progress and inch the agent towards giving
+    # up on a rider who is actively engaged.
+    if (
+        (_known_slots(entities) - known_before)
+        or corrected
+        or bare_correction
+        or confirmed_changes
+    ):
         entities.no_progress_turns = 0
     else:
         entities.no_progress_turns = state.entities.no_progress_turns + 1
 
-    result = _resolve(state, entities, visitor_type, lang_key)
+    # ── A change the rider has asked for ───────────────────────────────
+    # `corrected` holds values that would OVERWRITE something already on the session.
+    # Three outcomes, and which one applies is decided in code:
+    #
+    #   They already told us they wanted to change something and we asked what — this
+    #   IS the what, so it goes straight in. Asking "are you sure?" about an answer to
+    #   "what would you like to change?" is how a correction becomes an interrogation.
+    #
+    #   Otherwise we put our reading of it to them before acting on it. The value we
+    #   read is the thing most likely to be wrong, and the reported bug is what a bad
+    #   one looks like once it reaches a booking screen: a ride from "Mujhe Palampur"
+    #   to "Lekar Kasol". Shown as a question, that misparse is obvious to the one
+    #   person who can fix it.
+    #
+    #   And a rider who says they want a change without saying which gets asked which,
+    #   with the current details listed so they can point at one rather than remember.
+    if corrected and state.entities.awaiting_change_detail:
+        for field, value in corrected.items():
+            setattr(entities, field, value)
+        log.info(
+            "change_applied_on_request",
+            fields=sorted(corrected),
+            session_id=state.session_id,
+        )
+    elif corrected:
+        pending_entities = entities.model_copy(deep=True)
+        pending_entities.pending_changes = dict(corrected)
+        log.info(
+            "change_proposed",
+            fields=sorted(corrected),
+            session_id=state.session_id,
+        )
+        return _ask_about_the_change(
+            state,
+            pending_entities,
+            # Against `state.entities` — the values as they stood BEFORE this turn.
+            # `entities` already carries anything newly filled, and a confirmation that
+            # says "destination: Kasol → Kasol" tells the rider nothing.
+            modification.confirm_question(corrected, state.entities, lang_key),
+            modification.confirmation_event(corrected, state.entities, lang_key),
+            visitor_type,
+        )
+    elif latest_text and modification.wants_to_change_something(latest_text):
+        asking = entities.model_copy(deep=True)
+        asking.awaiting_change_detail = True
+        asking.no_progress_turns = 0
+        log.info("change_requested_without_a_field", session_id=state.session_id)
+        return _ask_about_the_change(
+            state,
+            asking,
+            modification.which_detail_question(asking, lang_key),
+            modification.which_detail_event(asking, lang_key),
+            visitor_type,
+        )
+
+    result = _resolve(
+        state, entities, visitor_type, lang_key, unbookable_hours, past_day
+    )
+
+    # A change that just landed is stated in the reply, so the rider can see it took.
+    # Everything downstream — route, fare, weather, booking handoff — is rebuilt from
+    # the entities each turn, so the reply already reflects the new value; what it has
+    # no way to say on its own is that the value MOVED, and why.
+    if confirmed_changes or (corrected and state.entities.awaiting_change_detail):
+        result["change_note"] = modification.applied_message(
+            confirmed_changes or corrected, lang_key
+        )
 
     log.info(
         "entities_extracted",
@@ -404,6 +1169,9 @@ Report what the user has stated. Use null for anything they have not."""
         duration=entities.duration_days,
         group_size=entities.group_size,
         travel_dates=entities.travel_dates,
+        rental_hours=entities.rental_hours,
+        pickup_time=entities.pickup_time,
+        cab_category=entities.cab_category,
         visitor_type=visitor_type,
         intent=state.intent,
         needs_clarification=result["needs_clarification"],

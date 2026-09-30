@@ -11,7 +11,7 @@ Responsibilities:
 
 from app.agent.state import AgentState
 from app.core.logging import get_logger
-from app.services.firestore import get_user_profile_service
+from app.repositories.firestore import get_user_profile_service
 
 log = get_logger(__name__)
 

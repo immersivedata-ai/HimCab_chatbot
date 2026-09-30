@@ -34,3 +34,14 @@ repos:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
         exclude: (\.env\.example|tests/fixtures/)
+
+  # requirements*.txt are generated from pyproject.toml — keep them in step locally
+  # rather than finding out in CI.
+  - repo: local
+    hooks:
+      - id: requirements-in-sync
+        name: requirements.txt matches pyproject.toml
+        entry: python scripts/gen_requirements.py --check
+        language: system
+        files: ^(pyproject\.toml|requirements(-dev)?\.txt)$
+        pass_filenames: false

@@ -22,7 +22,7 @@ Modes:
   python scripts/check_fare.py --dry-run --origin Solan --destination Kasol
 
   # 4. Re-derive the road-winding factors in app/services/geo.py from the surveyed
-  #    routes in app/services/himcab/distances.py, and report the estimator's error
+  #    routes in app/integrations/himcab/distances.py, and report the estimator's error
   python scripts/check_fare.py --calibrate
 
 The JWT can also come from HIMCAB_RIDER_JWT, and the base URL from JAVA_BACKEND_URL.
@@ -41,13 +41,13 @@ sys.path.insert(0, ".")
 
 def calibrate() -> None:
     """Fit the great-circle → road multipliers to the surveyed distances."""
+    from app.integrations.himcab.distances import ROAD_ROUTES
     from app.services.geo import (
         HIMACHAL_COORDS,
         estimate_road_distance_km,
         find_city,
         haversine_km,
     )
-    from app.services.himcab.distances import ROAD_ROUTES
 
     unknown, samples = set(), []
     for (origin, destination), (surveyed_km, _minutes) in ROAD_ROUTES.items():
@@ -113,7 +113,7 @@ async def report_offers(quote, args, jwt: str) -> None:
     the reply, which simply says nothing. So each is printed per coupon.
     """
     from app.core.config import settings
-    from app.services.himcab.offers_service import get_offers_service, usable_offers
+    from app.integrations.himcab.offers_service import get_offers_service, usable_offers
 
     if not settings.enable_offers:
         print("  ENABLE_OFFERS=false — the agent will never mention a coupon.")
@@ -193,12 +193,12 @@ def main() -> None:
         return
 
     from app.core.config import settings
-    from app.models.session import ExtractedEntities
+    from app.domain.conversation import ExtractedEntities
+    from app.integrations.himcab.distances import resolve_route, resolve_route_from_fix
+    from app.integrations.himcab.fare_service import get_fare_service
+    from app.integrations.himcab.quote_builder import build_fare_quote_input
     from app.services import geo
     from app.services.geo import find_city
-    from app.services.himcab.distances import resolve_route, resolve_route_from_fix
-    from app.services.himcab.fare_service import get_fare_service
-    from app.services.himcab.quote_builder import build_fare_quote_input
 
     fix = geo.locate(args.lat, args.lon) if args.lat is not None and args.lon is not None else None
 

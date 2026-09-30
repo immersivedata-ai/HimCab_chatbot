@@ -513,6 +513,18 @@
   </div>
 
   <!-- ── Chat ─────────────────────────────────────────────────────── -->
+  <!-- ── Why there is no price ─────────────────────────────────────────────
+       The backend maps `dev-test-token` to jwt=None on purpose, and the fare gate
+       requires a rider JWT — so on the placeholder token there is no fare, and with
+       no fare there are no cab options to choose from. The rental page has warned
+       about this for a while; these two did not, and a local ride with no cab list
+       and no explanation was reported as the flow being broken. -->
+  <div id="notice" style="display:none;align-items:flex-start;gap:9px;padding:9px 20px;
+       background:#fef3c7;border-bottom:1px solid #fde68a;color:#78350f;
+       font-size:0.76rem;line-height:1.5;flex-shrink:0">
+    <span id="notice-text"></span>
+  </div>
+
   <div id="chat-container">
     <div id="welcome-screen">
 
@@ -682,6 +694,26 @@
     // ── Helpers ───────────────────────────────────────────────────────
     const scrollBottom = () => { $chat.scrollTop = $chat.scrollHeight; };
 
+    // ── Why there is no price ───────────────────────────────────────────────
+    //: True while the page is running on the placeholder token. The backend maps it to
+    //: jwt=None on purpose, the fare gate requires a rider JWT, and with no fare there
+    //: are no cab options — the single most common reason this page shows no cabs.
+    const usingDevToken = () => RIDER_TOKEN === "dev-test-token";
+
+    function noticeIfNoFare(events) {
+      const el = document.getElementById("notice");
+      if (!el) return;
+      const priced = (events || []).some(e => e.type === "cab_fare");
+      if (priced || !usingDevToken()) { el.style.display = "none"; return; }
+      document.getElementById("notice-text").innerHTML =
+        "<b>No cab options.</b> This page is using the placeholder " +
+        "<code>dev-test-token</code>, which the backend treats as no rider credential " +
+        "at all — so no fare is requested and there are no cabs to choose from. " +
+        "Open this page as <code>?rider_token=&lt;JWT&gt;</code> with a real Him Cab " +
+        "rider token to see prices.";
+      el.style.display = "flex";
+    }
+
     function showError(msg) {
       $errorText.textContent = msg;
       $errorBanner.classList.add("show");
@@ -722,6 +754,71 @@
     // ── Open the chat ─────────────────────────────────────────────────
     // One call when the dialog opens. The backend creates the conversation and hands
     // back the greeting to show as the first assistant bubble.
+
+    // ── The first bubble, with nothing in front of it ──────────────────────
+    // Copies of the backend's WELCOME_MESSAGES, rendered with NO network call, so the
+    // greeting is on screen immediately — including while Cloud Run is still cold-
+    // starting, when no endpoint can answer at all. That is the whole point: only text
+    // the page already has can appear before the container has booted.
+    //
+    // /start is then free to take as long as it needs. It reverse-geocodes the fix,
+    // reads the rental rate card (with retries, if that backend is slow) and writes a
+    // session to Firestore before it can reply — and none of that work changes this
+    // text, so waiting for it to render the first bubble was three round trips spent
+    // on a string that was already known.
+    //
+    // GET /v1/chat/{persona}/greeting serves these same strings and is the canonical
+    // source; `checkGreetingDrift()` compares the two and complains in the console
+    // rather than letting a stale copy here quietly disagree with the backend.
+    const GREETINGS = {
+      "local": "नमस्ते! Him Cab में आपका स्वागत है 🙏 मैं आपकी हिमाचल यात्रा की योजना बनाने में मदद कर सकता हूँ। आप कहाँ जाना चाहते हैं?",
+      "outstation": "Welcome to Him Cab! 🙏 I can help you plan your trip to Himachal Pradesh. Where would you like to go?",
+      "rental": "Welcome to Him Cab! 🙏 I can arrange a car and driver by the hour. How long do you need the car for?"
+    };
+
+    let $greetingBubble = null;   // held so the bubble can be upgraded in place
+    let $greetingCol    = null;   // …and so later cards attach to the same message
+    let greetingShown   = "";
+
+    function renderBundledGreeting(persona) {
+      greetingShown = GREETINGS[persona] || GREETINGS.outstation;
+      const made = addMessage("assistant", greetingShown);
+      // addMessage returns a bare bubble on one page and an object on the others.
+      $greetingBubble = made.bubble || made;
+      $greetingCol    = made.col || null;
+      return { bubble: $greetingBubble, col: $greetingCol };
+    }
+
+    // Replace the bundled text once the server's own greeting arrives — but only when
+    // it actually differs. For local and outstation it will not, so the bubble never
+    // flickers; for rental it will, because /start names the real hourly packages,
+    // which is a better question than the open one shown first.
+    function reconcileGreeting(serverText) {
+      if (!serverText || !$greetingBubble) return null;
+      if (serverText !== greetingShown) {
+        $greetingBubble.innerHTML = marked.parse(serverText);
+        greetingShown = serverText;
+      }
+      return $greetingCol;
+    }
+
+    // A bundled copy that has drifted shows the rider one greeting and then swaps it
+    // for another a second later, which is worse than the slow version this replaces.
+    // Cheap, unauthenticated, and never blocks anything.
+    async function checkGreetingDrift(persona) {
+      try {
+        const res = await fetch(`${API_BASE}/v1/chat/${persona}/greeting`);
+        if (!res.ok) return;
+        const { message } = await res.json();
+        if (message && message !== GREETINGS[persona]) {
+          console.warn(
+            `[greeting] The bundled copy for "${persona}" no longer matches the ` +
+            `backend. Update GREETINGS in this file.`, { bundled: GREETINGS[persona], backend: message }
+          );
+        }
+      } catch (_) { /* a drift check must never affect the page */ }
+    }
+
     async function startChat() {
       try {
         const query = new URLSearchParams(fixParams()).toString();
@@ -743,7 +840,7 @@
           ? `${place} · ${PERSONA}`
           : `#${data.session_id.slice(0, 8)}`;
         setStatus(true);
-        addMessage("assistant", data.message);
+        reconcileGreeting(data.message);
         return true;
       } catch (e) {
         showError("Could not start chat: " + e.message);
@@ -912,6 +1009,46 @@
         `;
         col.appendChild(card);
 
+      } else if (type === "change_confirmation" || type === "change_options") {
+        // A detail the rider is changing mid-conversation. `change_confirmation` names
+        // BOTH sides of each field and waits for a yes — nothing has moved yet when
+        // this arrives. `change_options` lists what we hold, for them to pick from.
+        // Rendered as taps because that is how the app should do it; the reply text
+        // carries the same question for any client that draws no cards.
+        const confirming = type === "change_confirmation";
+        const rows = (confirming ? payload.changes : payload.fields) || [];
+        const card = document.createElement("div");
+        card.className = "event-card";
+        card.innerHTML = `
+          <div class="event-card-header">
+            <span class="event-card-icon">✏️</span>
+            <span class="event-card-title">${confirming ? "Confirm this change" : "What would you like to change?"}</span>
+          </div>
+          <div class="event-card-body">
+            ${rows.map(r => `<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0">
+              <span style="opacity:.7">${r.label}</span>
+              <strong>${confirming ? `${r.current} → ${r.proposed}` : r.current}</strong>
+            </div>`).join("")}
+          </div>
+        `;
+        if (confirming) {
+          const actions = document.createElement("div");
+          actions.className = "event-card-body";
+          actions.style.display = "flex";
+          actions.style.gap = "8px";
+          [["Yes, update", "haan"], ["No, keep it", "nahi"]].forEach(([label, reply]) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.style.cssText =
+              "flex:1;padding:8px;border-radius:8px;border:1px solid #c9d2e0;cursor:pointer";
+            button.onclick = () => sendMessage(reply);
+            actions.appendChild(button);
+          });
+          card.appendChild(actions);
+        }
+        col.appendChild(card);
+
       } else if (type !== "") {
         // Generic fallback card
         const card = document.createElement("div");
@@ -967,6 +1104,7 @@
         col    = refs.col;
         bubble.parentElement.parentElement.style.display = "none"; // hide row until first token
         let firstToken = true;
+        const seenEvents = [];
 
         while (true) {
           const { value, done } = await reader.read();
@@ -995,10 +1133,14 @@
                   bubble.innerHTML = marked.parse(fullText);
                   scrollBottom();
                 } else if (eventType === "structured") {
+                  seenEvents.push(data);
                   buildEventCard(data, col);
                   scrollBottom();
                 } else if (eventType === "done") {
                   nodeTrace = data.node_trace || [];
+                  // Evaluated at the end of the turn, not per event: "no cab_fare
+                  // arrived" is only knowable once they have all arrived.
+                  noticeIfNoFare(seenEvents);
                 } else if (eventType === "error") {
                   showError(data.message || "Error");
                 }
@@ -1032,6 +1174,7 @@
       $messages.innerHTML = "";
       $welcome.style.display = "flex";
       $sessionInfo.textContent = "";
+      renderBundledGreeting(PERSONA);
       await startChat();
       $input.focus();
     });
@@ -1047,9 +1190,11 @@
     // Locate first, then greet: the persona (and the greeting's language) depends on
     // which side of the state line the rider is on.
     (async () => {
+      renderBundledGreeting(PERSONA);   // instant, no network
+      $input.focus();                   // and they can type straight away
       await resolvePersona();
       await startChat();
-      $input.focus();
+      checkGreetingDrift(PERSONA);
     })();
   </script>
 </body>
