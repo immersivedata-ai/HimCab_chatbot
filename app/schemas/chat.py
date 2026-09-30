@@ -100,6 +100,9 @@ class StructuredEventType(str, Enum):
     #: The rider asked to change something without saying what. Payload:
     #: {fields: [{field, label, current}]} — the details we hold, to pick from.
     CHANGE_OPTIONS = "change_options"
+    #: The question in flight wants one date or one small number, so the app can offer
+    #: a calendar / number picker instead of the keyboard. Payload: see StructuredEvent.
+    INPUT_REQUEST = "input_request"
 
 
 class StructuredEvent(BaseModel):
@@ -195,6 +198,14 @@ class StructuredEvent(BaseModel):
                            the backend starts that flow and returns its greeting. Carried
                            on GET /v1/chat/flows and never mid-turn today, but shaped as a
                            structured event so the same card-rendering code handles it.
+      - `input_request`  → the question just asked wants a single date or a single
+                           number: {field, kind: "date"} or {field, kind: "number", min,
+                           max, unit}. `field` is "travel_dates", "group_size" or
+                           "duration_days". Offer a calendar (no past days) or a min..max
+                           number picker beside the reply, and send the pick back as an
+                           ordinary message — "25-09-2026" for a date, the bare number
+                           ("4") for a number. Typing stays allowed; the picker is only a
+                           shortcut. Sent only on the asking turn, never on an answer.
 
     Zero or more events accompany any reply; clarification turns carry none.
     """
