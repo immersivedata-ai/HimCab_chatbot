@@ -792,16 +792,14 @@
         ));
 
       } else if (type === "booking_handoff") {
-        // A rental handoff carries a pickup and a duration, and the drop when the
-        // rider named one — `destination` is null when they did not.
+        // A rental handoff carries a pickup and a duration; `destination` is null by
+        // design — the rider decides where to go once the car is theirs.
         const o = p.origin || {};
-        const d = p.destination || {};
         col.appendChild(card(
           "card-booking", "🚕", "Open booking screen", p.trip_type,
           kv([
             ["Pickup",     o.name],
             ["Pin",        o.lat != null ? `${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}` : null],
-            ["Drop",       d.name],
             ["Hours",      p.rental_hours],
             ["Included",   p.included_km ? `${Math.round(p.included_km)} km` : null],
             ["Passengers", p.passengers],

@@ -44,7 +44,9 @@ ESTIMATE = {"data": [
     {"categoryId": 4, "name": "Tempo Traveller", "totalFare": 5200, "seatCapacity": "12"},
 ]}
 
-#: The rider's own sentence, drop included — every flow asks for a pickup and a drop.
+#: The rider's own sentence. It names a drop, which a rental does not take (it has only a
+#: pickup, a 2026-09-30 decision) — the model reads it anyway, as it does in production,
+#: so this also proves the drop never reaches the booking screen.
 FIRST_MESSAGE = (
     "I need a car for 8 hours from Shimla tomorrow at 9 am, we are 5 people, "
     "drop at Kufri"
@@ -141,9 +143,9 @@ class TestTakingTheRecommendationIsAnAnswer:
         assert handoff["pickup_time"] == "09:00"
         assert handoff["travel_dates"] == TOMORROW
         assert handoff["origin"]["lat"] and handoff["origin"]["lon"]
-        # The drop the rider named, pinned — every flow asks for one since 2026-09-29.
-        assert handoff["destination"]["name"] == "Kufri"
-        assert handoff["destination"]["lat"] and handoff["destination"]["lon"]
+        # A rental has one place. The drop they named is not carried: the Rent a Car
+        # screen has no field for it.
+        assert handoff["destination"] is None
         # The choice is stored, so the next turn is still booking the same cab.
         assert chat.entities.cab_category == "suv"
 

@@ -805,50 +805,6 @@ def accepts_recommendation(text: str) -> bool:
     return any(t in _ACCEPT_STRONG for t in tokens)
 
 
-#: A rental's drop answered by pointing back at the pickup: "same place", "wahi",
-#: "pickup wali jagah", "wapas yahin", "वहीं". An hourly hire often ends where it
-#: began, and without this each of those replies read as a place we could not parse —
-#: the rider was told we had not understood them, and then the drop was left out.
-_SAME_AS_PICKUP_STRONG = frozenset({
-    "same", "wahi", "vahi", "wohi", "wahin", "vahin", "usi", "pickup", "wapas",
-    "vapas", "back", "return", "here", "yahin", "yahi",
-    "वही", "वहीं", "उसी", "पिकअप", "वापस", "यहीं",
-})
-_SAME_AS_PICKUP_FILLER = frozenset({
-    "place", "location", "jagah", "as", "the", "se", "par", "pe", "hi", "wali", "wala",
-    "vali", "vala", "point", "to", "at", "on", "drop", "kar", "karo", "do", "dena",
-    "dijiye", "please", "me", "us", "is", "it", "spot",
-    "जगह", "वाली", "वाला", "पर", "पे", "से", "ही", "ड्रॉप", "कर", "दो", "दीजिए",
-})
-
-
-def means_same_as_pickup(text: str) -> bool:
-    """True when a reply to the drop question means "where you picked me up".
-
-    Every word must be same-place vocabulary or filler, and one must actually point
-    back — "back to Shimla" names a place and goes to the place reader instead.
-    """
-    low = (text or "").strip().lower()
-    if not low or _looks_like_a_question(low):
-        return False
-    tokens = _ACCEPT_TOKEN_RE.findall(low)
-    if not tokens or len(tokens) > 6:
-        return False
-    if any(t not in _SAME_AS_PICKUP_STRONG and t not in _SAME_AS_PICKUP_FILLER for t in tokens):
-        return False
-    return any(t in _SAME_AS_PICKUP_STRONG for t in tokens)
-
-
-#: Words that mark a message as being ABOUT the drop. A rental keeps a destination the
-#: extraction model reports only from a turn that was — see `planner._strip_trip_fields`.
-_DROP_WORDS = frozenset({"drop", "dropped", "dropoff", "ड्रॉप"})
-
-
-def mentions_drop(text: str) -> bool:
-    """True when the message talks about where the car should drop them."""
-    return any(t in _DROP_WORDS for t in _ACCEPT_TOKEN_RE.findall((text or "").lower()))
-
-
 # ── Reading a whole sentence (rental flow) ────────────────────────────────────
 # The parsers above read a REPLY to a question. This reads a SENTENCE — "I need a car
 # tomorrow at 9 am from Shimla for 8 hours, 4 of us" — which is what riders actually
@@ -1122,10 +1078,11 @@ _PICKUP_MARKER_RES = (
     ),
 )
 
-#: A rental's DROP, read from a sentence. Every flow asks for a pickup and a drop since
-#: 2026-09-29, and a rental sentence now carries both: "8 hours from Shimla, drop at
-#: Kufri". Without this the drop was the one detail the code could not read, so with
-#: Vertex down the rider who had said it was asked for it anyway (§2).
+#: A DROP, read from a sentence. The local and outstation flows ask for a pickup and a
+#: drop since 2026-09-29, and riders answer in those words: "Shimla se pickup, drop at
+#: Manali". Without this the drop was the one detail the code could not read, so with
+#: Vertex down the rider who had said it was asked for it anyway (§2). Not read on a
+#: rental, which has only a pickup — see `_RENTAL_NEEDS`.
 #:
 #: Narrow on purpose. The place AFTER "drop" ("drop at Kufri", "drop me at Kufri", "drop
 #: location Kufri"), or a place that STARTS a clause before it ("Kufri drop kar dena",
@@ -1402,11 +1359,9 @@ def read_rental_details(text: str) -> dict[str, Any]:
     if place:
         found["origin"] = place
 
-    # The drop, when the sentence marks one — see `_DROP_MARKER_RES`. A drop that came
-    # out equal to the pickup is the pickup read twice, not a drop.
-    drop = _place_beside_marker(clauses, _DROP_MARKER_RES, _PLACE_STOP_WORDS)
-    if drop and drop != found.get("origin"):
-        found["destination"] = drop
+    # No drop is read: a rental has only a pickup (see `_RENTAL_NEEDS`). The clause
+    # break above still matters — it stops "pickup Shimla drop Kufri" reading as the
+    # one pickup "Shimla Drop Kufri".
 
     cab = parse_cab_category(text)
     if cab:
@@ -2031,13 +1986,13 @@ _RIDE_NEEDS: dict[str, Need] = {
 _RENTAL_NEEDS: dict[str, Need] = {
     SlotName.RENTAL_HOURS: Need.REQUIRED,
     SlotName.ORIGIN: Need.REQUIRED,
-    # The drop — where the hire ends — asked right after the pickup, like every flow
-    # (a 2026-09-29 decision; a rental used to have no drop at all). IMPORTANT, never
-    # REQUIRED: plenty of hires end wherever the day ends, so a rider who does not say
-    # still reaches the booking screen, and "same place" is read as the pickup
-    # (`means_same_as_pickup`). Only a drop the rider actually named is kept — see
-    # `planner._strip_trip_fields`.
-    SlotName.DESTINATION: Need.IMPORTANT,
+    # A rental has ONE place: where the car comes to. It was asked for a drop as well
+    # from 2026-09-29, like every other flow, and on 2026-09-30 that was reversed: the
+    # chat put a second location search card under "Where should we drop you?", the
+    # app's Rent a Car screen has no drop field to fill, and a rider hiring by the
+    # hour has no drop to give. UNUSED, so `decide` never asks it, and the planner
+    # strips any drop the model reads — see `planner._NOT_IN_A_RENTAL`.
+    SlotName.DESTINATION: Need.UNUSED,
     # The day and the hour are two questions, not one. `travel_dates` takes "tomorrow";
     # `pickup_time` takes the clock time the car should arrive, which the backend reads
     # as `bookingTime` and applies the night rate from. Without it the quote stood on

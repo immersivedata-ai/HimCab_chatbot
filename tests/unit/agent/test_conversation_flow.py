@@ -205,28 +205,23 @@ class TestQuestionsDoNotHijackAnswers:
 
 class TestARentalSentenceIsUnderstood:
 
-    # Every one of these sentences names a drop: every flow asks for a pickup AND a drop
-    # since 2026-09-29, so a sentence without one is rightly asked for it.
     @pytest.mark.asyncio
     async def test_one_sentence_is_enough_to_reach_a_quote(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
-            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us, drop at Kufri",
-            NOTHING,
+            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
         )
 
         assert turn.produced, "asked a question about details the sentence had given"
         assert chat.questions_asked == 0
         assert (chat.entities.rental_hours, chat.entities.origin) == (8, "Shimla")
-        assert chat.entities.destination == "Kufri"
         assert chat.entities.pickup_time == "09:00"
 
     @pytest.mark.asyncio
     async def test_the_same_sentence_in_hinglish(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
-            "Kal subah 6 baje Manali se gaadi chahiye 4 ghante ke liye, hum 4 hain, "
-            "Kullu pe drop",
+            "Kal subah 6 baje Manali se gaadi chahiye 4 ghante ke liye, hum 4 hain",
             NOTHING,
         )
 
@@ -234,43 +229,42 @@ class TestARentalSentenceIsUnderstood:
         assert chat.entities.rental_hours == 4
         assert chat.entities.pickup_time == "06:00"
         assert chat.entities.origin == "Manali"
-        assert chat.entities.destination == "Kullu"
 
     @pytest.mark.asyncio
     async def test_a_sentence_is_still_understood_when_vertex_is_down(self):
+        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
+        turn = await chat.say("4 hrs from Kullu tomorrow at 10 am, 2 of us", None)
+
+        assert turn.produced
+        assert chat.entities.rental_hours == 4
+        assert chat.entities.origin == "Kullu"
+
+    @pytest.mark.asyncio
+    async def test_a_sentence_that_also_names_a_drop_still_reaches_the_quote(self):
+        """A rental has only a pickup (2026-09-30). A rider who names a drop anyway is
+        not asked about it, and it is not kept — the drop is not the pickup either."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         turn = await chat.say(
             "4 hrs from Kullu tomorrow at 10 am, 2 of us, drop at Manali", None
         )
 
         assert turn.produced
-        assert chat.entities.rental_hours == 4
         assert chat.entities.origin == "Kullu"
-        assert chat.entities.destination == "Manali"
+        assert chat.entities.destination is None
 
     @pytest.mark.asyncio
-    async def test_a_sentence_without_a_drop_is_asked_for_one(self):
-        chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        turn = await chat.say(
-            "I need a car for 8 hours from Shimla tomorrow at 9 am, 4 of us", NOTHING
-        )
-
-        assert turn.asked
-        assert turn.result["last_asked_field"] == "destination"
-        assert "ड्रॉप" in turn.question or "drop" in turn.question
-
-    @pytest.mark.asyncio
-    async def test_a_rental_is_asked_for_a_drop_only_after_the_pickup_and_never_for_days(self):
+    async def test_a_rental_is_asked_for_the_pickup_and_never_for_a_drop_or_days(self):
         """The reported reply was a car-by-the-hour answered with "how many days?". A
-        rental has no trip length; it does have a drop now, asked after the pickup."""
+        rental has no trip length and no drop: one place, where the car comes to."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         await chat.say("I need a car", NOTHING)
         await chat.say("8 hours", NOTHING)
         await chat.say("Shimla", NOTHING)
 
         asked = [t.result["last_asked_field"] for t in chat.turns]
+        assert "origin" in asked
         assert "duration_days" not in asked
-        assert asked.index("origin") < asked.index("destination")
+        assert "destination" not in asked
 
     @pytest.mark.asyncio
     async def test_a_partial_sentence_asks_only_for_what_is_missing(self):

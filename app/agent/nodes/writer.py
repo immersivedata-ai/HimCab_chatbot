@@ -611,14 +611,12 @@ def _build_booking_handoff(state: AgentState) -> Optional[dict]:
         # Coordinates when the pickup could be placed, so the map opens on the point we
         # priced; the bare name when it could not, so the app can geocode it itself.
         origin_pin = state.pickup or {"name": pickup_name}
-        drop_name = state.entities.destination
         return {
             "trip_type": TripType.RENTAL,
             "origin": origin_pin,
-            # The drop, when the rider named one (every flow asks for it since
-            # 2026-09-29) — pinned when it could be placed, by name when it could not.
-            # Null when they gave none: the hire ends wherever the day does.
-            "destination": state.drop or ({"name": drop_name} if drop_name else None),
+            # A rental has no drop — the rider decides where to go once the car is
+            # theirs, and the Rent a Car screen has only a pickup to fill.
+            "destination": None,
             "rental_hours": state.entities.rental_hours,
             "included_km": fare.get("included_km"),
             # True when `recommended_category_*` is the rider's own pick rather than our
@@ -1051,9 +1049,10 @@ def _build_system_prompt(state: AgentState) -> str:
         # A turn with no bookable duration is a QUESTION; only a chosen one confirms.
         forbidden_step = (
             "FORBIDDEN — do not write any of these, in any wording: a day-by-day plan, "
-            "sightseeing or things-to-do suggestions, a drop point other than the one "
-            "in TRIP below, a route, a distance between two towns, a drive time, hotel "
-            "or food advice, or any JSON. They are hiring a car by the hour."
+            "sightseeing or things-to-do suggestions, a destination or drop-off point, "
+            "a route, a distance between two towns, a drive time, hotel or food advice, "
+            "or any JSON. They are hiring a car by the hour and have not said where "
+            "they are going."
         )
 
         if not _rental_duration_chosen(state):
@@ -1087,8 +1086,7 @@ def _build_system_prompt(state: AgentState) -> str:
                 "Him Cab in the third person — 'we'll have the car with you' reads like "
                 "a person, 'Him Cab is ready to provide' reads like a form letter.",
                 "Line 1: confirm what they are getting in one natural sentence — the "
-                "package, the pickup, the drop if TRIP gives one, and when. Do not "
-                "describe WHO is travelling "
+                "package, the pickup and when. Do not describe WHO is travelling "
                 "('your family', 'your group of 4') unless the party is stated below; "
                 "a headcount nobody gave you is still an invention.",
                 "Then EXACTLY these bullets, in this order, and NOTHING else. Each is "
@@ -1289,21 +1287,13 @@ NOTE: every activity "type" must be exactly one of: {activity_types} — never a
     # which is an invitation to write about a place in a reply whose whole job is a car,
     # a duration and a price. Worse, when the extractor had picked a place up in passing
     # ("a car for 8 hours around Manali"), the line named it as the trip's destination.
-    # The DROP is stated only as the rider gave it (the planner keeps no other), and
-    # as a drop — the end of the hire — never as somewhere to plan a visit to.
     if mode == slots.RENTAL_MODE:
-        drop = entities.destination
         trip_facts = [
             f"- Pickup: {origin_display}",
-            (
-                f"- Drop: {drop} — where the hire ends. Say it back; describe nothing there."
-                if drop
-                else "- Drop: not stated — do not name one."
-            ),
             f"- Date: {entities.travel_dates or 'not stated — do not name a date'}",
             f"- Pickup time: {entities.pickup_time or 'not stated — do not state a time'}",
-            "- There is NO trip length. They are hiring a car by the hour; where they "
-            "go in between is their business and they need not have decided.",
+            "- There is NO destination and NO trip length. They are hiring a car by the "
+            "hour; where they go is their business and they need not have decided.",
         ]
         if entities.group_size:
             trip_facts.insert(1, f"- Party: {entities.group_size} people")

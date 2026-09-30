@@ -138,9 +138,6 @@ class AgentState(BaseModel):
     #: the hour has no route to measure, so there is no `route_estimate` to carry the
     #: pin, and the booking screen still has to open its map somewhere.
     pickup: Optional[dict] = None
-    #: Where the hire ends, as {name, lat, lon} — rental flow only, and only when the
-    #: rider named a drop. The same map needs it; the price does not depend on it.
-    drop: Optional[dict] = None
     #: Rental blocks from the rate card ({hours, included_km, label}), rental flow only.
     #: The reply offers exactly these, because the backend matches a duration against
     #: them exactly — see app/integrations/himcab/rental_service.py.

@@ -1,15 +1,17 @@
 """
-Every flow asks for a pickup and a drop.
+Every flow asks for a pickup in the same words; the trip flows ask for a drop too.
 
 A 2026-09-29 decision. The local flow used to ask "आप किस शहर में रहते हैं?" — where the
 rider LIVES — when the booking needs where the cab should come; the outstation flow
-asked which city they were travelling from, the rental where the car should pick them
-up, and a rental had no drop at all. Now there is one pickup question and one drop
-question, in every flow.
+asked which city they were travelling from, and the rental where the car should pick
+them up. Now there is one pickup question and one drop question.
+
+A rental asks only the pickup (2026-09-30). For one day it asked for a drop as well, and
+the chat showed a second location search card under the pickup's — for a hire by the
+hour, which has no drop, on a Rent a Car screen with no drop field.
 
 Asking in those words changes what riders type back, so this also covers the readers:
-"Manali drop kar do", "Shimla se pickup", "yahin se", and — for a rental, whose hire
-often ends where it began — "same place".
+"Manali drop kar do", "Shimla se pickup", "yahin se".
 """
 
 from unittest.mock import patch
@@ -37,10 +39,13 @@ DROP_HI = "आपको कहाँ ड्रॉप करना है?"
 
 class TestTheQuestions:
     @pytest.mark.parametrize("flow", [slots.LOCAL, slots.OUTSTATION, slots.RENTAL])
-    def test_every_flow_asks_for_the_pickup_and_the_drop_in_the_same_words(self, flow):
+    def test_every_flow_asks_for_the_pickup_in_the_same_words(self, flow):
         assert slots.SLOTS["origin"].ask("hi", flow, 0) == PICKUP_HI
-        assert slots.SLOTS["destination"].ask("hi", flow, 0) == DROP_HI
         assert slots.SLOTS["origin"].ask("en", flow, 0) == "Where should we pick you up?"
+
+    @pytest.mark.parametrize("flow", [slots.LOCAL, slots.OUTSTATION])
+    def test_the_trip_flows_ask_for_the_drop_in_the_same_words(self, flow):
+        assert slots.SLOTS["destination"].ask("hi", flow, 0) == DROP_HI
         assert slots.SLOTS["destination"].ask("en", flow, 0) == "Where should we drop you?"
 
     def test_nobody_is_asked_where_they_live_any_more(self):
@@ -127,46 +132,51 @@ class TestThePickupAnsweredWithHere:
         assert turn.asked and turn.result["last_asked_field"] == "origin"
 
 
-class TestARentalDrop:
-    @pytest.mark.parametrize("reply", ["same place", "wahi", "pickup wali jagah", "वहीं"])
-    def test_same_place_means_the_pickup(self, reply):
-        assert slots.means_same_as_pickup(reply)
+class TestARentalHasOnlyAPickup:
+    """One location for a car hired by the hour: where it comes to. The app draws a
+    location search card for every place question, so asking a rental for a drop put a
+    second search box on screen for a detail the Rent a Car screen does not take."""
 
-    @pytest.mark.parametrize("reply", ["back to Shimla", "Kufri", "is it the same?", ""])
-    def test_a_place_or_a_question_does_not(self, reply):
-        assert not slots.means_same_as_pickup(reply)
+    def test_the_drop_is_never_asked(self):
+        assert slots.needs_for("rental_query")["destination"] is slots.Need.UNUSED
+        assert slots.needs_for("plan_trip", slots.RENTAL)["destination"] is slots.Need.UNUSED
 
     @pytest.mark.asyncio
-    async def test_it_is_asked_after_the_pickup(self):
+    async def test_the_pickup_is_followed_by_the_day_not_a_drop(self):
+        """The reported conversation: 4 hours, "my current location", then "Where
+        should we drop you?" and a second search card. The day comes next instead."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         await chat.say("8 hours", NOTHING)
         turn = await chat.say("Shimla", NOTHING)
 
-        assert turn.result["last_asked_field"] == "destination"
-        assert turn.question in (DROP_HI, "Where should we drop you?")
+        assert turn.asked
+        assert turn.result["last_asked_field"] == "travel_dates"
+        assert turn.question not in (DROP_HI, "Where should we drop you?")
 
     @pytest.mark.asyncio
-    async def test_same_place_as_the_answer_drops_them_at_the_pickup(self):
+    async def test_no_rental_question_is_ever_the_drop(self):
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        await chat.say("8 hours", NOTHING)
-        await chat.say("Shimla", NOTHING)
-        await chat.say("same place", NOTHING)
-
-        assert chat.entities.destination == "Shimla"
+        asked = []
+        for reply in ("8 hours", "Shimla", "tomorrow", "9 am", "4"):
+            turn = await chat.say(reply, NOTHING)
+            if turn.asked:
+                asked.append(turn.result["last_asked_field"])
+        assert "destination" not in asked
 
     @pytest.mark.asyncio
-    async def test_a_drop_the_model_reads_off_the_drop_question_is_kept(self):
+    async def test_a_drop_the_rider_volunteers_is_not_kept(self):
+        """Nothing downstream has a use for it: no question, no price, no field on the
+        booking screen. Kept, it would only be said back as a place they are going."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
-        await chat.say("8 hours", NOTHING)
-        await chat.say("Shimla", NOTHING)
-        await chat.say("Kufri please", extraction(destination="Kufri"))
+        await chat.say("8 hours from Shimla, drop at Kufri",
+                       extraction(rental_hours=8, origin="Shimla", destination="Kufri"))
 
-        assert chat.entities.destination == "Kufri"
+        assert chat.entities.origin == "Shimla"
+        assert chat.entities.destination is None
 
     @pytest.mark.asyncio
-    async def test_a_place_mentioned_in_passing_is_still_not_a_drop(self):
-        """The reason the model's rental destination is not trusted on its own: "around
-        Manali" is where the car is driven about, not where the hire ends."""
+    async def test_a_place_mentioned_in_passing_is_still_not_a_destination(self):
+        """"Around Manali" is where the car is driven about, not a trip to plan."""
         chat = Conversation(persona=slots.RENTAL, intent="rental_query")
         await chat.say("a car for 8 hours around Manali",
                        extraction(rental_hours=8, destination="Manali"))
@@ -175,19 +185,23 @@ class TestARentalDrop:
 
 
 class TestTheSentenceReaders:
-    @pytest.mark.parametrize("text,origin,drop", [
-        ("8 hours from Shimla, drop at Kufri", "Shimla", "Kufri"),
-        ("8 hours from Shimla drop me at Kufri", "Shimla", "Kufri"),
-        ("pickup Shimla drop Kufri", "Shimla", "Kufri"),
-        ("Shimla se 8 ghante, Kufri pe drop", "Shimla", "Kufri"),
+    @pytest.mark.parametrize("text", [
+        "8 hours from Shimla, drop at Kufri",
+        "8 hours from Shimla drop me at Kufri",
+        "pickup Shimla drop Kufri",
+        "Shimla se 8 ghante, Kufri pe drop",
     ])
-    def test_a_rental_sentence_yields_both_ends(self, text, origin, drop):
+    def test_a_rental_sentence_yields_the_pickup_and_no_drop(self, text):
+        """A rental has one place. The drop is not read — and, the part that matters,
+        it does not leak into the pickup: "pickup Shimla drop Kufri" is not the pickup
+        "Shimla Drop Kufri"."""
         found = slots.read_rental_details(text)
-        assert (found.get("origin"), found.get("destination")) == (origin, drop)
+        assert found.get("origin") == "Shimla"
+        assert "destination" not in found
 
-    def test_a_drop_verb_is_not_read_as_the_place(self):
-        """"Kufri drop kar dena" once came back as the drop "Kar Dena"."""
-        assert slots.read_rental_details("Kufri drop kar dena").get("destination") == "Kufri"
+    def test_a_drop_alone_fills_nothing(self):
+        """"Kufri drop kar dena" is not a pickup either — nothing says the car comes there."""
+        assert slots.read_rental_details("Kufri drop kar dena") == {}
 
     def test_an_ambiguous_run_of_names_is_read_as_nothing(self):
         """"from Shimla Kufri drop": nothing says which word is the drop, so neither end

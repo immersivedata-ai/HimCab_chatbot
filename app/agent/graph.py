@@ -197,7 +197,6 @@ async def cancel_node(state: AgentState) -> dict:
         "offers": [],
         "route_estimate": None,
         "pickup": None,
-        "drop": None,
         "rental_packages": [],
         "awaiting_cab_choice": False,
         "unavailable_cab_category": None,

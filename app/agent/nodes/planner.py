@@ -370,17 +370,15 @@ MERGING (the conversation is multi-turn):
   a known value with null, and never overwrite one unless the user has just changed it.
 
 A RENTAL CONVERSATION (the request says so above) IS NOT A TRIP:
-- The rider is hiring a car and a driver BY THE HOUR. They have no trip length in days
-  and no itinerary, and they are not expected to have one.
-- duration_days is ALWAYS null here, however the message is phrased.
-- destination is the DROP — where the car leaves them when the hire ends — and ONLY
-  when they said so: "drop me at Kufri", "Kufri drop", or a place given in answer to
-  "Where should we drop you?". "A car for 8 hours around Manali" is rental_hours=8 with
-  destination null — Manali is where the car will be driven about, not a drop.
+- The rider is hiring a car and a driver BY THE HOUR. They have no destination, no drop,
+  no trip length in days and no itinerary, and they are not expected to have one.
+- destination and duration_days are ALWAYS null here, however the message is phrased.
+  "A car for 8 hours around Manali" is rental_hours=8 with destination null — Manali is
+  where the car will be driven about, not a trip they asked you to plan.
 - A place they name is the PICKUP (`origin`) only when they said so: "from Shimla",
   "pick me up in Kullu", "Mandi se". A place mentioned any other way fills nothing.
-- What matters is exactly what their booking screen asks for: the duration, the pickup,
-  the drop, the date, the clock time and which cab. Nothing else.
+- What matters is exactly what their booking screen asks for: the duration, the pickup
+  address, the date, the clock time and which cab. Nothing else.
 
 NEVER INVENT:
 - Every field the user has not stated is null. Not a plausible guess, not a common
@@ -419,31 +417,22 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
 
 
 #: Trip-shaped fields that CANNOT exist in a rental conversation. The extraction model
-#: still reports them, and every one of them then leaks somewhere it does not belong:
+#: still reports them — "a car for 8 hours around Manali" reliably comes back with
+#: destination="Manali" — and every one of them then leaks somewhere it does not belong:
 #: into the writer's TRIP block, into the itinerary shortcut in `route_after_router`.
 #: So these are dropped at the door rather than guarded against one consumer at a time.
-_NOT_IN_A_RENTAL = ("duration_days", "return_journey_preference")
+#:
+#: The destination is here because a rental has one place, the pickup (a 2026-09-30
+#: decision). For one day it was kept as the rental's DROP, and the chat showed a second
+#: location search card for it — see `slots._RENTAL_NEEDS`.
+_NOT_IN_A_RENTAL = ("destination", "duration_days", "return_journey_preference")
 
 
-def _strip_trip_fields(
-    merged: dict, *, stored: dict, about_the_drop: bool, session_id: str
-) -> None:
-    """Remove trip-only facts from a rental conversation's entities (mutates).
-
-    The destination is the rental's DROP now (a 2026-09-29 decision — every flow asks
-    for a pickup and a drop), so it is no longer stripped outright. But the model's
-    reading of it is still not trusted on its own: "a car for 8 hours around Manali"
-    reliably comes back with destination="Manali", which is where the car will be
-    driven about, not where the hire ends. A drop is kept from the session as it was,
-    or from a turn that was ABOUT the drop — an answer to "Where should we drop you?",
-    or a message that says "drop". Anything else the model put there is put back.
-    """
+def _strip_trip_fields(merged: dict, session_id: str) -> None:
+    """Remove trip-only facts from a rental conversation's entities (mutates)."""
     dropped = [f for f in _NOT_IN_A_RENTAL if merged.get(f) is not None]
     for field in dropped:
         merged.pop(field, None)
-    if not about_the_drop and merged.get("destination") != stored.get("destination"):
-        merged["destination"] = stored.get("destination")
-        dropped.append("destination")
     if dropped:
         log.info("rental_trip_fields_dropped", fields=dropped, session_id=session_id)
 
@@ -1021,14 +1010,7 @@ Report what the user has stated. Use null for anything they have not."""
         merged.update(confirmed_changes)
 
     if is_rental:
-        _strip_trip_fields(
-            merged,
-            stored=existing_entities,
-            about_the_drop=(
-                previously_asked == SlotName.DESTINATION or slots.mentions_drop(latest_text)
-            ),
-            session_id=state.session_id,
-        )
+        _strip_trip_fields(merged, state.session_id)
 
     # ── Visitor classification (code, from what they told us) ─────────────────
     # `current` is passed so an in-state ORIGIN cannot promote a visitor to resident;
@@ -1100,22 +1082,6 @@ Report what the user has stated. Use null for anything they have not."""
                 is_precise=bool(fix and fix.is_precise),
                 session_id=state.session_id,
             )
-
-    # ── "Same place" — a rental's drop answered by pointing back at the pickup ─
-    # An hourly hire often ends where it began. Rental-only: on a ride or a trip, a drop
-    # at the pickup is not a journey, so the reply is left for the place reader, which
-    # rejects it and asks again. Keyed on the STORED drop, not `merged`: the model may
-    # already have written "Same Place" there as though it were a town.
-    if (
-        is_rental
-        and latest_text
-        and previously_asked == SlotName.DESTINATION
-        and not existing_entities.get("destination")
-        and merged.get("origin")
-        and slots.means_same_as_pickup(latest_text)
-    ):
-        merged["destination"] = merged["origin"]
-        log.info("rental_drop_same_as_pickup", session_id=state.session_id)
 
     # ── Read the reply as an answer to the question we asked ──────────────────
     # Strictly scoped: only the fields that question covered, only if the reply has

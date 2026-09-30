@@ -294,13 +294,6 @@ async def _rental_tools(state: AgentState) -> dict:
     elif pickup:
         tasks["pickup"] = _safe_call(geo.resolve_pickup(origin_name=pickup), "pickup")
 
-    # The drop pin, when the rider named one — for the booking map, not the price: a
-    # rental is charged on its package and the odometer, never on where it ends.
-    if entities.destination:
-        tasks["drop"] = _safe_call(
-            geo.resolve_pickup(origin_name=entities.destination), "drop"
-        )
-
     # The rate card's own entry for these hours, when we could read one. It carries the
     # included kilometres — what the package COVERS — and nothing else depends on it:
     # the price comes from the backend either way.
@@ -393,7 +386,6 @@ async def _rental_tools(state: AgentState) -> dict:
         "cab_fare": cab_fare,
         "offers": offers,
         "pickup": results.get("pickup"),
-        "drop": results.get("drop"),
         "rental_packages": offered_payload,
         "node_trace": ["tool_executor"],
     }
