@@ -1,9 +1,13 @@
 """The `input_request` card: which questions get a picker, and that a picked answer parses."""
 
+from datetime import date
+
 import pytest
 
-from app.agent import slots
+from app.agent import sanitize, slots
 from app.core.enums import SlotName
+
+TODAY = date(2026, 9, 21)
 
 
 def test_date_question_asks_for_a_calendar():
@@ -31,6 +35,15 @@ def test_other_questions_get_no_picker(field):
 def test_a_picked_date_is_read_as_the_travel_date():
     """The app sends the calendar pick as "25-09-2026"."""
     assert slots.parse_when("25-09-2026") == "25-09-2026"
+
+
+def test_a_picked_date_reaches_the_booking_screen_as_a_date():
+    """The whole point of the picker. `parse_when` keeps the value verbatim and
+    `sanitize` turns it into the ISO date the booking screen renders, so the two must
+    agree on this format: the picked date used to stop at `parse_when` and never get
+    that far."""
+    picked = slots.parse_when("25-09-2026")
+    assert sanitize.travel_date(picked, as_iso=True, today=TODAY) == "2026-09-25"
 
 
 @pytest.mark.parametrize("n", [1, 4, slots.PICKER_MAX])

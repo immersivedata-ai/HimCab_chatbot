@@ -328,8 +328,11 @@ headers), not the browser's native `EventSource`, which cannot send an
 | `error` | `{"code": "...", "message": "..."}` | Error occurred |
 
 Query params: `message` (required), the optional `session_id` described under
-[Pinning a conversation](#pinning-a-conversation), and the optional `lat` / `lon` /
-`accuracy_m` described under [Sending coordinates](#sending-coordinates).
+[Pinning a conversation](#pinning-a-conversation), the optional `lat` / `lon` /
+`accuracy_m` described under [Sending coordinates](#sending-coordinates), and the
+optional `pickup_lat` / `pickup_lon` / `pickup_address` described under
+[Sending a picked pickup](#sending-a-picked-pickup), and the optional `drop_lat` /
+`drop_lon` / `drop_address` described under [Sending a picked drop](#sending-a-picked-drop).
 
 #### 2b. Send a message — non-streaming (fallback)
 ```
@@ -342,7 +345,9 @@ POST /v1/chat/{local|outstation}/message
 ```
 
 `lat`, `lon` and `accuracy_m` are optional — see
-[Sending coordinates](#sending-coordinates).
+[Sending coordinates](#sending-coordinates). So are `pickup_lat`, `pickup_lon` and
+`pickup_address` — see [Sending a picked pickup](#sending-a-picked-pickup) — and
+`drop_lat`, `drop_lon` and `drop_address` — see [Sending a picked drop](#sending-a-picked-drop).
 
 **Response**: `ChatResponse`
 ```json
@@ -481,6 +486,58 @@ Rules the backend applies:
   measure the distance but the assistant asks which city they mean.
 - **Their words beat their phone.** Once the rider names a starting city, that is the
   origin — booking a Delhi pickup from a Shimla sofa is a real thing people do.
+
+#### Sending a picked pickup
+
+When the assistant asks for the pickup, the app's dialog lets the rider search for a place
+or tap "use my current location". Both know the **exact point**. Send it with the message
+that answers the question:
+
+| Field | Required | What it is |
+|---|---|---|
+| `pickup_lat`, `pickup_lon` | yes, together | The point the rider picked: the search result's coordinates, or the device position for "use my current location" |
+| `pickup_address` | no (max 200 chars) | The full address the app showed for it — the search result's full address, or the device geocoder's address line. Omit it, or send "my current location", and the backend names the point itself at street level |
+
+Body fields on `/message`, query params on `/stream`. The `message` text is still required:
+send what the rider would see in the chat ("Hotel Snow View, The Mall, Shimla").
+
+What the backend does with it:
+
+- **The point is the pickup.** The route, the fare and the `booking_handoff` origin use the
+  coordinates as sent — never re-geocoded from a name. `booking_handoff.origin.name` (and a
+  rental's pickup name) is the full address.
+- **The conversation uses a short name** cut from the address at the town, within the
+  usual place limits (60 characters, six words): "Hotel Snow View, The Mall, Shimla".
+- **It never changes which assistant answers.** That is what `lat` / `lon` (where the
+  phone is) do; a picked pickup is only where the car goes, and may be in another state.
+- **It answers the pickup question only.** Sent on a turn where the pickup is already known
+  and was not being asked for, it is ignored — a pickup the rider already gave is changed
+  only by saying so, which is confirmed first.
+- No need to resend it: the point is kept on the conversation for as long as the pickup
+  stays the one they picked.
+
+#### Sending a picked drop
+
+The same, for the drop: when the assistant asks where to drop the rider and they pick a
+place in the app's drop search, send its **exact point** with the message that answers the
+question. Local and outstation chats only — a rental has no drop, and these are ignored there.
+
+| Field | Required | What it is |
+|---|---|---|
+| `drop_lat`, `drop_lon` | yes, together | The point the rider picked: the search result's coordinates |
+| `drop_address` | no (max 200 chars) | The full address the app showed for it. Omit it and the backend names the point itself at street level |
+
+Body fields on `/message`, query params on `/stream`, next to (never instead of) the
+`message` text. What the backend does with it mirrors the pickup:
+
+- **The point is the drop.** The route, the fare and the `booking_handoff` destination use
+  the coordinates as sent; the place is never found again by its name.
+  `booking_handoff.destination.name` is the full address.
+- **The conversation uses a short name** cut from the address, as for the pickup.
+- **The weather line is the drop's town**, since a weather service does not know a hotel.
+- **It answers the drop question only**, and is ignored when the drop is already known and
+  was not being asked for.
+- No need to resend it while the drop stays the one they picked.
 
 #### Pinning a conversation
 

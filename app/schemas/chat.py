@@ -75,6 +75,57 @@ class ChatMessageRequest(BaseModel):
     accuracy_m: Optional[float] = Field(
         default=None, ge=0, description="Optional device-reported accuracy in metres."
     )
+    pickup_lat: Optional[float] = Field(
+        default=None,
+        ge=-90,
+        le=90,
+        description=(
+            "Optional. Latitude of a pickup the rider PICKED in the app — a place-search "
+            "result, or the device position after \"use my current location\". Sent with "
+            "`pickup_lon` on the message that answers the pickup question, it becomes the "
+            "exact pickup point: the route, the fare and the booking pin use it as it is. "
+            "Unlike `lat`, it never changes which assistant answers. Ignored on a turn "
+            "where the pickup is already known and was not being asked for."
+        ),
+    )
+    pickup_lon: Optional[float] = Field(
+        default=None, ge=-180, le=180, description="Optional. See `pickup_lat`."
+    )
+    pickup_address: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Optional. The full address of that pickup, as the app showed it "
+            "(\"Hotel Snow View, The Mall, Shimla, Himachal Pradesh 171001, India\"). "
+            "It labels the pickup on the booking screen; the reply uses a short form of "
+            "it. Omit it for \"use my current location\" and the backend names the point."
+        ),
+    )
+    drop_lat: Optional[float] = Field(
+        default=None,
+        ge=-90,
+        le=90,
+        description=(
+            "Optional. Latitude of a drop the rider PICKED in the app's place search. Sent "
+            "with `drop_lon` on the message that answers the drop question, it becomes the "
+            "exact drop point: the route, the fare and the booking pin use it as it is, "
+            "rather than finding the place again by name. Ignored on the rental chat, "
+            "which has no drop, and on a turn where the drop is already known and was not "
+            "being asked for."
+        ),
+    )
+    drop_lon: Optional[float] = Field(
+        default=None, ge=-180, le=180, description="Optional. See `drop_lat`."
+    )
+    drop_address: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Optional. The full address of that drop, as the app showed it. It labels the "
+            "drop on the booking screen; the reply uses a short form of it. Without it the "
+            "backend names the point."
+        ),
+    )
 
 
 class StructuredEventType(str, Enum):
@@ -161,7 +212,10 @@ class StructuredEvent(BaseModel):
                            the driver.
       - `booking_handoff`→ open the booking screen on this journey. `origin` and
                            `destination` each carry {name, lat, lon} so the map can
-                           drop both pins without geocoding again; plus distance_km,
+                           drop both pins without geocoding again — for an end the
+                           rider picked in the app (`pickup_lat`/`pickup_lon`,
+                           `drop_lat`/`drop_lon`), exactly that point, named by its
+                           full address; plus distance_km,
                            duration_text, passengers, travel_dates, the
                            recommended_category_id to preselect and, when one applies,
                            offer_id / coupon_code to prefill. `trip_type` is the rate

@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.core.logging import get_logger
-from app.domain.location import PRECISE_FIX_KM, RiderLocation
+from app.domain.location import PRECISE_FIX_KM, PickedPlace, RiderLocation
 from app.integrations.external.geocoding import (
     Lookup,
     Place,
@@ -262,6 +262,7 @@ async def resolve_journey(
     *,
     origin_name: Optional[str] = None,
     origin_fix: Optional[LocationFix] = None,
+    destination_fix: Optional[LocationFix] = None,
 ) -> Optional[Journey]:
     """Resolve a journey to `destination`, or None when any part cannot be resolved.
 
@@ -270,31 +271,31 @@ async def resolve_journey(
     is 14 km up the road from Manali, and pricing it as "Manali" quietly drops that leg.
     Falls back to the city they named.
 
-    Both endpoints are geocoded concurrently: they are independent lookups, and a chat
-    turn should not pay for them one after the other.
+    The drop is the point the rider picked (`destination_fix`) when there is one, for
+    the same reason from the other end: finding "Hotel Snow View, The Mall, Manali"
+    again by its name lands on the town centre at best, and somewhere else at worst.
+
+    Whatever is not already a point is geocoded, both ends concurrently: they are
+    independent lookups, and a chat turn should not pay for them one after the other.
     """
     if not destination:
+        return None
+    if origin_fix is None and not origin_name:
         return None
 
     geocoder = get_geocoding_service()
 
-    # A fix is already coordinates — no lookup needed, and its own name is the best
-    # label we have for it.
-    if origin_fix is not None:
-        origin_place: Optional[Place] = Place(
-            name=origin_fix.place_name or (origin_name or "Your location"),
-            lat=origin_fix.lat,
-            lon=origin_fix.lon,
-            state=origin_fix.state,
-        )
-        destination_place = await geocoder.geocode(destination)
-    elif origin_name:
-        origin_place, destination_place = await asyncio.gather(
-            geocoder.geocode(origin_name),
-            geocoder.geocode(destination),
-        )
-    else:
-        return None
+    async def _place(fix: Optional[LocationFix], name: str) -> Optional[Place]:
+        # A fix is already coordinates — no lookup needed, and its own name is the best
+        # label we have for it.
+        if fix is not None:
+            return Place(name=fix.place_name or name, lat=fix.lat, lon=fix.lon, state=fix.state)
+        return await geocoder.geocode(name)
+
+    origin_place, destination_place = await asyncio.gather(
+        _place(origin_fix, origin_name or "Your location"),
+        _place(destination_fix, destination),
+    )
 
     if origin_place is None or destination_place is None:
         log.info(
@@ -350,3 +351,41 @@ async def resolve_rider_location(
         return None
     fix = await locate(lat, lon)
     return rider_location_from_fix(fix, accuracy_m) if fix else None
+
+
+async def resolve_picked_place(
+    lat: Optional[float],
+    lon: Optional[float],
+    address: Optional[str] = None,
+) -> Optional[PickedPlace]:
+    """A pickup or drop the rider picked in the app, or None when the point is unusable.
+
+    The coordinates are the place: they are what the app's search or "use my current
+    location" actually chose, so they are used as they are, never re-geocoded from a
+    name. The address is the app's own label for that point; without one the point is
+    named at street level, and failing that by its town — the rider still gets the
+    exact point priced, just a vaguer label.
+
+    The town lookup is the persona-free one `locate` also uses (cached, so a phone fix
+    and a pick at the same spot cost one request). It answers two questions a label
+    cannot: whether the point is in Himachal, and what town the weather line is for.
+    """
+    if lat is None or lon is None or not valid_coordinates(lat, lon):
+        return None
+    geocoder = get_geocoding_service()
+    town_place = await geocoder.reverse(lat, lon)
+    label = " ".join((address or "").split()) or None
+    if label is None:
+        label = await geocoder.reverse_address(lat, lon)
+    if label is None and town_place is not None:
+        label = town_place.name
+    if label is None:
+        log.info("picked_place_unnamed", lat=lat, lon=lon)
+        return None
+    return PickedPlace(
+        address=label,
+        lat=lat,
+        lon=lon,
+        town=town_place.name if town_place else None,
+        in_himachal=town_place.in_himachal if town_place else None,
+    )

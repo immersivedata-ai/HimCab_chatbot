@@ -933,6 +933,11 @@ class TestAnswerParsers:
          # back. Kept verbatim, exactly as the correctly-spelled reply would be.
          ("tommorow", "tommorow"), ("tomorow", "tomorow"), ("tomarrow", "tomarrow"),
          ("tmrw", "tmrw"), ("tonite", "tonite"),
+         # A date written only in digits is a date. It has no word in it, and that used
+         # to make it a non-answer, so the date picker's "25-09-2026" was turned away
+         # and the rider was asked "when?" again. Punctuation alone still says nothing.
+         ("25-09-2026", "25-09-2026"), ("25/09/2026", "25/09/2026"),
+         ("2026-09-25", "2026-09-25"), ("...", None),
          # travel_dates is the last field a combined question covers, so a reply that
          # answered a different one must not fall through into it.
          ("shimla", None), ("with my family", None),

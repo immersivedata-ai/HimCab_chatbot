@@ -81,3 +81,37 @@ class RiderLocation(BaseModel):
             and self.place_distance_km is not None
             and self.place_distance_km <= PRECISE_FIX_KM
         )
+
+
+class PickedPlace(BaseModel):
+    """A pickup or drop point the rider PICKED in the app, rather than one read from their words.
+
+    The app's pickup dialog offers a place search and "use my current location", and its
+    drop dialog a place search. Each knows the exact point, and each used to reach us as
+    a name: the app sent a search pick as at most three words (falling back to the town)
+    and "my current location" as the town the phone was in — because a name was all the
+    chat API could carry for either end. Picked at the hotel gate, priced and pinned at
+    the town centre; and a drop was re-found by its name, which can land somewhere else.
+
+    Kept apart from `RiderLocation` on purpose. That is where the PHONE is, and it
+    decides which assistant answers; this is where the rider wants the car, which may be
+    somewhere else entirely, and must not move the persona.
+    """
+
+    #: The short name the conversation uses — what `ExtractedEntities.origin` (or
+    #: `destination`) holds and the reply says. Short enough for `sanitize.place`,
+    #: specific enough to recognise: "Hotel Snow View, The Mall, Shimla" rather than the
+    #: whole postal address. None until the planner files the pick: the rule that
+    #: shortens it is `sanitize`'s, next to the place limits it has to satisfy, not the
+    #: geocoding service's.
+    name: Optional[str] = None
+    #: The full address, as the app showed it to the rider — the booking screen's label.
+    address: str
+    lat: float
+    lon: float
+    #: The town the point sits in. For a lookup that wants a town rather than a gate —
+    #: the rental's weather line — since a weather service will not find a hotel.
+    town: Optional[str] = None
+    #: Whether the point is inside Himachal Pradesh. None when the geocoder could not
+    #: say: a missing answer must never be read as "outside".
+    in_himachal: Optional[bool] = None

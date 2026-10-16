@@ -376,6 +376,61 @@ class GeocodingService:
         self._cache.set(key, place or False, settings.geocoding_cache_ttl_seconds)
         return place
 
+    async def reverse_address(self, lat: float, lon: float) -> Optional[str]:
+        """The street-level address at these coordinates, or None when it cannot say.
+
+        Not `reverse`, which stops at the town on purpose — that name decides the
+        persona and labels a phone's position. This is for a pickup the rider PICKED,
+        whose label should say where the car is going, not which town it is in.
+        Used only when the app sends a picked point without its own address.
+        """
+        # ~10 m: a pickup point a few metres away is the same gate; a street away is not.
+        key = f"revaddr:{round(lat, 4)},{round(lon, 4)}"
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached or None
+        try:
+            payload = await self._get("/reverse", {
+                "lat": lat,
+                "lon": lon,
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "zoom": 18,  # building / street level
+            })
+        except Exception as e:
+            log.warning("reverse_address_failed", lat=lat, lon=lon, error=str(e))
+            return None
+        address = self._to_address(payload)
+        self._cache.set(key, address or False, settings.geocoding_cache_ttl_seconds)
+        return address
+
+    @staticmethod
+    def _to_address(row: object) -> Optional[str]:
+        """A reverse-geocoding row as "<feature>, <road>, <area>, <town>", most specific first.
+
+        Built from the address parts rather than `display_name`, which also carries the
+        tehsil, district, state, PIN code and country — a label nobody reads to the end.
+        """
+        if not isinstance(row, dict):
+            return None
+        raw_address = row.get("address")
+        address: dict = raw_address if isinstance(raw_address, dict) else {}
+        town = next((address[k] for k in _PLACE_NAME_KEYS if address.get(k)), None)
+        parts: list[str] = []
+        for value in (
+            row.get("name"),
+            address.get("road"),
+            address.get("neighbourhood") or address.get("suburb"),
+            town,
+        ):
+            text = str(value).strip() if value else ""
+            if text and text.lower() not in (p.lower() for p in parts):
+                parts.append(text)
+        if not parts:
+            display = str(row.get("display_name") or "")
+            parts = [p.strip() for p in display.split(",")[:3] if p.strip()]
+        return ", ".join(parts) or None
+
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()

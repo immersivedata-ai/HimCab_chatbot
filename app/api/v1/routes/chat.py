@@ -117,6 +117,7 @@ from fastapi import APIRouter, Depends, Query
 from langchain_core.messages import AIMessage, HumanMessage
 from sse_starlette.sse import EventSourceResponse
 
+from app.agent import slots
 from app.agent.graph import get_agent_graph
 from app.agent.state import AgentState
 from app.api.middleware.rider_auth import RiderIdentity, get_rider
@@ -124,7 +125,7 @@ from app.core.config import settings
 from app.core.exceptions import RateLimitExceededError
 from app.core.logging import get_logger
 from app.domain.conversation import MessageRole, TripSession
-from app.domain.location import RiderLocation
+from app.domain.location import PickedPlace, RiderLocation
 from app.integrations.himcab import available_packages
 from app.repositories.firestore import get_session_service
 from app.schemas.chat import (
@@ -184,6 +185,41 @@ _LAT_DESCRIPTION = (
     "whichever path you called. Resend it every turn — the newest fix wins."
 )
 _LON_DESCRIPTION = "Optional device longitude. See `lat`."
+_PICKUP_LAT_DESCRIPTION = (
+    "Optional latitude of a pickup the rider PICKED in the app (place search, or "
+    "\"use my current location\"). With `pickup_lon`, on the message answering the "
+    "pickup question, it is the exact pickup point. Never changes the persona."
+)
+_PICKUP_LON_DESCRIPTION = "Optional. See `pickup_lat`."
+_PICKUP_ADDRESS_DESCRIPTION = (
+    "Optional full address of that pickup, as the app showed it. Omit it for "
+    "\"use my current location\" and the backend names the point."
+)
+_DROP_LAT_DESCRIPTION = (
+    "Optional latitude of a drop the rider PICKED in the app's place search. With "
+    "`drop_lon`, on the message answering the drop question, it is the exact drop point."
+)
+_DROP_LON_DESCRIPTION = "Optional. See `drop_lat`."
+_DROP_ADDRESS_DESCRIPTION = (
+    "Optional full address of that drop, as the app showed it. Without it the backend "
+    "names the point."
+)
+
+
+async def _resolve_pick(
+    lat: float | None, lon: float | None, address: str | None
+) -> PickedPlace | None:
+    """A pickup or drop the rider picked in the app this turn, or None when none was sent.
+
+    "My current location" is what a client may put in the address for that button, and
+    it is not an address: it is dropped here so the backend names the point instead of
+    labelling a booking screen "My current location".
+    """
+    if lat is None or lon is None:
+        return None
+    if address and slots.means_current_location(address):
+        address = None
+    return await geo.resolve_picked_place(lat, lon, address)
 
 
 def _resolved_location_dto(location: RiderLocation | None) -> ResolvedLocation | None:
@@ -243,6 +279,8 @@ def _build_state(
     message: str,
     persona: str,
     token_queue: asyncio.Queue | None = None,
+    picked_pickup: PickedPlace | None = None,
+    picked_drop: PickedPlace | None = None,
 ) -> AgentState:
     """Assemble the agent's starting state for one turn."""
     history_messages = _build_history_messages(session.messages)
@@ -265,6 +303,10 @@ def _build_state(
         # Where they are, if the app has told us — used for the route, the fare and
         # the pickup pin. Already merged with any fix sent on THIS request.
         rider_location=session.rider_location,
+        # A pickup picked in the app on THIS request. Not merged into the session here:
+        # whether it answers anything is the planner's decision.
+        picked_pickup=picked_pickup,
+        picked_drop=picked_drop,
         token_stream=token_queue,
     )
 
@@ -290,6 +332,8 @@ async def _stream_agent_response(
     rider: RiderIdentity,
     message: str,
     persona: str,
+    picked_pickup: PickedPlace | None = None,
+    picked_drop: PickedPlace | None = None,
 ):
     """
     Core generator — runs the LangGraph agent and yields SSE events.
@@ -307,7 +351,10 @@ async def _stream_agent_response(
     # in this order keeps the turn correct whether or not the store mutates `session`
     # in place — otherwise the new message can end up in the history twice.
     token_queue: asyncio.Queue = asyncio.Queue()
-    initial_state = _build_state(session, rider, message, persona, token_queue)
+    initial_state = _build_state(
+        session, rider, message, persona, token_queue,
+        picked_pickup=picked_pickup, picked_drop=picked_drop,
+    )
 
     await session_svc.append_message(
         session_id=session_id,
@@ -462,6 +509,12 @@ async def _handle_stream(
     lat: float | None = None,
     lon: float | None = None,
     accuracy_m: float | None = None,
+    pickup_lat: float | None = None,
+    pickup_lon: float | None = None,
+    pickup_address: str | None = None,
+    drop_lat: float | None = None,
+    drop_lon: float | None = None,
+    drop_address: str | None = None,
 ) -> EventSourceResponse:
     _enforce_rate_limit(rider.user_id)
     location = await geo.resolve_rider_location(lat, lon, accuracy_m)
@@ -473,8 +526,10 @@ async def _handle_stream(
         location=location,
         adopt_from=persona,
     )
+    picked = await _resolve_pick(pickup_lat, pickup_lon, pickup_address)
+    picked_drop = await _resolve_pick(drop_lat, drop_lon, drop_address)
     return EventSourceResponse(
-        _stream_agent_response(session, rider, message, served),
+        _stream_agent_response(session, rider, message, served, picked, picked_drop),
         media_type="text/event-stream",
     )
 
@@ -506,8 +561,18 @@ async def _handle_message(
         adopt_from=persona,
     )
 
+    picked = await _resolve_pick(body.pickup_lat, body.pickup_lon, body.pickup_address)
+    # Not resolved for a rental: it has no drop, and the lookup would cost a geocoding
+    # request for a point the planner throws away.
+    picked_drop = (
+        None if served == RENTAL
+        else await _resolve_pick(body.drop_lat, body.drop_lon, body.drop_address)
+    )
+
     # Snapshot-then-persist, for the same reason as the streaming path above.
-    initial_state = _build_state(session, rider, body.message, served)
+    initial_state = _build_state(
+        session, rider, body.message, served, picked_pickup=picked, picked_drop=picked_drop
+    )
     await get_session_service().append_message(
         session_id=session.session_id,
         role=MessageRole.USER,
@@ -755,10 +820,24 @@ async def stream_chat_local(
     lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
     lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
     accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    pickup_lat: float | None = Query(default=None, ge=-90, le=90, description=_PICKUP_LAT_DESCRIPTION),
+    pickup_lon: float | None = Query(default=None, ge=-180, le=180, description=_PICKUP_LON_DESCRIPTION),
+    pickup_address: str | None = Query(
+        default=None, max_length=200, description=_PICKUP_ADDRESS_DESCRIPTION
+    ),
+    drop_lat: float | None = Query(default=None, ge=-90, le=90, description=_DROP_LAT_DESCRIPTION),
+    drop_lon: float | None = Query(default=None, ge=-180, le=180, description=_DROP_LON_DESCRIPTION),
+    drop_address: str | None = Query(
+        default=None, max_length=200, description=_DROP_ADDRESS_DESCRIPTION
+    ),
     rider: RiderIdentity = Depends(get_rider),
 ):
     """Send a message on the LOCAL chat and stream the reply back as SSE."""
-    return await _handle_stream(rider, LOCAL, message, session_id, lat, lon, accuracy_m)
+    return await _handle_stream(
+        rider, LOCAL, message, session_id, lat, lon, accuracy_m,
+        pickup_lat, pickup_lon, pickup_address,
+        drop_lat, drop_lon, drop_address,
+    )
 
 
 @router.post("/local/message", response_model=ChatResponse)
@@ -810,11 +889,23 @@ async def stream_chat_outstation(
     lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
     lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
     accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    pickup_lat: float | None = Query(default=None, ge=-90, le=90, description=_PICKUP_LAT_DESCRIPTION),
+    pickup_lon: float | None = Query(default=None, ge=-180, le=180, description=_PICKUP_LON_DESCRIPTION),
+    pickup_address: str | None = Query(
+        default=None, max_length=200, description=_PICKUP_ADDRESS_DESCRIPTION
+    ),
+    drop_lat: float | None = Query(default=None, ge=-90, le=90, description=_DROP_LAT_DESCRIPTION),
+    drop_lon: float | None = Query(default=None, ge=-180, le=180, description=_DROP_LON_DESCRIPTION),
+    drop_address: str | None = Query(
+        default=None, max_length=200, description=_DROP_ADDRESS_DESCRIPTION
+    ),
     rider: RiderIdentity = Depends(get_rider),
 ):
     """Send a message on the OUTSTATION chat and stream the reply back as SSE."""
     return await _handle_stream(
-        rider, OUTSTATION, message, session_id, lat, lon, accuracy_m
+        rider, OUTSTATION, message, session_id, lat, lon, accuracy_m,
+        pickup_lat, pickup_lon, pickup_address,
+        drop_lat, drop_lon, drop_address,
     )
 
 
@@ -889,10 +980,18 @@ async def stream_chat_rental(
     lat: float | None = Query(default=None, ge=-90, le=90, description=_LAT_DESCRIPTION),
     lon: float | None = Query(default=None, ge=-180, le=180, description=_LON_DESCRIPTION),
     accuracy_m: float | None = Query(default=None, ge=0, description="Device accuracy in metres."),
+    pickup_lat: float | None = Query(default=None, ge=-90, le=90, description=_PICKUP_LAT_DESCRIPTION),
+    pickup_lon: float | None = Query(default=None, ge=-180, le=180, description=_PICKUP_LON_DESCRIPTION),
+    pickup_address: str | None = Query(
+        default=None, max_length=200, description=_PICKUP_ADDRESS_DESCRIPTION
+    ),
     rider: RiderIdentity = Depends(get_rider),
 ):
     """Send a message on the RENTAL chat and stream the reply back as SSE."""
-    return await _handle_stream(rider, RENTAL, message, session_id, lat, lon, accuracy_m)
+    return await _handle_stream(
+        rider, RENTAL, message, session_id, lat, lon, accuracy_m,
+        pickup_lat, pickup_lon, pickup_address,
+    )
 
 
 @rental_router.post("/message", response_model=ChatResponse)

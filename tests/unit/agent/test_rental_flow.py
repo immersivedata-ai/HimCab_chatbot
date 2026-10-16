@@ -1854,6 +1854,10 @@ class TestTheRiderPicksTheCab:
             # Not a choice: a question, a place, a duration, a non-answer.
             ("which cars do you have?", None), ("manali", None),
             ("8 hours", None), ("yes", None), ("", None),
+            # A bare number names no cab. Kept here because a digits-only reply now
+            # counts as an answer (for the date picker), and this parser shares the
+            # non-answer check: it must still find no tier in "4".
+            ("4", None),
         ],
     )
     def test_a_cab_choice_is_read_from_whatever_they_type(self, reply, expected):

@@ -21,7 +21,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.itinerary import BudgetRange, GroupType, Itinerary
-from app.domain.location import RiderLocation
+from app.domain.location import PickedPlace, RiderLocation
 
 
 class MessageRole(str, Enum):
@@ -79,6 +79,14 @@ class ExtractedEntities(BaseModel):
     #: on its own: a tier we cannot find in the quote is told to the rider rather than
     #: booked.
     cab_category: Optional[str] = None
+    #: The exact pickup point, when the rider PICKED it in the app rather than naming
+    #: it — see `PickedPlace`. Read only while `origin` is still its `name`: a pickup
+    #: changed later, by a correction or a cancellation, leaves this behind as stale,
+    #: and a point that no longer matches the pickup must never price or pin the trip.
+    origin_place: Optional[PickedPlace] = None
+    #: The exact drop point, when the rider PICKED it in the app — the same as
+    #: `origin_place`, for `destination`, and stale the same way once the drop changes.
+    destination_place: Optional[PickedPlace] = None
 
     # ── Conversation control (not trip facts) ────────────────────────────────
     # Persisted alongside the entities because the planner's decision on the next

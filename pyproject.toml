@@ -30,7 +30,12 @@ dependencies = [
     "pydantic-settings==2.5.2",
     "langgraph==0.2.35",
     "langchain==0.3.3",
-    "langchain-google-vertexai==2.0.1",
+    # 2.0.4 is the first release whose `with_structured_output` accepts
+    # `method="json_mode"`, which the planner's extraction relies on (CLAUDE.md §3).
+    # Under 2.0.1 that call raised "Received unsupported arguments" before reaching
+    # Vertex, was logged as `planner_extraction_failed`, and every turn ran with no
+    # extraction at all. 2.0.6+ also needs a newer langchain-core than the pin below.
+    "langchain-google-vertexai==2.0.5",
     "langchain-core==0.3.10",
     "google-cloud-firestore==2.19.0",
     "google-cloud-pubsub==2.26.1",

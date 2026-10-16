@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.conversation import ExtractedEntities, Language
 from app.domain.itinerary import Itinerary
-from app.domain.location import RiderLocation
+from app.domain.location import PickedPlace, RiderLocation
 from app.domain.user import UserProfile
 
 
@@ -80,6 +80,15 @@ class AgentState(BaseModel):
     # afterwards. Three things read it: the persona (local vs outstation), the origin
     # the route is measured FROM, and the pickup pin in the booking handoff.
     rider_location: Optional[RiderLocation] = None
+
+    # ── A pickup the rider picked in the app, on THIS turn ────────────────────
+    # The app's place search or "use my current location", resolved by the chat API.
+    # This turn only: the planner decides whether it answers the pickup question and,
+    # if so, files it on `entities.origin_place`, which is what later turns read.
+    picked_pickup: Optional[PickedPlace] = None
+    # The same for a drop, picked in the app's drop search; filed on
+    # `entities.destination_place`. Never on a rental, which has no drop.
+    picked_drop: Optional[PickedPlace] = None
 
     # ── Live token streaming ──────────────────────────────────────────────────
     # An asyncio.Queue set by the SSE endpoint; the Writer pushes real LLM tokens

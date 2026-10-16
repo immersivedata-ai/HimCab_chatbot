@@ -147,6 +147,60 @@ def place(value: Any) -> Optional[str]:
     return text
 
 
+#: Longest picked address kept for the booking screen. A postal address is longer than
+#: a place name, but a pasted paragraph is still not an address.
+_MAX_ADDRESS_CHARS = 200
+
+#: Address parts that say nothing a pickup or drop label needs: the country, and a PIN code.
+_ADDRESS_NOISE_RE = re.compile(r"^(india|[\d\s-]+)$", re.IGNORECASE)
+
+
+def picked_name(address: Any, town: Optional[str] = None) -> Optional[str]:
+    """The short name for a pickup or drop the rider PICKED in the app, or None.
+
+    The app sends the full address it showed ("Hotel Snow View, The Mall, Shimla,
+    Himachal Pradesh 171001, India"); `origin` and `destination` need a name that passes
+    `place` — the same 60 characters and six words as any other — because every reader
+    of them assumes one. So the address is cut at the town and taken from the most
+    specific end for as long as it fits: "Hotel Snow View, The Mall, Shimla". The full
+    address and the exact point are kept on `PickedPlace`, so nothing is lost by
+    shortening it.
+
+    The limits are `place`'s own, used from here rather than restated, because a
+    second copy is how two rules drift and a picked pickup starts being refused.
+    """
+    text = clean_text(address, max_chars=_MAX_ADDRESS_CHARS)
+    if text is None or slots.means_current_location(text):
+        return None
+    parts = [p.strip() for p in text.split(",")]
+    parts = [p for p in parts if p and not _ADDRESS_NOISE_RE.match(p)]
+    # Everything after the town — district, state, PIN code — is where the town is,
+    # not where the car stops.
+    if town:
+        low = town.strip().lower()
+        for i, part in enumerate(parts):
+            if part.lower() == low:
+                parts = parts[: i + 1]
+                break
+    label = ""
+    for part in parts:
+        candidate = f"{label}, {part}" if label else part
+        if len(candidate) > _MAX_PLACE_CHARS or len(slots._tokens(candidate)) > _MAX_PLACE_WORDS:
+            break
+        label = candidate
+    if not label and parts:
+        # A single part already too long ("Opposite Old Bus Stand Near Lakkar Bazaar
+        # Market Road"): its first words are still the most specific thing we have.
+        words = parts[0].split()
+        while words and (
+            len(" ".join(words)) > _MAX_PLACE_CHARS
+            or len(slots._tokens(" ".join(words))) > _MAX_PLACE_WORDS
+        ):
+            words.pop()
+        label = " ".join(words)
+    return place(label) if label else None
+
+
 def resolve_relative_day(text: Any, *, today: Optional[date] = None) -> Optional[date]:
     """The calendar date a relative day phrase names, or None if it names none.
 

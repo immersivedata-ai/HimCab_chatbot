@@ -44,6 +44,7 @@ from app.core.enums import SlotName
 from app.core.logging import get_logger
 from app.domain.conversation import ExtractedEntities
 from app.domain.itinerary import BudgetRange, GroupType
+from app.domain.location import PickedPlace
 from app.integrations.external.geocoding import LookupStatus
 from app.integrations.himcab import available_packages, offered_hours
 from app.services import geo
@@ -424,8 +425,11 @@ def _has_trip_facts(entities: ExtractedEntities) -> bool:
 #:
 #: The destination is here because a rental has one place, the pickup (a 2026-09-30
 #: decision). For one day it was kept as the rental's DROP, and the chat showed a second
-#: location search card for it — see `slots._RENTAL_NEEDS`.
-_NOT_IN_A_RENTAL = ("destination", "duration_days", "return_journey_preference")
+#: location search card for it — see `slots._RENTAL_NEEDS`. A picked drop point goes
+#: with it: the planner never files one on a rental, so this is only the belt to that.
+_NOT_IN_A_RENTAL = (
+    "destination", "destination_place", "duration_days", "return_journey_preference"
+)
 
 
 def _strip_trip_fields(merged: dict, session_id: str) -> None:
@@ -502,6 +506,69 @@ async def _place_problem(value: str, field: str, visitor_type: Optional[str]) ->
     return None
 
 
+#: Which end of the ride a picked place fills, as the logs name it.
+_PICK_ROLES = {"origin": "pickup", "destination": "drop"}
+
+
+def _accept_pick(
+    picked: Optional[PickedPlace],
+    field: str,
+    state: AgentState,
+    existing_entities: dict,
+    previously_asked: Optional[str],
+) -> Optional[PickedPlace]:
+    """A pickup or drop picked in the app this turn, named and ready to file — or None.
+
+    `field` is the end it fills: `origin` for the pickup dialog, `destination` for the
+    drop dialog. Accepted as an ANSWER only: to that end's question, or into that end
+    while it is still empty. The app opens each dialog under its question, so this is
+    the normal case. A pick arriving when that end is already known and was not being
+    asked about would overwrite something the rider is looking at, and a change is never
+    applied without confirming it (CLAUDE.md §4.4); it is logged and left alone rather
+    than guessed at.
+
+    The short name is `sanitize.picked_name`'s, so it passes the same gate as any other
+    place; failing that the town, because the exact point is worth keeping under a
+    vaguer label. Neither usable means nothing to file, and the turn reads the text.
+    """
+    if picked is None:
+        return None
+    role = _PICK_ROLES[field]
+    if previously_asked != _PLACE_SLOTS[field] and existing_entities.get(field):
+        log.info("picked_place_ignored", role=role, reason="already_given", session_id=state.session_id)
+        return None
+    name = sanitize.picked_name(picked.address, picked.town) or sanitize.place(picked.town)
+    if not name:
+        log.info("picked_place_ignored", role=role, reason="no_usable_name", session_id=state.session_id)
+        return None
+    log.info(
+        "place_picked_in_app",
+        role=role,
+        in_himachal=picked.in_himachal,
+        named_from_address=name != picked.town,
+        session_id=state.session_id,
+    )
+    return picked.model_copy(update={"name": name})
+
+
+def _filed_pick(merged: dict, field: str = "origin") -> Optional[PickedPlace]:
+    """The picked place the session holds for `field`, while it is still that end — or None.
+
+    Every turn, not just the one it was picked on. The classification and the place
+    check both run every turn, and each used to treat the picked label like a typed
+    name: a later turn looked it up by its whole label, stored that label as the rider's
+    home city, and the place check then refused the home city — clearing the pickup with
+    it, because the two are one answer. The place check would refuse a picked drop's
+    label the same way.
+    """
+    raw = merged.get(f"{field}_place")
+    if isinstance(raw, dict):
+        raw = PickedPlace.model_validate(raw)
+    if not isinstance(raw, PickedPlace) or not geo.same_place(merged.get(field), raw.name):
+        return None
+    return raw
+
+
 async def _reject_unplaceable(
     merged: dict,
     corrected: dict[str, Any],
@@ -520,6 +587,8 @@ async def _reject_unplaceable(
     routed there without a second request.
     """
     fix_name = state.rider_location.place_name if state.rider_location else None
+    filed = _filed_pick(merged)
+    filed_drop = _filed_pick(merged, "destination")
 
     for field, slot in _PLACE_SLOTS.items():
         # A proposed change is checked first: it is what the rider has JUST said.
@@ -529,6 +598,13 @@ async def _reject_unplaceable(
                 continue
             # Named by the reverse geocoder from the device's own fix — already a place.
             if fix_name and geo.same_place(value, fix_name):
+                continue
+            # Picked on the app's map — already a point, on every later turn too. A
+            # search for "Hotel Snow View, The Mall, Shimla" by name may well find
+            # nothing, and refusing it would throw away the one pickup we know exactly.
+            if filed and field in ("origin", "home_city") and geo.same_place(value, filed.name):
+                continue
+            if filed_drop and field == "destination" and geo.same_place(value, filed_drop.name):
                 continue
             reason = await _place_problem(value, field, visitor_type)
             if reason is None:
@@ -589,6 +665,8 @@ def _build_entities(merged: dict) -> ExtractedEntities:
         rental_hours=merged.get("rental_hours"),
         pickup_time=merged.get("pickup_time"),
         cab_category=merged.get("cab_category"),
+        origin_place=merged.get("origin_place"),
+        destination_place=merged.get("destination_place"),
         asked_counts=dict(merged.get("asked_counts") or {}),
         proceed_requested=bool(merged.get("proceed_requested")),
         no_progress_turns=int(merged.get("no_progress_turns") or 0),
@@ -1012,6 +1090,32 @@ Report what the user has stated. Use null for anything they have not."""
     if is_rental:
         _strip_trip_fields(merged, state.session_id)
 
+    # ── A pickup the rider PICKED in the app ──────────────────────────────────
+    # The app's pickup dialog — a place search, or "use my current location" — knows the
+    # exact point, and it used to reach us as a town name: the only thing the API could
+    # carry for a pickup was words, so the app trimmed a pick to three of them, or to the
+    # town. Picked at the hotel gate, priced and pinned at the town centre. Now the point
+    # itself arrives (`state.picked_pickup`), and is filed here, ahead of everything that
+    # reads `origin`, so the classification below is made from it and not from whatever
+    # the extraction model made of the address text.
+    picked = _accept_pick(state.picked_pickup, "origin", state, existing_entities, previously_asked)
+    if picked is not None:
+        merged["origin"] = picked.name
+        merged["origin_place"] = picked.model_dump()
+
+    # ── A drop the rider PICKED in the app ────────────────────────────────────
+    # The same, from the other end. The app's drop search knows the exact point and could
+    # only send its name, which was then found again by name — the town centre at best,
+    # a namesake somewhere else at worst — and priced and pinned there. Never on a
+    # rental: it has no drop (`_NOT_IN_A_RENTAL`).
+    picked_drop = (
+        None if is_rental
+        else _accept_pick(state.picked_drop, "destination", state, existing_entities, previously_asked)
+    )
+    if picked_drop is not None:
+        merged["destination"] = picked_drop.name
+        merged["destination_place"] = picked_drop.model_dump()
+
     # ── Visitor classification (code, from what they told us) ─────────────────
     # `current` is passed so an in-state ORIGIN cannot promote a visitor to resident;
     # only a stated home city does that. See `classify_visitor_type`.
@@ -1020,12 +1124,21 @@ Report what the user has stated. Use null for anything they have not."""
     # `home_city` promotion below is LOCAL-only. Geocoding the pickup here would be a
     # wasted Nominatim round-trip on the planner's critical path.
     origin_in_hp = result_dict.get("origin_in_himachal")
-    if origin_in_hp is None and merged.get("origin") and not is_rental:
-        origin_in_hp = await geo.place_in_himachal(merged["origin"])
+    # A picked pickup answers this from the point itself, and is looked up — if it has
+    # to be — by its town: the geocoder finds "Shimla", not "Hotel Snow View, The Mall".
+    # On every turn it is still the pickup, not only the one it was picked on.
+    origin_for_lookup = merged.get("origin")
+    filed = _filed_pick(merged)
+    if filed is not None:
+        if filed.in_himachal is not None:
+            origin_in_hp = filed.in_himachal
+        origin_for_lookup = filed.town or filed.name
+    if origin_in_hp is None and origin_for_lookup and not is_rental:
+        origin_in_hp = await geo.place_in_himachal(origin_for_lookup)
 
     visitor_type = (
         await classify_visitor_type(
-            merged.get("origin"),
+            origin_for_lookup,
             origin_in_hp,
             home_city=merged.get("home_city"),
             current=state.visitor_type,
@@ -1041,8 +1154,10 @@ Report what the user has stated. Use null for anything they have not."""
         # it now asks for the pickup, and the recording is kept for that stickiness.)
         # Deliberately not done for a visitor: their in-state origin is where the trip
         # starts, not where they live, and writing it here used to turn them into a local.
+        # The town, for a picked pickup: a home city is somewhere a rider lives, and
+        # nobody lives at "Hotel Snow View, The Mall".
         if visitor_type == LOCAL and origin_in_hp and not merged.get("home_city"):
-            merged["home_city"] = merged.get("origin")
+            merged["home_city"] = origin_for_lookup
 
     # ── "Here" — the pickup answered by pointing rather than naming ───────────
     # Every flow, and only as a reply to that exact question. Every flow now asks
@@ -1059,6 +1174,7 @@ Report what the user has stated. Use null for anything they have not."""
     # sending a car on it, so the question is simply asked again.
     if (
         latest_text
+        and picked is None  # a pick already said exactly where; "here" adds nothing
         and previously_asked == SlotName.ORIGIN
         and not merged.get("origin")
         and slots.means_current_location(latest_text)
@@ -1218,6 +1334,20 @@ Report what the user has stated. Use null for anything they have not."""
         # changing a value overwrites something the rider already gave us and is
         # already looking at. The second one is proposed and confirmed below; see
         # app/agent/modification.py for why it is worth the extra turn.
+        #
+        # Neither may touch a picked pickup: the address text the app sent with it would
+        # be read as a place here ("pickup Hotel Snow View, The Mall" → "Hotel Snow View")
+        # and written over the point the rider actually chose. Nor is the pick itself a
+        # change to confirm — the bare-answer reader above may have proposed one from
+        # that same text — because the rider tapped it in reply to the pickup question.
+        if picked is not None:
+            filled.pop("origin", None)
+            corrected.pop("origin", None)
+        # A picked drop, the same way: "drop Hotel Snow View" read out of its address
+        # text must not be written over the point, nor proposed as a change.
+        if picked_drop is not None:
+            filled.pop("destination", None)
+            corrected.pop("destination", None)
         if filled:
             merged.update(filled)
         for field in corrected:
@@ -1348,6 +1478,10 @@ Report what the user has stated. Use null for anything they have not."""
         # the tool executor writes the cab in — without this the reply read as no
         # progress and the "didn't catch that" re-ask fired on a perfectly clear yes.
         or accepted_recommended_cab
+        # A pickup or drop tapped in the app is an answer even when it replaces one the
+        # question was re-asking about, which fills no NEW slot.
+        or picked is not None
+        or picked_drop is not None
     )
     if made_progress:
         entities.no_progress_turns = 0

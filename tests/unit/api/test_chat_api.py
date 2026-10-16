@@ -934,3 +934,152 @@ class TestLegacyEndpointsAreGone:
         client, _, _, _ = api
         resp = getattr(client, method)(path, headers=AUTH)
         assert resp.status_code == 404
+
+
+# ── A pickup picked in the app ────────────────────────────────────────────────
+
+PICKED = {
+    "pickup_lat": 31.1035,
+    "pickup_lon": 77.1712,
+    "pickup_address": "Hotel Snow View, The Mall, Shimla, Himachal Pradesh 171001, India",
+}
+
+
+class TestAPickedPickupReachesTheAgent:
+    """The app's pickup dialog knows the exact point. These assert the point itself — not
+    a town — arrives on the agent's state, from both the plain and the streaming path."""
+
+    def test_the_exact_point_and_its_address_arrive(self, api):
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "Hotel Snow View, The Mall", **PICKED},
+        )
+        picked = graph.last_state.picked_pickup
+        assert (picked.lat, picked.lon) == (31.1035, 77.1712)
+        assert picked.address == PICKED["pickup_address"]
+        assert picked.town == "Shimla" and picked.in_himachal is True
+
+    def test_the_streaming_path_carries_it_too(self, api):
+        # sse-starlette keeps one module-level asyncio.Event, created on the event loop
+        # of the first TestClient that streamed; every TestClient runs its own loop, so a
+        # later stream fails with "bound to a different event loop". Production has one
+        # loop. Reset it so this test does not depend on which test streamed first.
+        from sse_starlette.sse import AppStatus
+
+        AppStatus.should_exit_event = None
+        client, _, graph, _ = api
+        client.get(
+            "/v1/chat/rental/stream", headers=AUTH,
+            params={"message": "Hotel Snow View, The Mall", **PICKED},
+        )
+        picked = graph.last_state.picked_pickup
+        assert picked is not None and (picked.lat, picked.lon) == (31.1035, 77.1712)
+
+    def test_it_never_changes_which_assistant_answers(self, api):
+        """A device fix in Delhi serves the visitor assistant; a pickup PICKED in Delhi
+        is only where the car goes, and must not move a local rider's chat."""
+        client, _, _, _ = api
+        resp = client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "Terminal 3", "pickup_lat": 28.5562, "pickup_lon": 77.1000,
+                  "pickup_address": "Terminal 3, IGI Airport, New Delhi"},
+        )
+        assert resp.json()["persona"] == "local"
+
+    def test_my_current_location_is_not_used_as_an_address(self, api):
+        """A client may label the "use my current location" pick with those words; the
+        booking screen must say where the point is, not "My current location"."""
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "my current location", "pickup_lat": 31.1035,
+                  "pickup_lon": 77.1712, "pickup_address": "My current location"},
+        )
+        picked = graph.last_state.picked_pickup
+        assert picked is not None
+        assert "current location" not in picked.address.lower()
+
+    def test_a_message_without_a_pick_carries_none(self, api):
+        client, _, graph, _ = api
+        client.post("/v1/chat/local/message", headers=AUTH, json={"message": "Manali"})
+        assert graph.last_state.picked_pickup is None
+
+    def test_an_address_longer_than_any_address_is_refused(self, api):
+        client, _, _, _ = api
+        resp = client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "here", **PICKED, "pickup_address": "x" * 201},
+        )
+        assert resp.status_code == 422
+
+
+# ── A drop picked in the app ──────────────────────────────────────────────────
+
+PICKED_DROP = {
+    "drop_lat": 32.2432,
+    "drop_lon": 77.1892,
+    "drop_address": "Hotel Snow Peak, Mall Road, Manali, Himachal Pradesh 175131, India",
+}
+
+
+class TestAPickedDropReachesTheAgent:
+    """The app's drop search knows the exact point. These assert that point arrives on the
+    agent's state, from both paths — and never on a rental, which has no drop."""
+
+    def test_the_exact_point_and_its_address_arrive(self, api):
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "Hotel Snow Peak, Mall Road", **PICKED_DROP},
+        )
+        picked = graph.last_state.picked_drop
+        assert (picked.lat, picked.lon) == (32.2432, 77.1892)
+        assert picked.address == PICKED_DROP["drop_address"]
+        assert picked.town == "Manali" and picked.in_himachal is True
+
+    def test_the_streaming_path_carries_it_too(self, api):
+        # The sse-starlette event-loop reset — see the pickup's streaming test above.
+        from sse_starlette.sse import AppStatus
+
+        AppStatus.should_exit_event = None
+        client, _, graph, _ = api
+        client.get(
+            "/v1/chat/outstation/stream", headers=AUTH,
+            params={"message": "Hotel Snow Peak, Mall Road", **PICKED_DROP},
+        )
+        picked = graph.last_state.picked_drop
+        assert picked is not None and (picked.lat, picked.lon) == (32.2432, 77.1892)
+
+    def test_a_pickup_and_a_drop_on_one_message_stay_apart(self, api):
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "Shimla to Manali", **PICKED, **PICKED_DROP},
+        )
+        state = graph.last_state
+        assert (state.picked_pickup.lat, state.picked_pickup.lon) == (31.1035, 77.1712)
+        assert (state.picked_drop.lat, state.picked_drop.lon) == (32.2432, 77.1892)
+
+    def test_a_rental_is_never_given_one(self, api):
+        """A rental has no drop; resolving one would be a geocoding request for a point
+        the planner throws away."""
+        client, _, graph, _ = api
+        client.post(
+            "/v1/chat/rental/message", headers=AUTH,
+            json={"message": "Hotel Snow Peak", **PICKED_DROP},
+        )
+        assert graph.last_state.picked_drop is None
+
+    def test_a_message_without_a_pick_carries_none(self, api):
+        client, _, graph, _ = api
+        client.post("/v1/chat/local/message", headers=AUTH, json={"message": "Manali"})
+        assert graph.last_state.picked_drop is None
+
+    def test_an_address_longer_than_any_address_is_refused(self, api):
+        client, _, _, _ = api
+        resp = client.post(
+            "/v1/chat/local/message", headers=AUTH,
+            json={"message": "Manali", **PICKED_DROP, "drop_address": "x" * 201},
+        )
+        assert resp.status_code == 422

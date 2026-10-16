@@ -146,7 +146,14 @@ def _looks_like_a_question(text: str) -> bool:
 
 def _is_non_answer(text: str) -> bool:
     toks = _tokens(text)
-    return not toks or all(t in _NON_ANSWERS for t in toks)
+    if not toks:
+        # `_tokens` keeps words only, so a reply made of digits has no tokens at all —
+        # and that is a number, not an empty reply. Counting it as one made `parse_when`
+        # turn away the date picker's "25-09-2026" (and a typed "25/09/2026"): the rider
+        # tapped a date and was asked "when?" again, because the picked value never
+        # reached `sanitize`, which reads all of those formats.
+        return not any(c.isdigit() for c in text)
+    return all(t in _NON_ANSWERS for t in toks)
 
 
 def parse_place(text: str) -> Optional[str]:

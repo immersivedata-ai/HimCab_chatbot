@@ -33,6 +33,7 @@ from app.core.config import settings
 from app.core.enums import TripType
 from app.core.logging import get_logger
 from app.domain.conversation import ExtractedEntities
+from app.domain.location import PickedPlace
 from app.integrations.external.weather import get_weather_service
 from app.integrations.himcab import (
     build_fare_quote_input,
@@ -117,25 +118,86 @@ async def _resolve_journey(state: AgentState) -> Optional[geo.Journey]:
         return None
 
     named_origin = entities.origin or entities.home_city
-    fix = state.rider_location
-
-    if fix is not None and _fix_matches_origin(fix, named_origin):
+    point = _origin_point(state, named_origin)
+    drop_point = _destination_point(state, destination)
+    if point is not None:
         return await geo.resolve_journey(
-            destination,
-            origin_name=named_origin,
-            # Re-resolved from the raw coordinates rather than the stored name: the fix
-            # is where the cab goes, and the town it sits in is only a label for it.
-            origin_fix=geo.LocationFix(
-                lat=fix.lat,
-                lon=fix.lon,
-                in_himachal=fix.in_himachal,
-                nearest_city=fix.place_name,
-                nearest_city_km=fix.place_distance_km,
-                state=fix.state,
-            ),
+            destination, origin_name=named_origin, origin_fix=point, destination_fix=drop_point
         )
     if named_origin:
-        return await geo.resolve_journey(destination, origin_name=named_origin)
+        return await geo.resolve_journey(
+            destination, origin_name=named_origin, destination_fix=drop_point
+        )
+    return None
+
+
+def _picked_fix(picked: PickedPlace) -> geo.LocationFix:
+    """A picked place as the point a journey is measured from or to.
+
+    Labelled with its full address — `place_name` is what names the point in the
+    journey and the handoff — so the booking screen says where the car is going rather
+    than which town that is in.
+    """
+    return geo.LocationFix(
+        lat=picked.lat,
+        lon=picked.lon,
+        in_himachal=bool(picked.in_himachal),
+        nearest_city=picked.address,
+        nearest_city_km=0.0,
+    )
+
+
+def _destination_point(state: AgentState, destination: Optional[str]) -> Optional[geo.LocationFix]:
+    """The exact drop point for this journey, or None to geocode the name instead.
+
+    Only a drop the rider PICKED in the app, and only while it is still the drop: one
+    the rider later changed by name leaves the old point behind, and that point must
+    never price or pin the new drop. There is no device-fix rung here, unlike the
+    pickup — the phone says where the rider is, never where they are going.
+    """
+    picked = state.entities.destination_place
+    if picked is not None and destination and geo.same_place(destination, picked.name):
+        return _picked_fix(picked)
+    return None
+
+
+def _weather_place(name: str, picked: Optional[PickedPlace]) -> str:
+    """Where to ask the weather for: the town of a picked place, else the name itself.
+
+    The weather is a town's, and a picked place is a gate: a weather lookup for "Hotel
+    Snow View, The Mall, Shimla" finds nothing.
+    """
+    if picked is not None and picked.town and geo.same_place(name, picked.name):
+        return picked.town
+    return name
+
+
+def _origin_point(state: AgentState, named_origin: Optional[str]) -> Optional[geo.LocationFix]:
+    """The exact pickup point for this journey, or None to geocode the name instead.
+
+    Best first:
+      1. a pickup the rider PICKED in the app, while it is still the pickup. It is
+         labelled with its full address, so the booking screen says where the car is
+         going rather than which town that is in;
+      2. the device's fix, when it agrees with the pickup they named (`_fix_matches_origin`);
+      3. nothing — the caller geocodes the name, and gets the place's centre.
+
+    Re-resolved from raw coordinates rather than a stored name either way: the point is
+    where the cab goes, and a name is only a label for it.
+    """
+    picked = state.entities.origin_place
+    if picked is not None and named_origin and geo.same_place(named_origin, picked.name):
+        return _picked_fix(picked)
+    fix = state.rider_location
+    if fix is not None and _fix_matches_origin(fix, named_origin):
+        return geo.LocationFix(
+            lat=fix.lat,
+            lon=fix.lon,
+            in_himachal=fix.in_himachal,
+            nearest_city=fix.place_name,
+            nearest_city_km=fix.place_distance_km,
+            state=fix.state,
+        )
     return None
 
 
@@ -269,27 +331,18 @@ async def _rental_tools(state: AgentState) -> dict:
     offered = offered_packages(packages) if settings.enable_rentals else []
 
     tasks: dict[str, Any] = {}
+    point = _origin_point(state, pickup)
     if pickup:
-        tasks["weather"] = _safe_call(get_weather_service().get_weather(pickup), "weather")
+        # The weather is a town's, and a picked pickup is a gate — see `_weather_place`.
+        weather_place = _weather_place(pickup, state.entities.origin_place)
+        tasks["weather"] = _safe_call(get_weather_service().get_weather(weather_place), "weather")
 
     # The pin the booking screen opens its map on. A rental has no drop, so there is no
     # journey to resolve — only where the cab goes. Same precedence as a journey's
-    # origin: the device's fix when it agrees with what they said, else the city itself.
-    fix = state.rider_location
-    if fix is not None and _fix_matches_origin(fix, pickup):
+    # origin — see `_origin_point` — else the city itself.
+    if point is not None:
         tasks["pickup"] = _safe_call(
-            geo.resolve_pickup(
-                origin_name=pickup,
-                origin_fix=geo.LocationFix(
-                    lat=fix.lat,
-                    lon=fix.lon,
-                    in_himachal=fix.in_himachal,
-                    nearest_city=fix.place_name,
-                    nearest_city_km=fix.place_distance_km,
-                    state=fix.state,
-                ),
-            ),
-            "pickup",
+            geo.resolve_pickup(origin_name=pickup, origin_fix=point), "pickup"
         )
     elif pickup:
         tasks["pickup"] = _safe_call(geo.resolve_pickup(origin_name=pickup), "pickup")
@@ -489,7 +542,11 @@ async def tool_executor_node(state: AgentState) -> dict:
     intent = state.intent or "plan_trip"
 
     tasks: dict[str, Any] = {
-        "weather": _safe_call(weather_svc.get_weather(destination), "weather"),
+        # The town, for a picked drop — see `_weather_place`.
+        "weather": _safe_call(
+            weather_svc.get_weather(_weather_place(destination, entities.destination_place)),
+            "weather",
+        ),
     }
 
     # ── The journey ───────────────────────────────────────────────────────────
